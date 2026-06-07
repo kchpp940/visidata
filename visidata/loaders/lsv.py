@@ -4,6 +4,7 @@ import collections
 
 from visidata import VisiData, Sheet, ItemColumn, TypedExceptionWrapper, stacktrace
 from visidata.text_source import clean_text_line
+from visidata.save import clean_saved_value
 
 
 @VisiData.api
@@ -54,13 +55,11 @@ def _lsv_records(fp):
 @VisiData.api
 def save_lsv(vd, p, *vsheets):
     vs = vsheets[0]
-
-    def _write_row(fp, dispvals, clean):
-        for col, val in dispvals.items():
-            fp.write('%s: %s\n' % (clean(col.name), clean(val)))
-        fp.write('\n')
-
-    vs.save_text_table(p, write_row=_write_row)
+    with p.open(mode='w', encoding=vs.options.save_encoding) as fp:
+        for dispvals in vs.iterdispvals(format=True):
+            for col, val in dispvals.items():
+                fp.write('%s: %s\n' % (clean_saved_value(col.name), clean_saved_value(val)))
+            fp.write('\n')
 
 
 class LsvSheet(Sheet):

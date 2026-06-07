@@ -1,6 +1,6 @@
 from visidata import vd, VisiData, SequenceSheet, options
 from visidata import Progress
-from visidata.text_source import iter_clean_records, clean_text_line, clean_text_row
+from visidata.text_source import clean_text_line, clean_text_row, is_empty_text_row, extend_text_row, wrap_error_row
 from visidata.save import clean_saved_value
 
 vd.option('csv_dialect', 'excel', 'dialect passed to csv.reader', replay=True)
@@ -51,7 +51,7 @@ class CsvSheet(SequenceSheet):
     _rowtype = list  # rowdef: list of values
 
     def iterload(self):
-        'Convert from CSV, going through the shared iter_clean_records pipeline.'
+        'Load CSV rows, reusing shared helpers for cleanup, empty detection, extension, and error wrapping.'
         import csv
         csv.field_size_limit(2**31-1)  #288 Windows has max 32-bit
 
@@ -61,15 +61,30 @@ class CsvSheet(SequenceSheet):
             if csv_opts['delimiter'] == self.source.options.getdefault('csv_delimiter'):
                 csv_opts['delimiter'] = self.source.options.delimiter
 
+        ncols = self.nVisibleCols
         with self.open_text_source(newline='') as fp:
-            # NUL-clean lines before csv.reader sees them, then pass parsed rows through pipeline
             rdr = csv.reader((clean_text_line(line) for line in fp), **csv_opts)
-            yield from iter_clean_records(rdr, lambda r: r, ncols=self.nVisibleCols, record_cleaner=clean_text_row)
+            it = iter(rdr)
+            while True:
+                try:
+                    raw = next(it)
+                except StopIteration:
+                    return
+                except Exception as e:
+                    yield wrap_error_row(e, ncols or 1)
+                    continue
+                try:
+                    row = clean_text_row(raw)
+                    if is_empty_text_row(row):
+                        continue
+                    yield extend_text_row(row, ncols)
+                except Exception as e:
+                    yield wrap_error_row(e, ncols or 1)
 
 
 @VisiData.api
 def save_csv(vd, p, sheet):
-    'Save as single CSV file via the shared save_text_table pipeline.'
+    'Save as single CSV file. Reuses clean_saved_value for NUL stripping.'
     import csv
     csv.field_size_limit(2**31-1)  #288 Windows has max 32-bit
 
@@ -79,19 +94,14 @@ def save_csv(vd, p, sheet):
         if csv_opts['delimiter'] == p.options.getdefault('csv_delimiter'):
             csv_opts['delimiter'] = p.options.delimiter
 
-    cw_holder = {}
-
-    def _write_header(fp, cols, clean):
-        cw_holder['cw'] = csv.writer(fp, **csv_opts)
-        colnames = [clean(col.name) for col in cols]
-        if ''.join(colnames):
-            cw_holder['cw'].writerow(colnames)
-
-    def _write_row(fp, dispvals, clean):
-        cw_holder['cw'].writerow([clean(v) for v in dispvals.values()])
-
     with Progress(gerund='saving', total=sheet.nRows):
-        sheet.save_text_table(p, write_header=_write_header, write_row=_write_row, newline='')
+        with p.open(mode='w', encoding=sheet.options.save_encoding, newline='') as fp:
+            cw = csv.writer(fp, **csv_opts)
+            colnames = [clean_saved_value(col.name) for col in sheet.visibleCols]
+            if ''.join(colnames):
+                cw.writerow(colnames)
+            for dispvals in sheet.iterdispvals(format=True):
+                cw.writerow([clean_saved_value(v) for v in dispvals.values()])
 
 vd.addGlobals({
     'CsvSheet': CsvSheet

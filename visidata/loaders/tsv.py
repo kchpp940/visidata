@@ -5,7 +5,8 @@ import time
 
 from visidata import vd, asyncthread, options, Progress, ColumnItem, SequenceSheet, Sheet, VisiData
 from visidata import namedlist, filesize
-from visidata.text_source import iter_clean_records, clean_text_line
+from visidata.text_source import clean_text_line, is_empty_text_row, extend_text_row, wrap_error_row
+from visidata.save import clean_saved_value
 
 vd.option('delimiter', '\t', 'field delimiter to use for tsv/csv filetype', replay=True)
 vd.option('row_delimiter', '\n', 'row delimiter to use for tsv/csv filetype', replay=True)
@@ -68,6 +69,7 @@ def splitter(stream, delim='\n'):
 # rowdef: list
 class TsvSheet(SequenceSheet):
     def iterload(self):
+        'Load TSV rows, reusing shared helpers for cleanup, empty detection, extension, and error wrapping.'
         delim = self.source.options.delimiter
         rowdelim = self.source.options.row_delimiter
         if delim == '':
@@ -81,6 +83,7 @@ class TsvSheet(SequenceSheet):
         if delim == rowdelim:
             vd.fail('field delimiter and row delimiter cannot be the same')
 
+        ncols = self.nVisibleCols
         with self.open_text_source() as fp:
             regex_skip = getattr(fp, '_regex_skip', None)
             def _records():
@@ -88,12 +91,29 @@ class TsvSheet(SequenceSheet):
                     if not rawline or (regex_skip and regex_skip.match(rawline)):
                         continue
                     yield rawline
-            yield from iter_clean_records(_records(), lambda line: line.split(delim), ncols=self.nVisibleCols)
+
+            it = iter(_records())
+            while True:
+                try:
+                    raw = next(it)
+                except StopIteration:
+                    return
+                except Exception as e:
+                    yield wrap_error_row(e, ncols or 1)
+                    continue
+                try:
+                    cleaned = clean_text_line(raw)
+                    row = cleaned.split(delim)
+                    if is_empty_text_row(row):
+                        continue
+                    yield extend_text_row(row, ncols)
+                except Exception as e:
+                    yield wrap_error_row(e, ncols or 1)
 
 
 @VisiData.api
 def save_tsv(vd, p, vs):
-    'Write sheet to file `fn` as TSV via the shared save_text_table pipeline.'
+    'Write sheet to file `fn` as TSV. Reuses clean_saved_value for NUL stripping.'
     unitsep = p.options.delimiter
     rowsep = p.options.row_delimiter
     if unitsep == '':
@@ -106,14 +126,11 @@ def save_tsv(vd, p, vs):
         vd.fail('field delimiter and row delimiter cannot be the same')
     trdict = vs.safe_trdict(delimiter=unitsep)
 
-    def _write_header(fp, cols, clean):
-        fp.write(unitsep.join(clean(col.name.translate(trdict)) for col in cols) + rowsep)
-
-    def _write_row(fp, dispvals, clean):
-        fp.write(unitsep.join(clean(v) for v in dispvals.values()))
-        fp.write(rowsep)
-
-    vs.save_text_table(p, write_header=_write_header, write_row=_write_row, delimiter=unitsep)
+    with p.open(mode='w', encoding=vs.options.save_encoding) as fp:
+        fp.write(unitsep.join(clean_saved_value(col.name.translate(trdict)) for col in vs.visibleCols) + rowsep)
+        for dispvals in vs.iterdispvals(format=True, delimiter=unitsep):
+            fp.write(unitsep.join(clean_saved_value(v) for v in dispvals.values()))
+            fp.write(rowsep)
 
 
 vd.addGlobals({

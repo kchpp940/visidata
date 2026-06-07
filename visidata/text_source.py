@@ -49,79 +49,6 @@ def wrap_error_row(exc, ncols):
     return errrow
 
 
-def iter_clean_text_rows(fp, parse_line, ncols=0):
-    '''Generator that yields parsed rows from a text file fp using parse_line(line)->row.
-
-    Shared for line-per-record text-table loaders (CSV, TSV, USV, PSV).
-    Not for multi-line-per-record formats like LSV (those should implement their own record producer).
-
-    Pipeline per line: clean NUL → parse → empty check → extend → error wrap
-    '''
-    yield from iter_clean_records(fp, parse_line, ncols=ncols, record_cleaner=clean_text_line)
-
-
-def iter_clean_records(records_iter, parse_record, ncols=0, record_cleaner=clean_text_line):
-    '''Unified pipeline for line-per-record text-table formats (CSV, TSV, USV, PSV).
-
-    Pipeline per record:
-      1. Get next from records_iter (catches iterator exceptions like csv.Error → error row)
-      2. record_cleaner (NUL cleanup per line or per field)
-      3. parse_record (format-specific parse, must return list row)
-      4. is_empty_text_row check → skip
-      5. extend_text_row to ncols → yield
-
-    Exceptions from both the record iterator and parse_record are caught, wrapped as error
-    rows with TypedExceptionWrapper in the first column.
-
-    For multi-line-per-record formats (e.g. LSV), implement your own record producer and
-    reuse the individual helpers: clean_text_line, open_text_source, clean_saved_value, etc.
-
-    Args:
-        records_iter: iterable yielding raw records (strings for line-based, list for pre-parsed like CSV)
-        parse_record: callable(cleaned_record) -> list row (must not return None)
-        ncols: target column count for extending short rows and sizing error rows
-        record_cleaner: callable(raw_record) -> cleaned_record, default: clean_text_line (strip NUL from strings).
-            Use clean_text_row for pre-parsed list records (e.g. csv.reader output).
-    '''
-    it = iter(records_iter)
-    while True:
-        try:
-            raw = next(it)
-        except StopIteration:
-            return
-        except Exception as e:
-            yield wrap_error_row(e, ncols or 1)
-            continue
-        try:
-            cleaned = record_cleaner(raw)
-            row = parse_record(cleaned)
-            if is_empty_text_row(row):
-                continue
-            yield extend_text_row(row, ncols)
-        except Exception as e:
-            yield wrap_error_row(e, ncols or 1)
-
-
-@BaseSheet.api
-def iter_text_rows(sheet, parse_record, ncols=None, record_cleaner=clean_text_line, **open_kwargs):
-    '''Sheet-level unified loading API for line-per-record text formats.
-
-    Opens sheet source via open_text_source (encoding, encoding_errors, regex_skip all handled uniformly),
-    then runs iter_clean_records pipeline.
-
-    Not for multi-line-per-record formats (e.g. LSV) — those should call open_text_source
-    directly and implement their own record assembly.
-
-    Args:
-        parse_record: callable(cleaned_record) -> list row
-        ncols: column count (default sheet.nVisibleCols)
-        record_cleaner: clean_text_line for string records, clean_text_row for pre-parsed list rows
-        **open_kwargs: extra kwargs for open_text_source (e.g. newline='' for CSV)
-    '''
-    ncols = ncols if ncols is not None else sheet.nVisibleCols
-    with sheet.open_text_source(**open_kwargs) as fp:
-        yield from iter_clean_records(fp, parse_record, ncols=ncols, record_cleaner=record_cleaner)
-
 @BaseSheet.api
 def regex_flags(sheet):
     'Return flags to pass to regex functions from options'
@@ -178,6 +105,4 @@ vd.addGlobals({
     'is_empty_text_row': is_empty_text_row,
     'extend_text_row': extend_text_row,
     'wrap_error_row': wrap_error_row,
-    'iter_clean_text_rows': iter_clean_text_rows,
-    'iter_clean_records': iter_clean_records,
 })
