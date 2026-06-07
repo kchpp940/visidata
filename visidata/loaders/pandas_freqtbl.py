@@ -158,7 +158,7 @@ class PandasFreqTableSheet(PivotSheet):
 
             self.addRow(PivotGroupRow(
                 element,
-                (0, 0),
+                None,
                 DataFrameRowSliceAdapter(df, mask),
                 {}
             ))

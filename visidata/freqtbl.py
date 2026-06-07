@@ -1,8 +1,8 @@
 from copy import copy
 import itertools
 
-from visidata import vd, vlen, VisiData, Column, AttrColumn, Sheet, ColumnsSheet, Fanout, Progress, asyncthread
-from visidata.pivot import PivotSheet, PivotGroupRow
+from visidata import vd, vlen, VisiData, Column, AttrColumn, Sheet, ColumnsSheet, Fanout, Progress, asyncthread, TypedWrapper, TypedExceptionWrapper
+from visidata.pivot import PivotSheet, PivotGroupRow, formatRange
 
 
 vd.theme_option('disp_histogram', '■', 'histogram element character')
@@ -10,11 +10,27 @@ vd.option('histogram_bins', 0, 'number of bins for histogram of numeric columns'
 vd.option('numeric_binning', False, 'bin numeric columns into ranges', replay=True)
 
 
+def _formatDiscreteVal(x):
+    if isinstance(x, TypedExceptionWrapper):
+        return '#ERR'
+    if isinstance(x, TypedWrapper):
+        return ''
+    if x is None:
+        return ''
+    return str(x)
+
+
 @VisiData.api
 def valueNames(vd, discrete_vals, numeric_vals):
-    ret = [ '+'.join(str(x) for x in discrete_vals) ]
-    if isinstance(numeric_vals, tuple) and numeric_vals != (0, 0):
-        ret.append('%s-%s' % numeric_vals)
+    ret = [ '+'.join(_formatDiscreteVal(x) for x in discrete_vals) ]
+    if isinstance(numeric_vals, tuple) and numeric_vals is not None:
+        s = ' - '.join(_formatDiscreteVal(x) for x in numeric_vals)
+        if s:
+            ret.append(s)
+    elif numeric_vals is not None:
+        s = _formatDiscreteVal(numeric_vals)
+        if s:
+            ret.append(s)
 
     return '+'.join(ret)
 
@@ -172,7 +188,7 @@ Each row on this sheet corresponds to a *bin* of rows on the source sheet that h
 class FreqTableSheetSummary(FreqTableSheet):
     'Append a PivotGroupRow to FreqTableSheet with only selectedRows.'
     def afterLoad(self):
-        self.addRow(PivotGroupRow(['Selected'], (0,0), self.source.selectedRows, {}))
+        self.addRow(PivotGroupRow(['Selected'], None, self.source.selectedRows, {}))
         super().afterLoad()
 
 

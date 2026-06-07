@@ -1,9 +1,18 @@
 import collections
 from copy import copy
 from visidata import ScopedSetattr, Column, Sheet, asyncthread, Progress, forward, wrapply, INPROGRESS
-from visidata import vlen, vd, date, setitem, anytype
+from visidata import vlen, vd, date, setitem, anytype, TypedWrapper, TypedExceptionWrapper
 import visidata
 
+
+class _NumericBinningSentinel:
+    def __init__(self, label):
+        self.label = label
+    def __repr__(self):
+        return self.label
+
+_NUMERIC_NULL = _NumericBinningSentinel('NUMERIC_NULL')
+_NUMERIC_ERROR = _NumericBinningSentinel('NUMERIC_ERROR')
 
 # discrete_keys = tuple of formatted discrete keys that group the row
 # numeric_key is a range
@@ -18,21 +27,52 @@ def makePivot(source, groupByCols, pivotCols):
             source=source)
 
 def makeErrorKey(col):
-    if col.type is date:
-        return date.min # date('2000-01-01')
-    else:
-        return col.type()
+    return _NUMERIC_ERROR
+
+def makeNullKey(col):
+    return _NUMERIC_NULL
 
 def formatRange(col, numeric_key):
+    if numeric_key is None:
+        return None
+    if not isinstance(numeric_key, tuple):
+        if numeric_key is _NUMERIC_ERROR or isinstance(numeric_key, TypedExceptionWrapper):
+            return '#ERR'
+        if numeric_key is _NUMERIC_NULL or (isinstance(numeric_key, TypedWrapper) and numeric_key.val is None):
+            return ''
+        return col.format(numeric_key)
     a, b = numeric_key
-    nankey = makeErrorKey(col)
+    if a is _NUMERIC_ERROR and b is _NUMERIC_ERROR:
+        return '#ERR'
+    if a is _NUMERIC_NULL and b is _NUMERIC_NULL:
+        return ''
     if b is None:
         return a
-    if a is nankey and b is nankey:
-        return '#ERR'
-    elif a == b:
+    if a == b:
         return col.format(a)
     return ' - '.join(col.format(x) for x in numeric_key)
+
+def _isExceptionalValue(v):
+    return v is None or isinstance(v, TypedWrapper)
+
+def _exceptionalGroupKey(v):
+    if isinstance(v, TypedExceptionWrapper):
+        return _NUMERIC_ERROR
+    if v is None or (isinstance(v, TypedWrapper) and v.val is None):
+        return _NUMERIC_NULL
+    return None
+
+_DISCRETE_ERROR = object()
+_DISCRETE_NULL = object()
+
+def _groupKeyForValue(v):
+    if isinstance(v, TypedExceptionWrapper):
+        return _DISCRETE_ERROR
+    if isinstance(v, TypedWrapper):
+        return _DISCRETE_NULL
+    if v is None:
+        return _DISCRETE_NULL
+    return v
 
 
 class RangeColumn(Column):
@@ -227,43 +267,58 @@ class PivotSheet(Sheet):
         for sourcerow in self.source.iterrows('grouping'):
             discreteKeys = list(forward(origcol.getTypedValue(sourcerow)) for origcol in discreteCols)
 
-            # wrapply will pass-through a key-able TypedWrapper
-            formattedDiscreteKeys = tuple(wrapply(c.format, v) for v, c in zip(discreteKeys, discreteCols))
+            formattedDiscreteKeys = tuple(_groupKeyForValue(v) for v in discreteKeys)
 
             numericGroupRows, groupRow = groups.get(formattedDiscreteKeys, (None, None))
             if numericGroupRows is None:
-                # add new group rows
                 numericGroupRows = {formatRange(numericCols[0], numRange): PivotGroupRow(discreteKeys, numRange, [], {}) for numRange in numericBins}
                 groups[formattedDiscreteKeys] = (numericGroupRows, None)
                 for r in numericGroupRows.values():
                     self.addRow(r)
 
-            # find the grouprow this sourcerow belongs in, by numericbin
             if numericCols:
                 try:
                     val = numericCols[0].getValue(sourcerow)
                     val = wrapply(numericCols[0].type, val)
-                    if not val:
-                        groupRow = numericGroupRows.get(str(val), None)
+                    if _isExceptionalValue(val):
+                        errkey = _exceptionalGroupKey(val)
+                        if errkey is _NUMERIC_ERROR:
+                            fmtkey = '#ERR'
+                            numrange = (_NUMERIC_ERROR, _NUMERIC_ERROR)
+                        else:
+                            fmtkey = ''
+                            numrange = (_NUMERIC_NULL, _NUMERIC_NULL)
+                        groupRow = numericGroupRows.get(fmtkey, None)
+                        if groupRow is None:
+                            groupRow = PivotGroupRow(discreteKeys, numrange, [], {})
+                            numericGroupRows[fmtkey] = groupRow
+                            self.addRow(groupRow)
                     else:
                         if not width:
                             binidx = 0
                         elif degenerateBinning:
-                            # in degenerate binning, each val has its own bin
                             binidx = numericBins.index((val, val))
                         else:
                             binidx = int((val-minval)//width)
                         groupRow = numericGroupRows[formatRange(numericCols[0], numericBins[min(binidx, nbins-1)])]
                 except Exception as e:
                     vd.exceptionCaught(e)
+                    fmtkey = '#ERR'
+                    numrange = (_NUMERIC_ERROR, _NUMERIC_ERROR)
+                    groupRow = numericGroupRows.get(fmtkey, None)
+                    if groupRow is None:
+                        groupRow = PivotGroupRow(discreteKeys, numrange, [], {})
+                        numericGroupRows[fmtkey] = groupRow
+                        self.addRow(groupRow)
 
-            # add the main bin if no numeric bin (error, or no numeric cols)
             if groupRow is None:
                 if numericCols:
-                    groupRow = PivotGroupRow(discreteKeys, val, [], {})
-                    numericGroupRows[str(val)] = groupRow
+                    fmtkey = '#ERR'
+                    numrange = (_NUMERIC_ERROR, _NUMERIC_ERROR)
+                    groupRow = PivotGroupRow(discreteKeys, numrange, [], {})
+                    numericGroupRows[fmtkey] = groupRow
                 else:
-                    groupRow = PivotGroupRow(discreteKeys, (0, 0), [], {})
+                    groupRow = PivotGroupRow(discreteKeys, None, [], {})
                     groups[formattedDiscreteKeys] = (numericGroupRows, groupRow)
                 self.addRow(groupRow)
 
@@ -273,6 +328,7 @@ class PivotSheet(Sheet):
             # separate by pivot value
             for col in self.pivotCols:
                 varval = col.getTypedValue(sourcerow)
+                varval = _groupKeyForValue(varval)
                 matchingRows = groupRow.pivotrows.get(varval)
                 if matchingRows is None:
                     matchingRows = groupRow.pivotrows[varval] = []
