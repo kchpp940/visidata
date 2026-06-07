@@ -1,8 +1,8 @@
 from copy import copy
 import itertools
 
-from visidata import vd, vlen, VisiData, Column, AttrColumn, Sheet, ColumnsSheet, Fanout, Progress, asyncthread, TypedWrapper, TypedExceptionWrapper
-from visidata.pivot import PivotSheet, PivotGroupRow, formatRange
+from visidata import vd, vlen, VisiData, Column, AttrColumn, Sheet, ColumnsSheet, Fanout, Progress, asyncthread
+from visidata.pivot import PivotSheet, PivotGroupRow, formatRange, formatGroupValue
 
 
 vd.theme_option('disp_histogram', '■', 'histogram element character')
@@ -10,29 +10,17 @@ vd.option('histogram_bins', 0, 'number of bins for histogram of numeric columns'
 vd.option('numeric_binning', False, 'bin numeric columns into ranges', replay=True)
 
 
-def _formatDiscreteVal(x):
-    if isinstance(x, TypedExceptionWrapper):
-        return '#ERR'
-    if isinstance(x, TypedWrapper):
-        return ''
-    if x is None:
-        return ''
-    return str(x)
-
-
 @VisiData.api
 def valueNames(vd, discrete_vals, numeric_vals):
-    ret = [ '+'.join(_formatDiscreteVal(x) for x in discrete_vals) ]
-    if isinstance(numeric_vals, tuple) and numeric_vals is not None:
-        s = ' - '.join(_formatDiscreteVal(x) for x in numeric_vals)
-        if s:
-            ret.append(s)
-    elif numeric_vals is not None:
-        s = _formatDiscreteVal(numeric_vals)
-        if s:
-            ret.append(s)
-
-    return '+'.join(ret)
+    parts = []
+    discrete_part = '+'.join(formatGroupValue(None, x) for x in discrete_vals)
+    if discrete_part:
+        parts.append(discrete_part)
+    if numeric_vals is not None:
+        numeric_part = formatGroupValue(None, numeric_vals)
+        if numeric_part:
+            parts.append(numeric_part)
+    return '+'.join(parts)
 
 class HistogramColumn(Column):
     '.sourceCol is the column to be histogrammed'

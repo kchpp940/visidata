@@ -7,6 +7,7 @@ import itertools
 
 from visidata import Progress, Sheet, Column, ColumnsSheet, VisiData, SettableColumn
 from visidata import vd, anytype, numtype, vlen, asyncthread, wrapply, AttrDict, date, INPROGRESS, dispwidth, stacktrace, TypedExceptionWrapper
+from visidata.pivot import normalizeGroupValue
 
 vd.help_aggregators = '''# Choose Aggregators
 Start typing an aggregator name or description.
@@ -207,9 +208,8 @@ def aggregate_groups(sheet, col, rows, aggr) -> list:
     *col* is a column whose values determine each row's rank within a group.
     *rows* is a list of visidata rows.
     *aggr* is an Aggregator object.
-    Rows are grouped by their key columns. Null key column cells are considered equal,
-    so nulls are grouped together. Cells with exceptions do not group together.
-    Each exception cell is grouped by itself, with only one row in the group.
+    Rows are grouped by their key columns, using the same normalized group key logic
+    as pivot/freqtbl: nulls group together, errors group together, real values pass through.
     '''
     def _key_progress(prog):
         def identity(val):
@@ -219,26 +219,21 @@ def aggregate_groups(sheet, col, rows, aggr) -> list:
 
     with Progress(gerund='ranking', total=4*sheet.nRows) as prog:
         p = _key_progress(prog) # increment progress every time p() is called
-        # compile row data, for each row a list of tuples: (group_key, rank_key, rownum)
-        rowdata = [(sheet.rowkey(r), col.getTypedValue(r), p(rownum)) for rownum, r in enumerate(rows)]
-        # sort by row key and column value to prepare for grouping
+        rowdata = [(tuple(normalizeGroupValue(k) for k in sheet.rowkey(r)), col.getTypedValue(r), p(rownum)) for rownum, r in enumerate(rows)]
         try:
             rowdata.sort(key=p)
         except TypeError as e:
             vd.fail(f'elements in a ranking column must be comparable: {e.args[0]}')
         rowvals = []
-        #group by row key
         for _, group in itertools.groupby(rowdata, key=lambda v: v[0]):
-            # within a group, the rows have already been sorted by col_val
             group = list(group)
-            if isinstance(aggr, ListAggregator): # for list aggregators, each row gets its own value
+            if isinstance(aggr, ListAggregator):
                 aggr_vals = aggr.aggregate_list(col, [rows[rownum] for _, _, rownum in group])
                 rowvals += [(rownum, v) for (_, _, rownum), v in zip(group, aggr_vals)]
-            else:             # for normal aggregators, each row in the group gets the same value
+            else:
                 aggr_val = aggr.aggregate(col, [rows[rownum] for _, _, rownum in group])
                 rowvals += [(rownum, aggr_val) for _, _, rownum in group]
             prog.addProgress(len(group))
-        # sort by unique rownum, to make rank results match the original row order
         rowvals.sort(key=p)
         rowvals = [ v for rownum, v in rowvals ]
         return rowvals
