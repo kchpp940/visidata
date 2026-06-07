@@ -3,12 +3,52 @@ import collections
 #1179  Line Separated Values for e.g. awk
 
 from visidata import VisiData, Sheet, ItemColumn, TypedExceptionWrapper, stacktrace
-from visidata.text_source import iter_clean_records
+from visidata.text_source import clean_text_line
 
 
 @VisiData.api
 def open_lsv(vd, p):
     return LsvSheet(p.base_stem, source=p)
+
+
+def _lsv_error_row(exc):
+    if not hasattr(exc, 'stacktrace'):
+        exc.stacktrace = stacktrace()
+    return {'_error': str(TypedExceptionWrapper(None, exception=exc))}
+
+
+def _lsv_records(fp):
+    '''LSV record producer — multi-line accumulation specific to this format.
+
+    Reuses clean_text_line (NUL strip) and produces dict rows per record.
+    Last non-empty record without trailing blank line is flushed on StopIteration.
+    Each line is wrapped individually for exceptions; record boundaries are always
+    explicit blank lines so a bad line only corrupts its own record.
+    '''
+    row = collections.defaultdict(str)
+    current_key = ''
+
+    for raw_line in fp:
+        try:
+            line = clean_text_line(raw_line).strip()
+            if not line:
+                if row:
+                    yield row
+                    row = collections.defaultdict(str)
+                    current_key = ''
+                continue
+            if ':' in line:
+                current_key, rest = line.split(':', maxsplit=1)
+                current_key = current_key.strip()
+                line = rest
+            row[current_key] += line.strip()
+        except Exception as e:
+            yield _lsv_error_row(e)
+            row = collections.defaultdict(str)
+            current_key = ''
+
+    if row:
+        yield row
 
 
 @VisiData.api
@@ -21,13 +61,6 @@ def save_lsv(vd, p, *vsheets):
         fp.write('\n')
 
     vs.save_text_table(p, write_row=_write_row)
-
-
-def _lsv_wrap_error(exc, ncols):
-    if not hasattr(exc, 'stacktrace'):
-        exc.stacktrace = stacktrace()
-    errwrap = TypedExceptionWrapper(None, exception=exc)
-    return {'_error': str(errwrap)}
 
 
 class LsvSheet(Sheet):
@@ -43,24 +76,5 @@ class LsvSheet(Sheet):
         self.rows = []
         self._knownCols = set()
 
-        state = {'row': collections.defaultdict(str), 'k': ''}
-
-        def _parse_record(line):
-            line = line.strip()
-            if not line:
-                result = state['row']
-                state['row'] = collections.defaultdict(str)
-                state['k'] = ''
-                return result
-            if ':' in line:
-                state['k'], rest = line.split(':', maxsplit=1)
-                state['k'] = state['k'].strip()
-                line = rest
-            state['row'][state['k']] += line.strip()
-            return None
-
         with self.open_text_source() as fp:
-            yield from iter_clean_records(fp, _parse_record, ncols=0, wrap_error=_lsv_wrap_error)
-
-        if state['row']:
-            yield state['row']
+            yield from _lsv_records(fp)
