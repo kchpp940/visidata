@@ -10,6 +10,15 @@ vd.option('save_encoding', 'utf-8', 'encoding passed to codecs.open when saving 
 
 _compression_formats = {'gz', 'bz2', 'xz', 'lzma', 'zst'}
 
+def clean_saved_value(v):
+    """Shared output cleanup for all text-table savers: strip NUL characters.
+
+    Applied after formatting and type conversion. Always applied regardless of safety_first setting.
+    """
+    if isinstance(v, str):
+        return v.replace('\0', '')
+    return v
+
 def parse_filetype(ft):
     'Parse filetype string like "json.gz" into (format, compression). Returns (ft, None) for plain types.'
     for sep in ('.', '+'):
@@ -215,17 +224,12 @@ def save_txt(vd, p, *vsheets):
     if len(vsheets) == 1 and vsheets[0].nVisibleCols > 1:  #2173
         return vd.save_tsv(p, vsheets[0])
 
-    def _stripnull(v):
-        if isinstance(v, str):
-            return v.replace('\0', '')
-        return v
-
     with p.open(mode='w', encoding=vsheets[0].options.save_encoding) as fp:
         for vs in vsheets:
             unitsep = p.options.delimiter
             rowsep = p.options.row_delimiter
             for dispvals in vs.iterdispvals(*vs.visibleCols, format=True):
-                fp.write(unitsep.join(_stripnull(v) for v in dispvals.values()))
+                fp.write(unitsep.join(clean_saved_value(v) for v in dispvals.values()))
                 fp.write(rowsep)
 
 
@@ -252,3 +256,7 @@ vd.addMenuItems('''
     File > Save > current column > save-col
     File > Save > keys and current column > save-col-keys
 ''')
+
+vd.addGlobals({
+    'clean_saved_value': clean_saved_value,
+})

@@ -1,5 +1,7 @@
-from visidata import vd, VisiData, SequenceSheet, options, stacktrace
-from visidata import TypedExceptionWrapper, Progress
+from visidata import vd, VisiData, SequenceSheet, options
+from visidata import Progress
+from visidata.text_source import clean_text_line, extend_text_row, wrap_error_row, is_empty_text_row
+from visidata.save import clean_saved_value
 
 vd.option('csv_dialect', 'excel', 'dialect passed to csv.reader', replay=True)
 vd.option('csv_delimiter', ',', 'delimiter passed to csv.reader', replay=True)
@@ -45,10 +47,6 @@ def guess_csv(vd, p):
 def open_csv(vd, p):
     return CsvSheet(p.base_stem, source=p)
 
-def removeNulls(fp):
-    for line in fp:
-        yield line.replace('\0', '')
-
 class CsvSheet(SequenceSheet):
     _rowtype = list  # rowdef: list of values
 
@@ -64,23 +62,16 @@ class CsvSheet(SequenceSheet):
                 csv_opts['delimiter'] = self.source.options.delimiter
 
         with self.open_text_source(newline='') as fp:
-            rdr = csv.reader(removeNulls(fp), **csv_opts)
+            rdr = csv.reader((clean_text_line(line) for line in fp), **csv_opts)
 
             while True:
                 try:
                     row = next(rdr)
-                    if not row:
+                    if is_empty_text_row(row):
                         continue
-                    ncols = self.nVisibleCols
-                    if ncols and len(row) < ncols:
-                        row.extend([None]*(ncols-len(row)))
-                    yield row
+                    yield extend_text_row(row, self.nVisibleCols)
                 except csv.Error as e:
-                    e.stacktrace=stacktrace()
-                    ncols = self.nVisibleCols or 1
-                    errrow = [None]*ncols
-                    errrow[0] = TypedExceptionWrapper(None, exception=e)
-                    yield errrow
+                    yield wrap_error_row(e, self.nVisibleCols or 1)
                 except StopIteration:
                     return
 
@@ -97,20 +88,15 @@ def save_csv(vd, p, sheet):
         if csv_opts['delimiter'] == p.options.getdefault('csv_delimiter'):
             csv_opts['delimiter'] = p.options.delimiter
 
-    def _sanitize(v):
-        if isinstance(v, str):
-            return v.replace('\0', '')
-        return v
-
     with p.open(mode='w', encoding=sheet.options.save_encoding, newline='') as fp:
         cw = csv.writer(fp, **csv_opts)
-        colnames = [_sanitize(col.name) for col in sheet.visibleCols]
+        colnames = [clean_saved_value(col.name) for col in sheet.visibleCols]
         if ''.join(colnames):
             cw.writerow(colnames)
 
         with Progress(gerund='saving', total=sheet.nRows) as prog:
             for dispvals in sheet.iterdispvals(format=True):
-                cw.writerow([_sanitize(v) for v in dispvals.values()])
+                cw.writerow([clean_saved_value(v) for v in dispvals.values()])
                 prog.addProgress(1)
 
 vd.addGlobals({
