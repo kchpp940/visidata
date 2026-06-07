@@ -2,7 +2,7 @@ import collections
 
 #1179  Line Separated Values for e.g. awk
 
-from visidata import VisiData, Sheet, ItemColumn
+from visidata import VisiData, Sheet, ItemColumn, TypedExceptionWrapper, stacktrace
 
 
 @VisiData.api
@@ -13,10 +13,16 @@ def open_lsv(vd, p):
 @VisiData.api
 def save_lsv(vd, p, *vsheets):
     vs = vsheets[0]
+
+    def _sanitize(v):
+        if isinstance(v, str):
+            return v.replace('\0', '')
+        return v
+
     with p.open(mode='w', encoding=vs.options.save_encoding) as fp:
-        for row in vs.iterrows('saving'):
-            for col in vs.visibleCols:
-                fp.write('%s: %s\n' % (col.name, col.getFullDisplayValue(row)))
+        for dispvals in vs.iterdispvals(format=True):
+            for col, val in dispvals.items():
+                fp.write('%s: %s\n' % (_sanitize(col.name), _sanitize(val)))
             fp.write('\n')
 
 
@@ -38,16 +44,21 @@ class LsvSheet(Sheet):
 
         with self.open_text_source() as fp:
             for line in fp:
-                line = line.strip()
-                if not line:
-                    yield row
-                    row = collections.defaultdict(str)
+                try:
+                    line = line.replace('\0', '').strip()
+                    if not line:
+                        yield row
+                        row = collections.defaultdict(str)
 
-                if ':' in line:
-                    k, line = line.split(':', maxsplit=1)
-                # else append to previous k
+                    if ':' in line:
+                        k, line = line.split(':', maxsplit=1)
+                    # else append to previous k
 
-                row[k.strip()] += line.strip()
+                    row[k.strip()] += line.strip()
+                except Exception as e:
+                    e.stacktrace = stacktrace()
+                    errwrap = TypedExceptionWrapper(None, exception=e)
+                    row['_error'] = str(errwrap)
 
         if row:
             yield row

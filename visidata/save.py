@@ -215,12 +215,17 @@ def save_txt(vd, p, *vsheets):
     if len(vsheets) == 1 and vsheets[0].nVisibleCols > 1:  #2173
         return vd.save_tsv(p, vsheets[0])
 
+    def _stripnull(v):
+        if isinstance(v, str):
+            return v.replace('\0', '')
+        return v
+
     with p.open(mode='w', encoding=vsheets[0].options.save_encoding) as fp:
         for vs in vsheets:
             unitsep = p.options.delimiter
             rowsep = p.options.row_delimiter
             for dispvals in vs.iterdispvals(*vs.visibleCols, format=True):
-                fp.write(unitsep.join(dispvals.values()))
+                fp.write(unitsep.join(_stripnull(v) for v in dispvals.values()))
                 fp.write(rowsep)
 
 

@@ -15,7 +15,7 @@ vd.option('safety_first', False, 'sanitize input/output to handle edge cases, wi
 @VisiData.api
 def guess_csv_delimiter(vd, p):
     'If csv_delimiter option has been modified from default, assume CSV format.'
-    
+
     if vd.options.csv_delimiter != vd.options.getdefault('csv_delimiter'):
         return dict(filetype='csv', _likelihood=2)
 
@@ -64,17 +64,23 @@ class CsvSheet(SequenceSheet):
                 csv_opts['delimiter'] = self.source.options.delimiter
 
         with self.open_text_source(newline='') as fp:
-            if self.options.safety_first:
-                rdr = csv.reader(removeNulls(fp), **csv_opts)
-            else:
-                rdr = csv.reader(fp, **csv_opts)
+            rdr = csv.reader(removeNulls(fp), **csv_opts)
 
             while True:
                 try:
-                    yield next(rdr)
+                    row = next(rdr)
+                    if not row:
+                        continue
+                    ncols = self.nVisibleCols
+                    if ncols and len(row) < ncols:
+                        row.extend([None]*(ncols-len(row)))
+                    yield row
                 except csv.Error as e:
                     e.stacktrace=stacktrace()
-                    yield [TypedExceptionWrapper(None, exception=e)]
+                    ncols = self.nVisibleCols or 1
+                    errrow = [None]*ncols
+                    errrow[0] = TypedExceptionWrapper(None, exception=e)
+                    yield errrow
                 except StopIteration:
                     return
 
@@ -91,15 +97,20 @@ def save_csv(vd, p, sheet):
         if csv_opts['delimiter'] == p.options.getdefault('csv_delimiter'):
             csv_opts['delimiter'] = p.options.delimiter
 
+    def _sanitize(v):
+        if isinstance(v, str):
+            return v.replace('\0', '')
+        return v
+
     with p.open(mode='w', encoding=sheet.options.save_encoding, newline='') as fp:
         cw = csv.writer(fp, **csv_opts)
-        colnames = [col.name for col in sheet.visibleCols]
+        colnames = [_sanitize(col.name) for col in sheet.visibleCols]
         if ''.join(colnames):
             cw.writerow(colnames)
 
         with Progress(gerund='saving', total=sheet.nRows) as prog:
             for dispvals in sheet.iterdispvals(format=True):
-                cw.writerow(dispvals.values())
+                cw.writerow([_sanitize(v) for v in dispvals.values()])
                 prog.addProgress(1)
 
 vd.addGlobals({

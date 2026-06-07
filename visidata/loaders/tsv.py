@@ -3,8 +3,8 @@ import collections
 import math
 import time
 
-from visidata import vd, asyncthread, options, Progress, ColumnItem, SequenceSheet, Sheet, VisiData
-from visidata import namedlist, filesize
+from visidata import vd, asyncthread, options, Progress, ColumnItem, SequenceSheet, Sheet, VisiData, stacktrace
+from visidata import namedlist, filesize, TypedExceptionWrapper
 
 vd.option('delimiter', '\t', 'field delimiter to use for tsv/csv filetype', replay=True)
 vd.option('row_delimiter', '\n', 'row delimiter to use for tsv/csv filetype', replay=True)
@@ -86,13 +86,21 @@ class TsvSheet(SequenceSheet):
                     if not line or (regex_skip and regex_skip.match(line)):
                         continue
 
-                    row = line.split(delim)
+                    try:
+                        line = line.replace('\0', '')
+                        row = line.split(delim)
 
-                    if len(row) < self.nVisibleCols:
-                        # extend rows that are missing entries
-                        row.extend([None]*(self.nVisibleCols-len(row)))
+                        if len(row) < self.nVisibleCols:
+                            # extend rows that are missing entries
+                            row.extend([None]*(self.nVisibleCols-len(row)))
 
-                    yield row
+                        yield row
+                    except Exception as e:
+                        e.stacktrace = stacktrace()
+                        ncols = self.nVisibleCols or 1
+                        errrow = [None]*ncols
+                        errrow[0] = TypedExceptionWrapper(None, exception=e)
+                        yield errrow
 
 
 @VisiData.api
@@ -110,12 +118,17 @@ def save_tsv(vd, p, vs):
         vd.fail('field delimiter and row delimiter cannot be the same')
     trdict = vs.safe_trdict(delimiter=unitsep)
 
+    def _stripnull(v):
+        if isinstance(v, str):
+            return v.replace('\0', '')
+        return v
+
     with p.open(mode='w', encoding=vs.options.save_encoding) as fp:
-        colhdr = unitsep.join(col.name.translate(trdict) for col in vs.visibleCols) + rowsep
+        colhdr = unitsep.join(_stripnull(col.name.translate(trdict)) for col in vs.visibleCols) + rowsep
         fp.write(colhdr)
 
         for dispvals in vs.iterdispvals(format=True, delimiter=unitsep):
-            fp.write(unitsep.join(dispvals.values()))
+            fp.write(unitsep.join(_stripnull(v) for v in dispvals.values()))
             fp.write(rowsep)
 
 
