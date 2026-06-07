@@ -13,6 +13,15 @@ def clean_text_line(line):
     return line
 
 
+def clean_text_row(row):
+    'Shared row-level cleanup for pre-parsed rows (e.g. csv.reader output): strip NUL from each string field in-place.'
+    if isinstance(row, list):
+        for i, v in enumerate(row):
+            if isinstance(v, str):
+                row[i] = v.replace('\0', '')
+    return row
+
+
 def is_empty_text_row(row):
     'Return True if row is empty (all empty string or None).'
     if row is None:
@@ -40,7 +49,7 @@ def wrap_error_row(exc, ncols):
     return errrow
 
 
-def iter_clean_text_rows(fp, parse_line, ncols=0):
+def iter_clean_text_rows(fp, parse_line, ncols=0, wrap_error=None):
     '''Generator that yields parsed rows from a text file fp using parse_line(line)->row.
 
     Shared for all text-table loaders:
@@ -49,15 +58,66 @@ def iter_clean_text_rows(fp, parse_line, ncols=0):
     - Extend short rows
     - Yields parsed rows
     '''
-    for rawline in fp:
+    yield from iter_clean_records(fp, parse_line, ncols=ncols, record_cleaner=clean_text_line, wrap_error=wrap_error)
+
+
+def iter_clean_records(records_iter, parse_record, ncols=0, record_cleaner=clean_text_line, wrap_error=None):
+    '''Unified text-table loading pipeline. All formats go through here.
+
+    Pipeline per record: get next from iterator → record_cleaner() → parse_record() → empty check → extend → error wrap
+    Exceptions are caught both from the record iterator (e.g. csv.reader csv.Error) and from parse_record.
+
+    Args:
+        records_iter: iterable yielding raw records (strings for line-based, list for pre-parsed like CSV)
+        parse_record: callable(cleaned_record) -> row or None.
+            Return None to skip (e.g. LSV still accumulating across lines).
+            Return a list/dict row to yield it.
+        ncols: target column count for extending short rows and sizing error rows
+        record_cleaner: callable(raw_record) -> cleaned_record, default: clean_text_line (strip NUL from strings).
+            Use clean_text_row for pre-parsed list records (e.g. csv.reader output).
+        wrap_error: callable(exc, ncols) -> error row. Default: wrap_error_row (produces list row with TypedExceptionWrapper in col 0).
+            Override for formats with dict rows (e.g. LSV).
+    '''
+    if wrap_error is None:
+        wrap_error = wrap_error_row
+    it = iter(records_iter)
+    while True:
         try:
-            line = clean_text_line(rawline)
-            row = parse_line(line)
+            raw = next(it)
+        except StopIteration:
+            return
+        except Exception as e:
+            yield wrap_error(e, ncols or 1)
+            continue
+        try:
+            cleaned = record_cleaner(raw)
+            row = parse_record(cleaned)
+            if row is None:
+                continue
             if is_empty_text_row(row):
                 continue
             yield extend_text_row(row, ncols)
         except Exception as e:
-            yield wrap_error_row(e, ncols or 1)
+            yield wrap_error(e, ncols or 1)
+
+
+@BaseSheet.api
+def iter_text_rows(sheet, parse_record, ncols=None, record_cleaner=clean_text_line, wrap_error=None, **open_kwargs):
+    '''Sheet-level unified text loading API.
+
+    Opens sheet source via open_text_source (encoding, encoding_errors, regex_skip all handled uniformly),
+    then runs iter_clean_records pipeline.
+
+    Args:
+        parse_record: callable(cleaned_record) -> row or None
+        ncols: column count (default sheet.nVisibleCols)
+        record_cleaner: clean_text_line for string records, clean_text_row for pre-parsed list rows
+        wrap_error: callable(exc, ncols) -> error row, default: wrap_error_row
+        **open_kwargs: extra kwargs for open_text_source (e.g. newline='' for CSV)
+    '''
+    ncols = ncols if ncols is not None else sheet.nVisibleCols
+    with sheet.open_text_source(**open_kwargs) as fp:
+        yield from iter_clean_records(fp, parse_record, ncols=ncols, record_cleaner=record_cleaner, wrap_error=wrap_error)
 
 @BaseSheet.api
 def regex_flags(sheet):
@@ -111,8 +171,10 @@ def open_text_source(sheet, **kwargs):
 
 vd.addGlobals({
     'clean_text_line': clean_text_line,
+    'clean_text_row': clean_text_row,
     'is_empty_text_row': is_empty_text_row,
     'extend_text_row': extend_text_row,
     'wrap_error_row': wrap_error_row,
     'iter_clean_text_rows': iter_clean_text_rows,
+    'iter_clean_records': iter_clean_records,
 })

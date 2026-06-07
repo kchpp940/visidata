@@ -3,8 +3,7 @@ import collections
 #1179  Line Separated Values for e.g. awk
 
 from visidata import VisiData, Sheet, ItemColumn, TypedExceptionWrapper, stacktrace
-from visidata.text_source import clean_text_line
-from visidata.save import clean_saved_value
+from visidata.text_source import iter_clean_records
 
 
 @VisiData.api
@@ -16,11 +15,19 @@ def open_lsv(vd, p):
 def save_lsv(vd, p, *vsheets):
     vs = vsheets[0]
 
-    with p.open(mode='w', encoding=vs.options.save_encoding) as fp:
-        for dispvals in vs.iterdispvals(format=True):
-            for col, val in dispvals.items():
-                fp.write('%s: %s\n' % (clean_saved_value(col.name), clean_saved_value(val)))
-            fp.write('\n')
+    def _write_row(fp, dispvals, clean):
+        for col, val in dispvals.items():
+            fp.write('%s: %s\n' % (clean(col.name), clean(val)))
+        fp.write('\n')
+
+    vs.save_text_table(p, write_row=_write_row)
+
+
+def _lsv_wrap_error(exc, ncols):
+    if not hasattr(exc, 'stacktrace'):
+        exc.stacktrace = stacktrace()
+    errwrap = TypedExceptionWrapper(None, exception=exc)
+    return {'_error': str(errwrap)}
 
 
 class LsvSheet(Sheet):
@@ -31,32 +38,29 @@ class LsvSheet(Sheet):
                 self.addColumn(ItemColumn(k))
                 self._knownCols.add(k)
 
-
     def iterload(self):
         self.columns = []
         self.rows = []
         self._knownCols = set()
-        row = collections.defaultdict(str)
-        k = ''
+
+        state = {'row': collections.defaultdict(str), 'k': ''}
+
+        def _parse_record(line):
+            line = line.strip()
+            if not line:
+                result = state['row']
+                state['row'] = collections.defaultdict(str)
+                state['k'] = ''
+                return result
+            if ':' in line:
+                state['k'], rest = line.split(':', maxsplit=1)
+                state['k'] = state['k'].strip()
+                line = rest
+            state['row'][state['k']] += line.strip()
+            return None
 
         with self.open_text_source() as fp:
-            for rawline in fp:
-                try:
-                    line = clean_text_line(rawline).strip()
-                    if not line:
-                        yield row
-                        row = collections.defaultdict(str)
+            yield from iter_clean_records(fp, _parse_record, ncols=0, wrap_error=_lsv_wrap_error)
 
-                    if ':' in line:
-                        k, line = line.split(':', maxsplit=1)
-                    # else append to previous k
-
-                    row[k.strip()] += line.strip()
-                except Exception as e:
-                    if not hasattr(e, 'stacktrace'):
-                        e.stacktrace = stacktrace()
-                    errwrap = TypedExceptionWrapper(None, exception=e)
-                    row['_error'] = str(errwrap)
-
-        if row:
-            yield row
+        if state['row']:
+            yield state['row']

@@ -1,6 +1,6 @@
 from visidata import vd, VisiData, SequenceSheet, options
 from visidata import Progress
-from visidata.text_source import clean_text_line, extend_text_row, wrap_error_row, is_empty_text_row
+from visidata.text_source import iter_clean_records, clean_text_line, clean_text_row
 from visidata.save import clean_saved_value
 
 vd.option('csv_dialect', 'excel', 'dialect passed to csv.reader', replay=True)
@@ -51,7 +51,7 @@ class CsvSheet(SequenceSheet):
     _rowtype = list  # rowdef: list of values
 
     def iterload(self):
-        'Convert from CSV, first handling header row specially.'
+        'Convert from CSV, going through the shared iter_clean_records pipeline.'
         import csv
         csv.field_size_limit(2**31-1)  #288 Windows has max 32-bit
 
@@ -62,23 +62,14 @@ class CsvSheet(SequenceSheet):
                 csv_opts['delimiter'] = self.source.options.delimiter
 
         with self.open_text_source(newline='') as fp:
+            # NUL-clean lines before csv.reader sees them, then pass parsed rows through pipeline
             rdr = csv.reader((clean_text_line(line) for line in fp), **csv_opts)
-
-            while True:
-                try:
-                    row = next(rdr)
-                    if is_empty_text_row(row):
-                        continue
-                    yield extend_text_row(row, self.nVisibleCols)
-                except csv.Error as e:
-                    yield wrap_error_row(e, self.nVisibleCols or 1)
-                except StopIteration:
-                    return
+            yield from iter_clean_records(rdr, lambda r: r, ncols=self.nVisibleCols, record_cleaner=clean_text_row)
 
 
 @VisiData.api
 def save_csv(vd, p, sheet):
-    'Save as single CSV file, handling column names as first line.'
+    'Save as single CSV file via the shared save_text_table pipeline.'
     import csv
     csv.field_size_limit(2**31-1)  #288 Windows has max 32-bit
 
@@ -88,16 +79,19 @@ def save_csv(vd, p, sheet):
         if csv_opts['delimiter'] == p.options.getdefault('csv_delimiter'):
             csv_opts['delimiter'] = p.options.delimiter
 
-    with p.open(mode='w', encoding=sheet.options.save_encoding, newline='') as fp:
-        cw = csv.writer(fp, **csv_opts)
-        colnames = [clean_saved_value(col.name) for col in sheet.visibleCols]
-        if ''.join(colnames):
-            cw.writerow(colnames)
+    cw_holder = {}
 
-        with Progress(gerund='saving', total=sheet.nRows) as prog:
-            for dispvals in sheet.iterdispvals(format=True):
-                cw.writerow([clean_saved_value(v) for v in dispvals.values()])
-                prog.addProgress(1)
+    def _write_header(fp, cols, clean):
+        cw_holder['cw'] = csv.writer(fp, **csv_opts)
+        colnames = [clean(col.name) for col in cols]
+        if ''.join(colnames):
+            cw_holder['cw'].writerow(colnames)
+
+    def _write_row(fp, dispvals, clean):
+        cw_holder['cw'].writerow([clean(v) for v in dispvals.values()])
+
+    with Progress(gerund='saving', total=sheet.nRows):
+        sheet.save_text_table(p, write_header=_write_header, write_row=_write_row, newline='')
 
 vd.addGlobals({
     'CsvSheet': CsvSheet

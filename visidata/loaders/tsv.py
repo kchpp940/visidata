@@ -5,8 +5,7 @@ import time
 
 from visidata import vd, asyncthread, options, Progress, ColumnItem, SequenceSheet, Sheet, VisiData
 from visidata import namedlist, filesize
-from visidata.text_source import clean_text_line, extend_text_row, wrap_error_row, is_empty_text_row
-from visidata.save import clean_saved_value
+from visidata.text_source import iter_clean_records, clean_text_line
 
 vd.option('delimiter', '\t', 'field delimiter to use for tsv/csv filetype', replay=True)
 vd.option('row_delimiter', '\n', 'row delimiter to use for tsv/csv filetype', replay=True)
@@ -83,24 +82,18 @@ class TsvSheet(SequenceSheet):
             vd.fail('field delimiter and row delimiter cannot be the same')
 
         with self.open_text_source() as fp:
-                regex_skip = getattr(fp, '_regex_skip', None)
+            regex_skip = getattr(fp, '_regex_skip', None)
+            def _records():
                 for rawline in splitter(adaptive_bufferer(fp), rowdelim):
                     if not rawline or (regex_skip and regex_skip.match(rawline)):
                         continue
-
-                    try:
-                        line = clean_text_line(rawline)
-                        row = line.split(delim)
-                        if is_empty_text_row(row):
-                            continue
-                        yield extend_text_row(row, self.nVisibleCols)
-                    except Exception as e:
-                        yield wrap_error_row(e, self.nVisibleCols or 1)
+                    yield rawline
+            yield from iter_clean_records(_records(), lambda line: line.split(delim), ncols=self.nVisibleCols)
 
 
 @VisiData.api
 def save_tsv(vd, p, vs):
-    'Write sheet to file `fn` as TSV.'
+    'Write sheet to file `fn` as TSV via the shared save_text_table pipeline.'
     unitsep = p.options.delimiter
     rowsep = p.options.row_delimiter
     if unitsep == '':
@@ -113,13 +106,14 @@ def save_tsv(vd, p, vs):
         vd.fail('field delimiter and row delimiter cannot be the same')
     trdict = vs.safe_trdict(delimiter=unitsep)
 
-    with p.open(mode='w', encoding=vs.options.save_encoding) as fp:
-        colhdr = unitsep.join(clean_saved_value(col.name.translate(trdict)) for col in vs.visibleCols) + rowsep
-        fp.write(colhdr)
+    def _write_header(fp, cols, clean):
+        fp.write(unitsep.join(clean(col.name.translate(trdict)) for col in cols) + rowsep)
 
-        for dispvals in vs.iterdispvals(format=True, delimiter=unitsep):
-            fp.write(unitsep.join(clean_saved_value(v) for v in dispvals.values()))
-            fp.write(rowsep)
+    def _write_row(fp, dispvals, clean):
+        fp.write(unitsep.join(clean(v) for v in dispvals.values()))
+        fp.write(rowsep)
+
+    vs.save_text_table(p, write_header=_write_header, write_row=_write_row, delimiter=unitsep)
 
 
 vd.addGlobals({

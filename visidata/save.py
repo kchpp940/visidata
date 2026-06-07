@@ -19,6 +19,28 @@ def clean_saved_value(v):
         return v.replace('\0', '')
     return v
 
+
+@Sheet.api
+def save_text_table(sheet, path, write_header=None, write_row=None, delimiter=None, **open_kwargs):
+    '''Unified text-table save API.
+
+    Pipeline: open file (save_encoding) → write_header → iterdispvals(format=True) → clean_saved_value → write_row
+
+    Args:
+        path: output Path
+        write_header: callable(fp, cols, clean_saved_value) or None to skip header
+        write_row: callable(fp, dispvals, clean_saved_value) for each data row
+        delimiter: passed to iterdispvals for safety_first newline/delim replacement
+        **open_kwargs: extra kwargs for path.open() (e.g. newline='' for CSV)
+    '''
+    open_kwargs.setdefault('mode', 'w')
+    open_kwargs.setdefault('encoding', sheet.options.save_encoding)
+    with path.open(**open_kwargs) as fp:
+        if write_header:
+            write_header(fp, sheet.visibleCols, clean_saved_value)
+        for dispvals in sheet.iterdispvals(format=True, delimiter=delimiter):
+            write_row(fp, dispvals, clean_saved_value)
+
 def parse_filetype(ft):
     'Parse filetype string like "json.gz" into (format, compression). Returns (ft, None) for plain types.'
     for sep in ('.', '+'):
@@ -224,13 +246,15 @@ def save_txt(vd, p, *vsheets):
     if len(vsheets) == 1 and vsheets[0].nVisibleCols > 1:  #2173
         return vd.save_tsv(p, vsheets[0])
 
-    with p.open(mode='w', encoding=vsheets[0].options.save_encoding) as fp:
-        for vs in vsheets:
-            unitsep = p.options.delimiter
-            rowsep = p.options.row_delimiter
-            for dispvals in vs.iterdispvals(*vs.visibleCols, format=True):
-                fp.write(unitsep.join(clean_saved_value(v) for v in dispvals.values()))
-                fp.write(rowsep)
+    unitsep = p.options.delimiter
+    rowsep = p.options.row_delimiter
+    def _write_row(fp, dispvals, clean):
+        fp.write(unitsep.join(clean(v) for v in dispvals.values()))
+        fp.write(rowsep)
+
+    for i, vs in enumerate(vsheets):
+        mode = 'a' if i > 0 else 'w'
+        vs.save_text_table(p, write_row=_write_row, mode=mode)
 
 
 @BaseSheet.api
