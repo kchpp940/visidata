@@ -1,7 +1,7 @@
-from visidata import vd, Sheet, options, Column, asyncthread, Progress, PivotGroupRow, HistogramColumn, TypedWrapper, TypedExceptionWrapper
+from visidata import vd, Sheet, options, Column, asyncthread, Progress, PivotGroupRow, HistogramColumn, TypedWrapper, TypedExceptionWrapper, wrapply
 
 from visidata.loaders._pandas import PandasSheet
-from visidata.pivot import PivotSheet, normalizeGroupValue, GROUPING_NULL, GROUPING_ERROR, formatGroupValue
+from visidata.pivot import PivotSheet, normalizeGroupValue, GROUPING_NULL, GROUPING_ERROR
 
 class DataFrameRowSliceAdapter:
     """Tracks original dataframe and a boolean row mask
@@ -80,12 +80,6 @@ def _pandasNormalizeGroupValue(v):
     return normalizeGroupValue(v)
 
 
-def _pandasRowMatches(df, colname, target):
-    if target is GROUPING_NULL:
-        return df[colname].isna()
-    return df[colname] == target
-
-
 class PandasFreqTableSheet(PivotSheet):
     'Generate frequency-table sheet on currently selected column.'
     rowtype = 'bins'  # rowdef FreqRow(keys, sourcerows)
@@ -113,24 +107,12 @@ class PandasFreqTableSheet(PivotSheet):
         'Generate frequency table then reverse-sort by length.'
         import pandas as pd
 
-        df = self.source.df.copy()
+        df = self.source.df
 
         if len(self.groupByCols) < 1:
             vd.fail("no columns to group on")
 
         ncols = len(self.groupByCols)
-        colnames = [c.name for c in self.groupByCols]
-
-        _pivot_count_column = "__vd_pivot_count"
-        if _pivot_count_column not in df.columns:
-            df[_pivot_count_column] = 1
-
-        value_counts = df.pivot_table(
-            index=colnames,
-            values=_pivot_count_column,
-            aggfunc="count",
-            dropna=False
-        )[_pivot_count_column].sort_values(ascending=False, kind="mergesort")
 
         for c in [
                     Column('count', type=int,
@@ -141,39 +123,46 @@ class PandasFreqTableSheet(PivotSheet):
                     ]:
             self.addColumn(c)
 
-        normalized_groups = {}
+        buckets = {}
 
-        for raw_element in Progress(value_counts.index):
-            if ncols == 1:
-                raw_element = (raw_element,)
-            elif len(raw_element) != ncols:
-                vd.fail('different number of index cols and groupby cols (%s vs %s)' % (len(raw_element), ncols))
+        for i, sourcerow in enumerate(Progress(self.source.rows)):
+            typed_vals = []
+            norm_vals = []
+            for col in self.groupByCols:
+                raw = col.getValue(sourcerow)
+                typed = wrapply(col.type, raw)
+                norm = _pandasNormalizeGroupValue(typed)
+                typed_vals.append(typed)
+                norm_vals.append(norm)
 
-            norm_key = tuple(_pandasNormalizeGroupValue(v) for v in raw_element)
+            norm_key = tuple(norm_vals)
 
-            if norm_key not in normalized_groups:
-                mask = _pandasRowMatches(df, colnames[0], norm_key[0])
-                for i in range(1, ncols):
-                    mask = mask & _pandasRowMatches(df, colnames[i], norm_key[i])
-
+            if norm_key not in buckets:
                 display_keys = []
-                for i in range(ncols):
-                    nk = norm_key[i]
-                    coltype = self.groupByCols[i].type
+                for j, col in enumerate(self.groupByCols):
+                    nk = norm_vals[j]
                     if nk is GROUPING_NULL:
-                        display_keys.append(TypedWrapper(coltype, None))
+                        display_keys.append(TypedWrapper(col.type, None))
                     elif nk is GROUPING_ERROR:
-                        display_keys.append(TypedExceptionWrapper(coltype, exception=ValueError('type conversion error')))
+                        display_keys.append(TypedExceptionWrapper(col.type, exception=ValueError('type conversion error')))
                     else:
-                        display_keys.append(raw_element[i])
+                        display_keys.append(typed_vals[j])
 
-                normalized_groups[norm_key] = (mask, tuple(display_keys))
+                buckets[norm_key] = {
+                    'ilocs': [],
+                    'display_keys': tuple(display_keys),
+                }
 
-        sorted_groups = sorted(normalized_groups.items(), key=lambda kv: int(kv[1][0].sum()), reverse=True)
+            buckets[norm_key]['ilocs'].append(i)
 
-        for norm_key, (mask, display_keys) in sorted_groups:
+        sorted_buckets = sorted(buckets.items(), key=lambda kv: len(kv[1]['ilocs']), reverse=True)
+
+        for norm_key, info in sorted_buckets:
+            mask = pd.Series(False, index=df.index)
+            mask.iloc[info['ilocs']] = True
+
             self.addRow(PivotGroupRow(
-                display_keys,
+                info['display_keys'],
                 None,
                 DataFrameRowSliceAdapter(df, mask),
                 {}
