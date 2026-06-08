@@ -84,6 +84,7 @@ class GraphSheet(InvertedCanvas):
         self.reflines_char_x = {}
         self.reflines_char_y = {}
         self._reflines_dirty = True
+        self._reflines_signature = None
 
         if not vd.numericCols(self.xcols):
             if self.xcols:
@@ -102,9 +103,26 @@ class GraphSheet(InvertedCanvas):
     def _ensure_reflines_cache(self):
         '''Synchronously recompute the refline character-coordinate cache if it is marked dirty.
         Safe to call from the draw() path: plot_reflines() depends only on synchronously-committed
-        state (visibleBox, plotviewBox, scalers, reflines_x/y), never on in-flight async data.'''
+        state (visibleBox, plotviewBox, scalers, reflines_x/y), never on in-flight async data.
+        Uses a lightweight signature check inside plot_reflines() to short-circuit on cursor-only moves.'''
         if self._reflines_dirty:
             self.plot_reflines()
+
+    def _compute_reflines_signature(self):
+        '''Compute a lightweight signature of all state that affects refline character coordinates.
+        Returns a hashable tuple. Used to short-circuit recomputation when only the cursor
+        moved but the viewport and refline data are unchanged.'''
+        return (
+            self.visibleBox.xmin, self.visibleBox.ymin,
+            self.visibleBox.xmax, self.visibleBox.ymax,
+            self.plotviewBox.xmin, self.plotviewBox.ymin,
+            self.plotviewBox.xmax, self.plotviewBox.ymax,
+            self.canvasBox.xmin, self.canvasBox.ymin,
+            self.canvasBox.xmax, self.canvasBox.ymax,
+            self.xzoomlevel, self.yzoomlevel,
+            tuple(sorted(self.reflines_x)) if self.reflines_x else (),
+            tuple(sorted(self.reflines_y)) if self.reflines_y else (),
+        )
 
     def reset(self):
         super().reset()
@@ -215,6 +233,11 @@ class GraphSheet(InvertedCanvas):
         super().plot_elements(invert_y=True)
 
     def plot_reflines(self):
+        sig = self._compute_reflines_signature()
+        if sig == self._reflines_signature:
+            self._reflines_dirty = False
+            return
+
         self.reflines_char_x = {}
         self.reflines_char_y = {}
 
@@ -250,6 +273,7 @@ class GraphSheet(InvertedCanvas):
                     elif existing is None:
                         self.reflines_char_x[char_x] = chars[offset]
 
+        self._reflines_signature = sig
         self._reflines_dirty = False
 
     def moveToCol(self, colstr):
