@@ -1,43 +1,8 @@
 from functools import partial
 
 from visidata import VisiData, vd, Sheet, date, anytype, Path, options, Column, asyncthread, Progress, undoAttrCopyFunc, run
+from visidata.normalizers import to_python_value
 
-
-def _pandas_to_python(val):
-    'Convert pandas/NumPy values to native Python types.'
-    if val is None:
-        return None
-
-    try:
-        np = vd.importExternal('numpy')
-        if isinstance(val, np.ndarray):
-            return val.tolist()
-        if isinstance(val, np.generic):
-            try:
-                return val.item()
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    if isinstance(val, (list, tuple)):
-        return [_pandas_to_python(v) for v in val]
-
-    if isinstance(val, dict):
-        return {k: _pandas_to_python(v) for k, v in val.items()}
-
-    try:
-        import pandas as pd
-        if isinstance(val, pd.Timestamp):
-            return val.to_pydatetime()
-        if isinstance(val, pd.Timedelta):
-            return int(val.total_seconds())
-        if pd.isna(val):
-            return None
-    except Exception:
-        pass
-
-    return val
 
 @VisiData.api
 def open_pandas(vd, p):
@@ -184,7 +149,7 @@ class PandasSheet(Sheet):
     def getValue(self, col, row):
         '''Look up column values in the underlying DataFrame.'''
         val = col.sheet.df.loc[row.name, col.expr]
-        return _pandas_to_python(val)
+        return to_python_value(val)
 
     def setValue(self, col, row, val):
         '''

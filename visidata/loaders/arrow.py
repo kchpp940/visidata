@@ -1,103 +1,7 @@
 from collections import defaultdict
 
 from visidata import Sheet, VisiData, TypedWrapper, anytype, date, vlen, Column, vd
-
-
-def pyarrow_to_python(val):
-    'Recursively convert pyarrow scalar/array values to native Python types.'
-    pa = vd.importExternal('pyarrow')
-
-    if val is None:
-        return None
-
-    if isinstance(val, pa.Scalar):
-        if val.is_valid:
-            t = val.type
-            tid = t.id
-            try:
-                is_ext = isinstance(t, pa.ExtensionType)
-            except Exception:
-                is_ext = False
-
-            if is_ext:
-                try:
-                    storage = val.storage
-                    return pyarrow_to_python(storage)
-                except Exception:
-                    try:
-                        return val.as_py()
-                    except Exception:
-                        return str(val)
-            elif tid in (pa.lib.Type_LIST, pa.lib.Type_LARGE_LIST, pa.lib.Type_FIXED_SIZE_LIST, pa.lib.Type_LIST_VIEW, pa.lib.Type_LARGE_LIST_VIEW):
-                try:
-                    raw = val.as_py()
-                    return [pyarrow_to_python(v) for v in raw] if isinstance(raw, (list, tuple)) else raw
-                except Exception:
-                    return str(val)
-            elif tid == pa.lib.Type_STRUCT:
-                try:
-                    return {k: pyarrow_to_python(val[k]) for k in val.type.names}
-                except Exception:
-                    try:
-                        return val.as_py()
-                    except Exception:
-                        return str(val)
-            elif tid == pa.lib.Type_MAP:
-                result = {}
-                try:
-                    items = val.as_py()
-                    for item in items:
-                        if isinstance(item, dict) and 'key' in item and 'value' in item:
-                            result[pyarrow_to_python(item['key'])] = pyarrow_to_python(item['value'])
-                        elif isinstance(item, (list, tuple)) and len(item) >= 2:
-                            result[pyarrow_to_python(item[0])] = pyarrow_to_python(item[1])
-                except Exception:
-                    pass
-                return result
-            elif tid == pa.lib.Type_DICTIONARY:
-                try:
-                    return pyarrow_to_python(val.as_py())
-                except Exception:
-                    return str(val)
-            elif tid in (pa.lib.Type_SPARSE_UNION, pa.lib.Type_DENSE_UNION):
-                try:
-                    return pyarrow_to_python(val.as_py())
-                except Exception:
-                    return str(val)
-            elif tid in (pa.lib.Type_LARGE_STRING, pa.lib.Type_STRING, pa.lib.Type_STRING_VIEW):
-                try:
-                    return val.as_py()
-                except Exception:
-                    try:
-                        return memoryview(val.as_buffer())[:2**20].tobytes().decode('utf-8', errors='replace')
-                    except Exception:
-                        return str(val)
-            elif tid in (pa.lib.Type_BINARY, pa.lib.Type_LARGE_BINARY, pa.lib.Type_BINARY_VIEW, pa.lib.Type_FIXED_SIZE_BINARY):
-                try:
-                    raw = val.as_py()
-                    if isinstance(raw, (bytes, bytearray, memoryview)):
-                        return bytes(raw)
-                    return raw
-                except Exception:
-                    return str(val)
-            else:
-                try:
-                    return val.as_py()
-                except Exception:
-                    return str(val)
-        else:
-            return None
-
-    if isinstance(val, pa.ChunkedArray):
-        return [pyarrow_to_python(v) for v in val]
-
-    if isinstance(val, (list, tuple)):
-        return [pyarrow_to_python(v) for v in val]
-
-    if isinstance(val, dict):
-        return {k: pyarrow_to_python(v) for k, v in val.items()}
-
-    return val
+from visidata.normalizers import to_python_value, to_export_value
 
 
 @VisiData.api
@@ -175,23 +79,10 @@ class ArrowSheet(Sheet):
             colname = self.coldata.schema.names[colnum]
 
             self.addColumn(Column(colname, type=coltype, expr=colnum,
-                                  getter=lambda c,r: pyarrow_to_python(c.sheet.coldata[c.expr][r[0]])))
+                                  getter=lambda c,r: to_python_value(c.sheet.coldata[c.expr][r[0]])))
 
         for rownum in range(max(len(c) for c in self.coldata)):
             yield [rownum]
-
-
-def _python_to_pyarrow_val(val):
-    'Convert complex Python values to types pyarrow can serialize.'
-    import json as _json
-    if val is None:
-        return None
-    if isinstance(val, (dict, list, tuple)):
-        try:
-            return _json.dumps(val, ensure_ascii=False, default=str)
-        except Exception:
-            return str(val)
-    return val
 
 
 @VisiData.api
@@ -221,7 +112,7 @@ def save_arrow(vd, p, sheet, streaming=False):
             if isinstance(val, TypedWrapper):
                 val = None
 
-            databycol[col].append(_python_to_pyarrow_val(val))
+            databycol[col].append(to_export_value(val, fmt='arrow'))
 
     data = []
     for col, vals in databycol.items():
@@ -230,7 +121,7 @@ def save_arrow(vd, p, sheet, streaming=False):
             data.append(pa.array(vals, type=pa_type))
         except Exception:
             try:
-                data.append(pa.array([_python_to_pyarrow_val(v) for v in vals], type=pa.string()))
+                data.append(pa.array([to_export_value(v, fmt='arrow') for v in vals], type=pa.string()))
             except Exception:
                 data.append(pa.array([str(v) if v is not None else None for v in vals], type=pa.string()))
 

@@ -2,6 +2,7 @@ import json
 from collections import Counter
 
 from visidata import vd, date, anytype, VisiData, PyobjSheet, AttrDict, stacktrace, TypedExceptionWrapper, AlwaysDict, ItemColumn, wrapply, TypedWrapper, Progress, Sheet
+from visidata.normalizers import to_export_value
 
 vd.option('json_indent', None, 'indent to use when saving json')
 vd.option('json_sort_keys', False, 'sort object keys when saving to json')
@@ -100,71 +101,13 @@ JsonSheet.init('_knownKeys', set, copy=True)  # set of row keys already seen
 
 ## saving json and jsonl
 
-def _normalize_json_value(val):
-    'Normalize values for JSON serialization.'
-    if val is None:
-        return None
-
-    if isinstance(val, TypedExceptionWrapper):
-        return str(val)
-    if isinstance(val, TypedWrapper):
-        return _normalize_json_value(val.val)
-
-    try:
-        import pyarrow as pa
-        if isinstance(val, pa.Scalar):
-            from visidata.loaders.arrow import pyarrow_to_python
-            return _normalize_json_value(pyarrow_to_python(val))
-    except Exception:
-        pass
-
-    try:
-        import numpy as np
-        if isinstance(val, np.ndarray):
-            return [_normalize_json_value(v) for v in val.tolist()]
-        if isinstance(val, np.generic):
-            try:
-                return _normalize_json_value(val.item())
-            except Exception:
-                return str(val)
-    except Exception:
-        pass
-
-    try:
-        import pandas as pd
-        if isinstance(val, pd.Timestamp):
-            return val.isoformat()
-        if isinstance(val, pd.Timedelta):
-            return int(val.total_seconds())
-        if pd.isna(val):
-            return None
-    except Exception:
-        pass
-
-    if isinstance(val, (bytes, bytearray, memoryview)):
-        try:
-            return bytes(val).decode('utf-8', errors='replace')
-        except Exception:
-            return str(val)
-
-    if hasattr(val, '__geo_interface__'):
-        try:
-            return val.__geo_interface__
-        except Exception:
-            return str(val)
-
-    if isinstance(val, (list, tuple)):
-        return [_normalize_json_value(v) for v in val]
-
-    if isinstance(val, dict):
-        return {str(k): _normalize_json_value(v) for k, v in val.items()}
-
-    return val
-
 
 class _vjsonEncoder(json.JSONEncoder):
     def default(self, obj):
-        return _normalize_json_value(obj)
+        result = to_export_value(obj, fmt='json')
+        if isinstance(result, (dict, list, tuple)):
+            return result
+        return result
 
 
 @VisiData.api
@@ -176,7 +119,7 @@ def get_json_value(vd, col, row):
         o = o.val
     elif isinstance(o, date):
         o = col.getDisplayValue(row)
-    return _normalize_json_value(o)
+    return to_export_value(o, fmt='json')
 
 
 def _rowdict(cols, row, keep_nulls=False):

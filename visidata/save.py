@@ -1,72 +1,15 @@
 import collections
 import os
-import json as _json
 from copy import copy
 
 from visidata import vd
 from visidata import Sheet, BaseSheet, VisiData, IndexSheet, Path, Progress, TypedExceptionWrapper, TypedWrapper, UNLOADED
+from visidata.normalizers import to_python_value, to_export_value
 
 vd.option('safe_error', '#ERR', 'error string to use while saving', replay=True)
 vd.option('save_encoding', 'utf-8', 'encoding passed to codecs.open when saving a file', replay=True, help=vd.help_encoding)
 
 _compression_formats = {'gz', 'bz2', 'xz', 'lzma', 'zst'}
-
-
-def _normalize_value(val):
-    'Normalize stray pyarrow/pandas/numpy values to native Python types before saving/processing.'
-    if val is None:
-        return None
-
-    if isinstance(val, (TypedWrapper, TypedExceptionWrapper)):
-        return val
-
-    try:
-        import pyarrow as pa
-        if isinstance(val, pa.Scalar):
-            from visidata.loaders.arrow import pyarrow_to_python
-            return pyarrow_to_python(val)
-        if isinstance(val, pa.ChunkedArray):
-            from visidata.loaders.arrow import pyarrow_to_python
-            return pyarrow_to_python(val)
-    except Exception:
-        pass
-
-    try:
-        import numpy as np
-        if isinstance(val, np.ndarray):
-            return val.tolist()
-        if isinstance(val, np.generic):
-            try:
-                return val.item()
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    try:
-        import pandas as pd
-        if isinstance(val, pd.Timestamp):
-            return val.to_pydatetime()
-        if isinstance(val, pd.Timedelta):
-            return int(val.total_seconds())
-        if pd.isna(val):
-            return None
-    except Exception:
-        pass
-
-    if isinstance(val, (bytes, bytearray, memoryview)):
-        try:
-            return bytes(val).decode('utf-8', errors='replace')
-        except Exception:
-            return val
-
-    if hasattr(val, '__geo_interface__'):
-        try:
-            return _json.dumps(val.__geo_interface__, default=str)
-        except Exception:
-            return str(val)
-
-    return val
 
 
 def parse_filetype(ft):
@@ -116,7 +59,7 @@ def iterdispvals(sheet, *cols, format=False, delimiter=None):
         dispvals = collections.OrderedDict()  # [col] -> value
         for col, transforms in transformers.items():
             try:
-                dispval = _normalize_value(col.getValue(r))
+                dispval = to_python_value(col.getValue(r))
 
             except Exception as e:
                 dispval = options_safe_error or str(e)

@@ -3,24 +3,13 @@ import json
 from visidata import Sheet, VisiData, TypedWrapper, anytype, date, vlen, Column, vd, asyncthread, Progress, InvertedCanvas
 from collections import defaultdict
 
-from visidata.loaders.arrow import pyarrow_to_python, arrow_to_vdtype
+from visidata.loaders.arrow import arrow_to_vdtype
+from visidata.normalizers import to_python_value, to_export_value
 
 
 @VisiData.api
 def open_parquet(vd, p):
     return ParquetSheet(p.base_stem, source=p)
-
-
-def _python_to_pyarrow_val(val):
-    'Convert complex Python values to types pyarrow can serialize.'
-    if val is None:
-        return None
-    if isinstance(val, (dict, list, tuple)):
-        try:
-            return json.dumps(val, ensure_ascii=False, default=str)
-        except Exception:
-            return str(val)
-    return val
 
 
 class ParquetColumn(Column):
@@ -35,7 +24,7 @@ class ParquetColumn(Column):
         if rownum is None:
             return None
         val = self.source[rownum]
-        return pyarrow_to_python(val)
+        return to_python_value(val)
 
     def putValue(self, row, val):
         row[self.name] = val
@@ -235,7 +224,7 @@ def save_parquet(vd, p, sheet):
             if isinstance(val, TypedWrapper):
                 val = None
 
-            databycol[col].append(_python_to_pyarrow_val(val))
+            databycol[col].append(to_export_value(val, fmt='parquet'))
 
     data = []
     for col, vals in databycol.items():
@@ -244,7 +233,7 @@ def save_parquet(vd, p, sheet):
             data.append(pa.array(vals, type=pa_type))
         except Exception:
             try:
-                data.append(pa.array([_python_to_pyarrow_val(v) for v in vals], type=pa.string()))
+                data.append(pa.array([to_export_value(v, fmt='parquet') for v in vals], type=pa.string()))
             except Exception:
                 data.append(pa.array([str(v) if v is not None else None for v in vals], type=pa.string()))
 
