@@ -2,7 +2,7 @@ from copy import copy
 import itertools
 
 from visidata import vd, vlen, VisiData, Column, AttrColumn, Sheet, ColumnsSheet, Fanout, Progress, asyncthread
-from visidata.pivot import PivotSheet, PivotGroupRow, formatRange, formatGroupValue
+from visidata.pivot import PivotSheet, PivotGroupRow
 
 
 vd.theme_option('disp_histogram', '■', 'histogram element character')
@@ -12,15 +12,11 @@ vd.option('numeric_binning', False, 'bin numeric columns into ranges', replay=Tr
 
 @VisiData.api
 def valueNames(vd, discrete_vals, numeric_vals):
-    parts = []
-    discrete_part = '+'.join(formatGroupValue(None, x) for x in discrete_vals)
-    if discrete_part:
-        parts.append(discrete_part)
-    if numeric_vals is not None:
-        numeric_part = formatGroupValue(None, numeric_vals)
-        if numeric_part:
-            parts.append(numeric_part)
-    return '+'.join(parts)
+    ret = [ '+'.join(str(x) for x in discrete_vals) ]
+    if isinstance(numeric_vals, tuple) and numeric_vals != (0, 0):
+        ret.append('%s-%s' % numeric_vals)
+
+    return '+'.join(ret)
 
 class HistogramColumn(Column):
     '.sourceCol is the column to be histogrammed'
@@ -176,7 +172,7 @@ Each row on this sheet corresponds to a *bin* of rows on the source sheet that h
 class FreqTableSheetSummary(FreqTableSheet):
     'Append a PivotGroupRow to FreqTableSheet with only selectedRows.'
     def afterLoad(self):
-        self.addRow(PivotGroupRow(['Selected'], None, self.source.selectedRows, {}))
+        self.addRow(PivotGroupRow(['Selected'], (0,0), self.source.selectedRows, {}))
         super().afterLoad()
 
 

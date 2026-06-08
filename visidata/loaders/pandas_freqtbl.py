@@ -1,7 +1,7 @@
-from visidata import vd, Sheet, options, Column, asyncthread, Progress, PivotGroupRow, HistogramColumn, TypedWrapper, wrapply
+from visidata import vd, Sheet, options, Column, asyncthread, Progress, PivotGroupRow, HistogramColumn
 
 from visidata.loaders._pandas import PandasSheet
-from visidata.pivot import PivotSheet, normalizeGroupValue, GROUPING_NULL
+from visidata.pivot import PivotSheet
 
 class DataFrameRowSliceAdapter:
     """Tracks original dataframe and a boolean row mask
@@ -67,13 +67,6 @@ def makePandasFreqTable(sheet, *groupByCols):
     return PandasFreqTableSheet(sheet.name, fqcolname, groupByCols=groupByCols, source=sheet)
 
 
-def _pandasIsNA(v):
-    if v is None:
-        return True
-    pd = vd.importExternal('pandas')
-    return bool(pd.isna(v))
-
-
 class PandasFreqTableSheet(PivotSheet):
     'Generate frequency-table sheet on currently selected column.'
     rowtype = 'bins'  # rowdef FreqRow(keys, sourcerows)
@@ -101,13 +94,49 @@ class PandasFreqTableSheet(PivotSheet):
         'Generate frequency table then reverse-sort by length.'
         import pandas as pd
 
-        df = self.source.df
+        # Note: visidata's base FrequencyTable bins numeric data in ranges
+        # (e.g. as a histogram). We currently don't provide support for this
+        # for PandasSheet, although we could implement it with a pd.Grouper
+        # that operates similarly to pd.cut.
+        df = self.source.df.copy()
 
-        if len(self.groupByCols) < 1:
+        # Implementation (special case): for one row, this degenerates
+        # to .value_counts(); however this does not order in a stable manner.
+        # if len(self.groupByCols) == 1:
+        #     this_column = df.loc[:, str(self.groupByCols[0].name)]
+        #     value_counts = this_column.value_counts()
+        if len(self.groupByCols) >= 1:
+            # Implementation (1): add a dummy column to aggregate over in a pd.pivot_table.
+            # Is there a way to avoid having to mutate the dataframe? We can delete the
+            # column afterwards but we do incur the overhead of block consolidation.
+            _pivot_count_column = "__vd_pivot_count"
+            if _pivot_count_column not in df.columns:
+                df[_pivot_count_column] = 1
+            # Aggregate count over columns to group, and then apply a stable sort
+            value_counts = df.pivot_table(
+                index=[c.name for c in self.groupByCols],
+                values=_pivot_count_column,
+                aggfunc="count"
+            )[_pivot_count_column].sort_values(ascending=False, kind="mergesort")
+            # TODO: it seems that the ascending=False causes this to do a "reversed stable sort"?
+            # TODO: possibly register something to delete this column as soon as
+            # we exit visidata?
+            # del df["__vd_pivot_count"]
+
+            # Implementation (2) which does not require adding a dummy column:
+            # Compute cross-tabulation to get counts, and sort/remove zero-entries.
+            # Note that this is not space-efficient: the initial cross-tabulation will
+            # have space on the order of product of number of unique elements for each
+            # column, even though its possible the combinations present are sparse
+            # and most combinations have zero count.
+            # this_column = df.loc[:, str(self.groupByCols[0].name)]
+            # value_counts = pd.crosstab(this_column, [df.df[c.name] for c in self.groupByCols[1:]])
+            # value_counts = value_counts.stack(list(range(len(self.groupByCols) - 1)))
+            # value_counts = value_counts.loc[value_counts > 0].sort_values(ascending=False)
+        else:
             vd.fail("no columns to group on")
 
-        ncols = len(self.groupByCols)
-
+        # add default bonus columns
         for c in [
                     Column('count', type=int,
                            getter=lambda col,row: len(row.sourcerows)),
@@ -117,42 +146,19 @@ class PandasFreqTableSheet(PivotSheet):
                     ]:
             self.addColumn(c)
 
-        buckets = {}
+        for element in Progress(value_counts.index):
+            if len(self.groupByCols) == 1:
+                element = (element,)
+            elif len(element) != len(self.groupByCols):
+                vd.fail('different number of index cols and groupby cols (%s vs %s)' % (len(element), len(self.groupByCols)))
 
-        for i, sourcerow in enumerate(Progress(self.source.rows)):
-            typed_vals = []
-            norm_vals = []
-            for col in self.groupByCols:
-                raw = col.getValue(sourcerow)
-                if _pandasIsNA(raw):
-                    norm = GROUPING_NULL
-                    typed = TypedWrapper(col.type, None)
-                else:
-                    typed = wrapply(col.type, raw)
-                    norm = normalizeGroupValue(typed)
-                typed_vals.append(typed)
-                norm_vals.append(norm)
-
-            norm_key = tuple(norm_vals)
-
-            if norm_key not in buckets:
-                display_keys = tuple(typed_vals)
-                buckets[norm_key] = {
-                    'ilocs': [],
-                    'display_keys': display_keys,
-                }
-
-            buckets[norm_key]['ilocs'].append(i)
-
-        sorted_buckets = sorted(buckets.items(), key=lambda kv: len(kv[1]['ilocs']), reverse=True)
-
-        for norm_key, info in sorted_buckets:
-            mask = pd.Series(False, index=df.index)
-            mask.iloc[info['ilocs']] = True
+            mask = df[self.groupByCols[0].name] == element[0]
+            for i in range(1, len(self.groupByCols)):
+                mask = mask & (df[self.groupByCols[i].name] == element[i])
 
             self.addRow(PivotGroupRow(
-                info['display_keys'],
-                None,
+                element,
+                (0, 0),
                 DataFrameRowSliceAdapter(df, mask),
                 {}
             ))

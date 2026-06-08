@@ -146,21 +146,25 @@ class GraphSheet(InvertedCanvas):
 
     def draw_reflines(self, scr):
         cursorBBox = self.plotterCursorBox
+        cursorX1, cursorY1 = cursorBBox.xmin, cursorBBox.ymin
+        cursorX2, cursorY2 = cursorBBox.xmax, cursorBBox.ymax
         # draws only on character cells that have reflines, leaves other cells unaffected
         for char_y in range(0, self.plotheight//4):
-            has_y_line = char_y in self.reflines_char_y.keys()
+            has_y_line = char_y in self.reflines_char_y
+            pixY1 = char_y*4
+            pixY2 = char_y*4 + 4
             for char_x in range(0, self.plotwidth//2):
-                has_x_line = char_x in self.reflines_char_x.keys()
+                has_x_line = char_x in self.reflines_char_x
                 if has_x_line or has_y_line:
                     cattr = colors.color_graph_refline
                     if has_x_line:
                         ch = self.reflines_char_x[char_x]
-                        # where two lines cross, draw the vertical line, not the horizontal one
                     elif has_y_line:
                         ch = self.reflines_char_y[char_y]
-                    # draw cursor
-                    if cursorBBox.contains(char_x*2, char_y*4) or \
-                        cursorBBox.contains(char_x*2+1, char_y*4+3):
+                    pixX1 = char_x*2
+                    pixX2 = char_x*2 + 2
+                    if pixX1 < cursorX2 and pixX2 > cursorX1 and \
+                       pixY1 < cursorY2 and pixY2 > cursorY1:
                         cattr = update_attr(cattr, colors.color_current_row)
                     scr.addstr(char_y, char_x, ch, cattr.attr)
 
@@ -186,32 +190,35 @@ class GraphSheet(InvertedCanvas):
 
         bb = self.visibleBox
         xmin, ymin, xmax, ymax = bb.xmin, bb.ymin, bb.xmax, bb.ymax
+        multiple_char = self.options.disp_graph_multiple_reflines_char
+        plotw = self.plotwidth // 2
+        ploth = self.plotheight // 4
 
         for data_y in self.reflines_y:
             data_y = float(data_y)
-            if data_y >= ymin and data_y <= ymax:
+            if ymin <= data_y <= ymax:
                 char_y, offset = divmod(self.scaleY(data_y), 4)
-                chars = self.options.disp_graph_reflines_y_charset
-                # if we're drawing two different reflines in the same square, fill it with a different char
-                if char_y in self.reflines_char_y and self.reflines_char_y[char_y] != chars[offset]:
-                    self.reflines_char_y[char_y] = vd.options.disp_graph_multiple_reflines_char
-                else:
-                    self.reflines_char_y[char_y] = chars[offset]
+                if 0 <= char_y < ploth:
+                    chars = self.options.disp_graph_reflines_y_charset
+                    existing = self.reflines_char_y.get(char_y)
+                    if existing is not None and existing != chars[offset]:
+                        self.reflines_char_y[char_y] = multiple_char
+                    elif existing is None:
+                        self.reflines_char_y[char_y] = chars[offset]
 
         for data_x in self.reflines_x:
             data_x = float(data_x)
-            if data_x >= xmin and data_x <= xmax:
+            if xmin <= data_x <= xmax:
                 plot_x = self.scaleX(data_x)
-                # plot_x is an integer count of plotter pixels, and each character box has 2 plotter pixels
                 char_x = plot_x // 2
-                # To subdivide the 2 plotter pixels per square into 4 zones, we have to first multiply by 2.
-                offset = 2*plot_x % 4
-                chars = self.options.disp_graph_reflines_x_charset
-                # if we're drawing two different reflines in the same square, fill it with a different char
-                if char_x in self.reflines_char_x and self.reflines_char_x[char_x] != chars[offset]:
-                    self.reflines_char_y[char_x] = vd.options.disp_graph_multiple_reflines_char
-                else:
-                    self.reflines_char_x[char_x] = chars[offset]
+                if 0 <= char_x < plotw:
+                    offset = 2*plot_x % 4
+                    chars = self.options.disp_graph_reflines_x_charset
+                    existing = self.reflines_char_x.get(char_x)
+                    if existing is not None and existing != chars[offset]:
+                        self.reflines_char_x[char_x] = multiple_char
+                    elif existing is None:
+                        self.reflines_char_x[char_x] = chars[offset]
 
     def moveToCol(self, colstr):
         xmin, xmax = map(float, map(self.parseX, colstr.split()))
