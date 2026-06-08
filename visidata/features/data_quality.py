@@ -34,23 +34,141 @@ def recalc(sheet):
     _bump_dq_version(sheet)
 
 
+@Sheet.after
+def clearSelected(sheet):
+    _bump_dq_version(sheet)
+
+
+class DQSourceSnapshot:
+    '''Complete immutable fingerprint of a source sheet's data-quality-relevant state.
+
+    Captures:
+      - rowid ordering (rows identity)
+      - selected row ids
+      - per-column signature: identity, name, typestr, visibility, key status, and TypedExceptionWrapper count
+      - key column identities
+      - row count
+    '''
+
+    __slots__ = (
+        'rowids_tuple',
+        'selected_rowids',
+        'col_signatures',
+        'keycol_ids',
+        'nRows',
+        'nSelectedRows',
+    )
+
+    def __init__(self, sheet):
+        self.rowids_tuple = tuple(sheet.rowid(r) for r in sheet.rows)
+        self.selected_rowids = frozenset(sheet._selectedRows.keys())
+        self.col_signatures = tuple(
+            (
+                id(c),
+                c.name,
+                c.typestr,
+                c.hidden,
+                c.keycol,
+                self._count_errors(sheet, c),
+            )
+            for c in sheet.columns
+        )
+        self.keycol_ids = tuple(id(c) for c in sheet.keyCols)
+        self.nRows = sheet.nRows
+        self.nSelectedRows = sheet.nSelectedRows
+
+    @staticmethod
+    def _count_errors(sheet, col):
+        'Count TypedExceptionWrapper values in *col* across sheet rows. Cheap if col caches.'
+        n = 0
+        for r in sheet.rows:
+            try:
+                v = col.getTypedValue(r)
+                if isinstance(v, TypedExceptionWrapper):
+                    n += 1
+            except Exception:
+                n += 1
+        return n
+
+    @property
+    def col_id_to_sig(self):
+        return {sig[0]: sig for sig in self.col_signatures}
+
+    def rows_changed(self, other):
+        'True iff the row identity set or ordering differs between snapshots.'
+        return self.rowids_tuple != other.rowids_tuple
+
+    def selection_changed(self, other):
+        return self.selected_rowids != other.selected_rowids
+
+    def keycols_changed(self, other):
+        return self.keycol_ids != other.keycol_ids
+
+    def changed_col_ids(self, other):
+        'Return set of column ids whose signatures differ between snapshots.'
+        mine = self.col_id_to_sig
+        theirs = other.col_id_to_sig
+        changed = set()
+        for cid, sig in mine.items():
+            if cid not in theirs or theirs[cid] != sig:
+                changed.add(cid)
+        for cid in theirs:
+            if cid not in mine:
+                changed.add(cid)
+        return changed
+
+    def all_col_ids(self):
+        return frozenset(sig[0] for sig in self.col_signatures)
+
+    def __eq__(self, other):
+        if not isinstance(other, DQSourceSnapshot):
+            return NotImplemented
+        return (self.rowids_tuple == other.rowids_tuple and
+                self.selected_rowids == other.selected_rowids and
+                self.col_signatures == other.col_signatures and
+                self.keycol_ids == other.keycol_ids)
+
+    def __hash__(self):
+        return hash((self.rowids_tuple, self.selected_rowids,
+                     self.col_signatures, self.keycol_ids))
+
+
 class DQIssue:
     '''Represents a single data quality issue found on a source sheet.
 
     Stores row identity (rowids) rather than row object references,
-    so the issue remains valid across source sheet reloads as long as
-    the row objects retain their identity.
+    and remembers which rule and which columns it depends on so the
+    inspector can decide whether to recalculate it incrementally.
     '''
 
+    __slots__ = (
+        'issue_type',
+        '_column',
+        'severity',
+        'description',
+        '_source_sheet',
+        '_rowids',
+        'example_value',
+        '_dep_col_ids',
+        '_rule_name',
+    )
+
     def __init__(self, issue_type, column, severity, description, *,
-                 source_sheet=None, rowids=None, example_value=None):
+                 source_sheet=None, rowids=None, example_value=None,
+                 dep_col_ids=None, rule_name=None):
         self.issue_type = issue_type
         self._column = column
         self.severity = severity
         self.description = description
         self._source_sheet = source_sheet or (column.sheet if column else None)
-        self._rowids = set(rowids) if rowids is not None else set()
+        self._rowids = frozenset(rowids) if rowids is not None else frozenset()
         self.example_value = example_value
+        if dep_col_ids is None and column is not None and source_sheet is not None:
+            dep_col_ids = frozenset([id(column)])
+        elif dep_col_ids is None:
+            dep_col_ids = frozenset()
+        self._dep_col_ids = frozenset(dep_col_ids)
+        self._rule_name = rule_name or issue_type
 
     @property
     def colname(self):
@@ -68,20 +186,36 @@ class DQIssue:
     def count(self):
         return len(self._rowids)
 
-    def add_rowid(self, rowid):
-        self._rowids.add(rowid)
+    @property
+    def rule_name(self):
+        return self._rule_name
+
+    @property
+    def dep_col_ids(self):
+        return self._dep_col_ids
 
     def resolve_rows(self):
-        'Return list of actual row objects from the source sheet by rowid. Skips rows that no longer exist.'
+        '''Return (valid_rows, missing_count) tuple.
+
+        *valid_rows* are the actual row objects still present on the source sheet.
+        *missing_count* is how many stored rowids no longer resolve.
+        '''
         if not self._source_sheet:
-            return []
+            return [], 0
         id_to_row = {self._source_sheet.rowid(r): r for r in self._source_sheet.rows}
-        return [id_to_row[rid] for rid in self._rowids if rid in id_to_row]
+        valid = []
+        missing = 0
+        for rid in self._rowids:
+            if rid in id_to_row:
+                valid.append(id_to_row[rid])
+            else:
+                missing += 1
+        return valid, missing
 
     def resolve_first_row(self):
-        'Return the first still-existing row object, or None.'
-        rows = self.resolve_rows()
-        return rows[0] if rows else None
+        'Return (row, missing_count_since_scan). row is None if no rows resolvable.'
+        valid, missing = self.resolve_rows()
+        return (valid[0], missing) if valid else (None, missing)
 
 
 class DQRule:
@@ -90,14 +224,15 @@ class DQRule:
     Subclasses must implement:
       - rule_name (class attr): short stable identifier
       - default_severity (class attr): 'error' / 'warning' / 'info'
-      - applies_to(cls, sheet, col_or_None): classmethod, whether rule applies per-column or per-sheet
-      - scan(cls, sheet, col_or_None, rows, isNull): classmethod, returns DQIssue or None
+      - per_column (class attr): True if rule runs once per column; False if once per sheet
+      - applies_to(cls, sheet, col_or_None): whether rule applies to this sheet/column
+      - scan(cls, sheet, col_or_None, rows, isNull): returns DQIssue or None
 
-    The rule should prefer:
-      - ``col.getTypedValue(row)`` for typed values (yields TypedExceptionWrapper on errors)
-      - ``sheet.isNullFunc()`` for null detection
-      - ``sheet.rowid(row)`` for stable row identity
-      - ``vd.isNumeric(col)`` for numeric detection
+    Implementations must:
+      - Use ``col.getTypedValue(row)`` for typed values / error detection (TypedExceptionWrapper)
+      - Use ``sheet.isNullFunc()`` for null semantics
+      - Use ``sheet.rowid(row)`` to build rowid sets (never store row objects)
+      - Use ``vd.isNumeric(col)`` for numeric column detection
     '''
 
     rule_name = 'base'
@@ -107,6 +242,17 @@ class DQRule:
     @classmethod
     def applies_to(cls, sheet, col):
         return True
+
+    @classmethod
+    def _make_issue(cls, sheet, col, severity, description, *,
+                    rowids, example_value=None, dep_col_ids=None):
+        return DQIssue(
+            cls.rule_name, col, severity, description,
+            source_sheet=sheet, rowids=rowids,
+            example_value=example_value,
+            dep_col_ids=dep_col_ids,
+            rule_name=cls.rule_name,
+        )
 
     @classmethod
     def scan(cls, sheet, col, rows, isNull):
@@ -137,10 +283,10 @@ class NullValuesRule(DQRule):
         if not null_rowids:
             return None
         severity = 'error' if len(null_rowids) >= total * 0.5 else 'warning'
-        return DQIssue(
-            cls.rule_name, col, severity,
+        return cls._make_issue(
+            sheet, col, severity,
             f'{len(null_rowids)} null value(s) in {total} row(s)',
-            source_sheet=sheet, rowids=null_rowids,
+            rowids=null_rowids,
         )
 
 
@@ -170,10 +316,10 @@ class TypeErrorsRule(DQRule):
                 error_rowids.append(sheet.rowid(r))
         if not error_rowids:
             return None
-        return DQIssue(
-            cls.rule_name, col, 'error',
+        return cls._make_issue(
+            sheet, col, 'error',
             f'{len(error_rowids)} type/parsing error(s)',
-            source_sheet=sheet, rowids=error_rowids,
+            rowids=error_rowids,
             example_value=str(example) if example is not None else None,
         )
 
@@ -201,10 +347,10 @@ class DateParseFailuresRule(DQRule):
                 fail_rowids.append(sheet.rowid(r))
         if not fail_rowids:
             return None
-        return DQIssue(
-            cls.rule_name, col, 'error',
+        return cls._make_issue(
+            sheet, col, 'error',
             f'{len(fail_rowids)} date parse failure(s)',
-            source_sheet=sheet, rowids=fail_rowids,
+            rowids=fail_rowids,
         )
 
 
@@ -250,10 +396,10 @@ class NumericOutliersRule(DQRule):
                     outlier_rowids.update(val_rowids.get(v, set()))
             if not outlier_rowids:
                 return None
-            return DQIssue(
-                cls.rule_name, col, 'warning',
+            return cls._make_issue(
+                sheet, col, 'warning',
                 f'{len(outlier_rowids)} outlier(s) outside [{lower_bound:.4g}, {upper_bound:.4g}] (IQR method)',
-                source_sheet=sheet, rowids=outlier_rowids,
+                rowids=outlier_rowids,
                 example_value=f'min={min(vals):.4g}, max={max(vals):.4g}',
             )
         except Exception:
@@ -296,10 +442,12 @@ class DuplicateRowsRule(DQRule):
         if not dup_rowids:
             return None
         colname = '+'.join(c.name for c in cols_to_check)
-        return DQIssue(
-            cls.rule_name, cols_to_check[0], 'warning',
+        dep_col_ids = frozenset(id(c) for c in cols_to_check)
+        return cls._make_issue(
+            sheet, cols_to_check[0], 'warning',
             f'{len(dup_rowids)} duplicate row(s) based on {colname}',
-            source_sheet=sheet, rowids=dup_rowids,
+            rowids=dup_rowids,
+            dep_col_ids=dep_col_ids,
         )
 
 
@@ -331,10 +479,10 @@ class HighCardinalityRule(DQRule):
         ratio = unique_count / len(vals) if vals else 0
         if ratio < sheet.options.dq_high_cardinality_threshold:
             return None
-        return DQIssue(
-            cls.rule_name, col, 'info',
+        return cls._make_issue(
+            sheet, col, 'info',
             f'high cardinality: {unique_count}/{len(vals)} unique ({ratio*100:.1f}%)',
-            source_sheet=sheet, rowids=set(),
+            rowids=set(),
             example_value=f'top: {Counter(vals).most_common(3)}',
         )
 
@@ -369,10 +517,10 @@ class TypeMismatchRule(DQRule):
                 pass
         if non_null_count == 0 or str_count / non_null_count <= 0.5:
             return None
-        return DQIssue(
-            cls.rule_name, col, 'warning',
+        return cls._make_issue(
+            sheet, col, 'warning',
             f'{str_count}/{non_null_count} non-null values are strings but column type is {col.typestr or "anytype"}; consider changing column type',
-            source_sheet=sheet, rowids=set(str_rowids),
+            rowids=set(str_rowids),
         )
 
 
@@ -387,30 +535,10 @@ ALL_DQ_RULES = [
 ]
 
 
-@Sheet.api
-def scan_data_quality(sheet, rules=None):
-    '''Scan *sheet* for data quality issues using *rules* (default: ALL_DQ_RULES).
-    Yields ``DQIssue`` objects.
-    '''
-    if sheet.nRows == 0:
-        return
-
-    rules = rules or ALL_DQ_RULES
-    isNull = sheet.isNullFunc()
-    visible_cols = [c for c in sheet.visibleCols if not c.hidden]
+def _scan_columns_for_issues(sheet, cols, rules, isNull, progress_label=None):
+    'Run per-column *rules* on specific *cols*; yield DQIssue objects.'
     rows = sheet.rows
-
-    for rule in rules:
-        if not rule.per_column:
-            try:
-                if rule.applies_to(sheet, None):
-                    issue = rule.scan(sheet, None, rows, isNull)
-                    if issue:
-                        yield issue
-            except Exception as e:
-                vd.exceptionCaught(e)
-
-    for col in Progress(visible_cols, gerund='scanning columns'):
+    for col in (Progress(cols, gerund=progress_label or 'scanning columns') if progress_label else cols):
         for rule in rules:
             if not rule.per_column:
                 continue
@@ -423,12 +551,35 @@ def scan_data_quality(sheet, rules=None):
                 vd.exceptionCaught(e)
 
 
-def _column_signature(sheet):
-    'Return a hashable signature of sheet column state (identity+name+type+visibility).'
-    return tuple(
-        (id(c), c.name, c.typestr, c.hidden, c.keycol)
-        for c in sheet.columns
-    )
+def _scan_sheet_rules(sheet, rules, isNull):
+    'Run per-sheet *rules*; yield DQIssue objects.'
+    rows = sheet.rows
+    for rule in rules:
+        if rule.per_column:
+            continue
+        try:
+            if rule.applies_to(sheet, None):
+                issue = rule.scan(sheet, None, rows, isNull)
+                if issue:
+                    yield issue
+        except Exception as e:
+            vd.exceptionCaught(e)
+
+
+@Sheet.api
+def scan_data_quality(sheet, rules=None):
+    '''Scan *sheet* for data quality issues using *rules* (default: ALL_DQ_RULES).
+    Yields ``DQIssue`` objects.
+    '''
+    if sheet.nRows == 0:
+        return
+
+    rules = rules or ALL_DQ_RULES
+    isNull = sheet.isNullFunc()
+    visible_cols = [c for c in sheet.visibleCols if not c.hidden]
+
+    yield from _scan_sheet_rules(sheet, rules, isNull)
+    yield from _scan_columns_for_issues(sheet, visible_cols, rules, isNull, progress_label='scanning columns')
 
 
 class IssueColumn(Column):
@@ -439,7 +590,7 @@ class IssueColumn(Column):
 
 # rowdef: DQIssue
 class DataQualitySheet(Sheet):
-    'Data quality inspection results panel with row-identity-based source linking.'
+    'Data quality inspection panel with source snapshot tracking and incremental refresh.'
     guide = '''
 # Data Quality Inspection Panel
 This sheet shows data quality issues found in *{sheet.displaySource}*.
@@ -454,10 +605,14 @@ Each row represents one type of data quality issue detected.
 - `Ctrl+R` to rescan and refresh the inspection results
 - `export-dq` to export the results as a regular table
 
-## Note
-Issue rows are tracked by stable row-identity of the source sheet.
-If the source sheet reloads or its columns change, the DQ panel will be
-automatically marked stale and refresh on next access.
+## Source state tracking
+The panel captures a full snapshot of the source sheet at scan time:
+row identity ordering, selected rows, per-column signatures (name/type/visibility/key/error count),
+and key columns.  Any change on the source sheet marks the DQ results stale, and
+the next command will trigger a refresh — or refresh only affected columns when possible.
+
+When rows referenced by an issue no longer exist on the source sheet, you will see
+an explicit warning rather than a silent skip.
 '''
     rowtype = 'issues'
     precious = True
@@ -479,50 +634,141 @@ automatically marked stale and refresh on next access.
     def __init__(self, *names, source=None, **kwargs):
         super().__init__(*names, **kwargs)
         self.source = source
-        self._dq_source_version = -1
-        self._dq_column_signature = None
-        self._dq_nrows = -1
+        self._dq_snapshot = None
         if isinstance(source, Sheet):
             if self not in source._dq_dependents:
                 source._dq_dependents.append(self)
 
+    # ---------- source change / staleness ----------
+
     def _dq_source_changed(self):
         'Called by source sheet when its version counter increments.'
-        self._dq_mark_stale()
-
-    def _dq_mark_stale(self):
-        self._dq_source_version = -1
+        self._dq_snapshot = None  # cheap invalidation
 
     def _dq_is_stale(self):
         src = self.source
         if not isinstance(src, Sheet):
             return False
-        return (self._dq_source_version != src._dq_version or
-                self._dq_column_signature != _column_signature(src) or
-                self._dq_nrows != src.nRows)
+        if self._dq_snapshot is None:
+            return True
+        current = DQSourceSnapshot(src)
+        return self._dq_snapshot != current
+
+    def _dq_incremental_refresh(self):
+        '''Refresh only the rules/columns affected by the source change.
+
+        Falls back to full reload when the row identity set itself has changed.
+        '''
+        src = self.source
+        if not isinstance(src, Sheet):
+            self.rows = []
+            self._dq_snapshot = None
+            return
+
+        old_snap = self._dq_snapshot
+        new_snap = DQSourceSnapshot(src)
+
+        if old_snap is None or old_snap.rows_changed(new_snap):
+            vd.debug(f'{self.name}: rows changed; full DQ rescan')
+            self.rows = list(scan_data_quality(src))
+            self._dq_snapshot = new_snap
+            return
+
+        isNull = src.isNullFunc()
+        changed_col_ids = old_snap.changed_col_ids(new_snap)
+        keycols_changed = old_snap.keycols_changed(new_snap)
+        selection_changed = old_snap.selection_changed(new_snap)
+
+        if not changed_col_ids and not keycols_changed and not selection_changed:
+            self._dq_snapshot = new_snap
+            return
+
+        rules = ALL_DQ_RULES
+        rules_to_rescan_sheet = []
+        rules_to_rescan_cols = []
+        for rule in rules:
+            if rule.per_column:
+                rules_to_rescan_cols.append(rule)
+            else:
+                if keycols_changed or selection_changed:
+                    rules_to_rescan_sheet.append(rule)
+                elif any(dep in changed_col_ids for dep in
+                         (set() if rule != DuplicateRowsRule else new_snap.all_col_ids())):
+                    rules_to_rescan_sheet.append(rule)
+
+        # Determine which columns to rescan for per-column rules
+        # A column must be rescanned if (a) its own signature changed or
+        # (b) it was a dependency of a removed/changed issue.
+        old_issue_dep_cols = set()
+        for issue in self.rows:
+            old_issue_dep_cols.update(issue._dep_col_ids)
+        col_ids_to_rescan = changed_col_ids | (old_issue_dep_cols & new_snap.all_col_ids())
+
+        # Build id -> Column map for the current source sheet
+        col_by_id = {id(c): c for c in src.columns}
+        cols_to_rescan = [col_by_id[cid] for cid in col_ids_to_rescan if cid in col_by_id]
+
+        vd.debug(f'{self.name}: incremental DQ refresh; '
+                 f'sheet_rules={[r.rule_name for r in rules_to_rescan_sheet]}, '
+                 f'cols_to_rescan={len(cols_to_rescan)}')
+
+        # Drop all issues that depend on changed columns or come from rescanned sheet rules
+        resheet_rule_names = {r.rule_name for r in rules_to_rescan_sheet}
+        new_rows = []
+        for issue in self.rows:
+            if issue._rule_name in resheet_rule_names:
+                continue
+            if issue._dep_col_ids & changed_col_ids:
+                continue
+            new_rows.append(issue)
+
+        # Re-scan sheet-level rules
+        if rules_to_rescan_sheet:
+            for issue in _scan_sheet_rules(src, rules_to_rescan_sheet, isNull):
+                new_rows.append(issue)
+
+        # Re-scan affected columns
+        if cols_to_rescan and rules_to_rescan_cols:
+            for issue in _scan_columns_for_issues(src, cols_to_rescan, rules_to_rescan_cols, isNull):
+                new_rows.append(issue)
+
+        self.rows = new_rows
+        self._dq_snapshot = new_snap
 
     def _dq_refresh_if_stale(self):
         if self._dq_is_stale():
-            vd.debug(f'{self.name}: source changed, refreshing DQ results')
-            self.reload()
+            self._dq_incremental_refresh()
 
     def loader(self):
         if not isinstance(self.source, Sheet):
             self.rows = []
+            self._dq_snapshot = None
             return
         self.rows = list(scan_data_quality(self.source))
-        self._dq_source_version = self.source._dq_version
-        self._dq_column_signature = _column_signature(self.source)
-        self._dq_nrows = self.source.nRows
+        self._dq_snapshot = DQSourceSnapshot(self.source)
 
     def ensureLoaded(self):
         self._dq_refresh_if_stale()
         return super().ensureLoaded()
 
 
+# ---------- helpers: row-resolution with explicit staleness warnings ----------
+
+@DataQualitySheet.api
+def _warn_if_rows_missing(dqsheet, stored_count, resolved_count):
+    missing = stored_count - resolved_count
+    if missing > 0:
+        vd.warning(f'{missing}/{stored_count} row(s) referenced by this issue no longer exist on the source sheet; consider refreshing the DQ panel with Ctrl+R')
+    return missing
+
+
 @DataQualitySheet.api
 def _collect_resolved_rows(dqsheet, issues):
-    'Given a list of DQIssue, return (source_sheet, unique_rows) resolved by row identity.'
+    '''Given a list of DQIssue, return (source_sheet, unique_rows).
+
+    Emits an explicit warning if any stored rowids no longer resolve on the
+    source sheet, instead of silently skipping them.
+    '''
     all_rowids = set()
     src_sheet = None
     for issue in issues:
@@ -532,7 +778,11 @@ def _collect_resolved_rows(dqsheet, issues):
     if not all_rowids or not src_sheet:
         return None, []
     id_to_row = {src_sheet.rowid(r): r for r in src_sheet.rows}
-    unique_rows = [id_to_row[rid] for rid in all_rowids if rid in id_to_row]
+    unique_rows = []
+    for rid in all_rowids:
+        if rid in id_to_row:
+            unique_rows.append(id_to_row[rid])
+    _warn_if_rows_missing(dqsheet, len(all_rowids), len(unique_rows))
     return src_sheet, unique_rows
 
 
@@ -555,7 +805,7 @@ def select_issue_rows(dqsheet, issues, status=True):
     'Select/unselect source rows (resolved by identity) for *issues*.'
     dqsheet._dq_refresh_if_stale()
     src_sheet, rows = _collect_resolved_rows(dqsheet, issues)
-    if not rows or not src_sheet:
+    if not src_sheet:
         return
     count = 0
     for r in rows:
@@ -573,10 +823,13 @@ def toggle_issue_row(dqsheet, issue):
     dqsheet._dq_refresh_if_stale()
     if not issue or not issue._rowids or not issue.source_sheet:
         return
-    first = issue.resolve_first_row()
-    if first is None:
+    valid, missing = issue.resolve_rows()
+    if missing:
+        _warn_if_rows_missing(dqsheet, issue.count, len(valid))
+    if not valid:
+        vd.warning('no resolvable rows for this issue on the source sheet; consider refreshing with Ctrl+R')
         return
-    currently_selected = issue.source_sheet.isSelected(first)
+    currently_selected = issue.source_sheet.isSelected(valid[0])
     select_issue_rows(dqsheet, [issue], not currently_selected)
 
 
@@ -588,9 +841,11 @@ def goto_first_issue_row(dqsheet, issue):
         vd.warning('no source row to go to')
         return
     src = issue.source_sheet
-    first = issue.resolve_first_row()
+    first, missing = issue.resolve_first_row()
+    if missing:
+        _warn_if_rows_missing(dqsheet, issue.count, 1 if first else 0)
     if first is None:
-        vd.warning('no matching row found on source sheet')
+        vd.warning(f'none of the {issue.count} row(s) in this issue still exist on the source sheet; refresh with Ctrl+R')
         return
     vd.push(src)
     try:
@@ -648,6 +903,7 @@ vd.addGlobals(
     DataQualitySheet=DataQualitySheet,
     DQIssue=DQIssue,
     DQRule=DQRule,
+    DQSourceSnapshot=DQSourceSnapshot,
     ALL_DQ_RULES=ALL_DQ_RULES,
     NullValuesRule=NullValuesRule,
     TypeErrorsRule=TypeErrorsRule,
