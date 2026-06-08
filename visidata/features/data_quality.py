@@ -39,6 +39,39 @@ def clearSelected(sheet):
     _bump_dq_version(sheet)
 
 
+def _resolve_operation_source(view_sheet):
+    '''Given a *view_sheet* (possibly a filtered/derived copy), walk the
+    ``.source`` chain until we reach the canonical data sheet that owns the
+    actual row objects.
+
+    Sheets like :class:`FreqTableSheet` or :class:`PivotSheet` store a
+    reference to their originating data sheet in ``.source``.  Shallow copies
+    produced by ``copy(sheet)`` share row objects with their parent even
+    though ``.source`` points to a :class:`Path` — in that case the copy
+    itself is already the canonical data sheet.
+    '''
+    current = view_sheet
+    seen = set()
+    while isinstance(current, Sheet):
+        cid = id(current)
+        if cid in seen:
+            break
+        seen.add(cid)
+        src = getattr(current, 'source', None)
+        if isinstance(src, Sheet):
+            current = src
+        else:
+            break
+    return current
+
+
+def _is_derived_view(view_sheet):
+    '''True if *view_sheet* is a derived/filtered view of another data sheet
+    (i.e. the canonical operation source differs from *view_sheet* itself).
+    '''
+    return _resolve_operation_source(view_sheet) is not view_sheet
+
+
 class DQSourceSnapshot:
     '''Complete immutable fingerprint of a source sheet's data-quality-relevant state.
 
@@ -153,6 +186,13 @@ class DQIssue:
     Stores row identity (rowids) rather than row object references,
     and remembers which rule and which columns it depends on so the
     inspector can decide whether to recalculate it incrementally.
+
+    Distinguishes the **view sheet** (the sheet that was actually scanned,
+    possibly a filtered/derived copy) from the **source sheet** (the
+    canonical data sheet that owns the row objects and that select/goto/
+    filter operations should target).  Because shallow copies share row
+    objects with their parent, the stored ``rowids`` are valid on both
+    sheets simultaneously.
     '''
 
     __slots__ = (
@@ -160,6 +200,7 @@ class DQIssue:
         '_column',
         'severity',
         'description',
+        '_view_sheet',
         '_source_sheet',
         '_rowids',
         'example_value',
@@ -168,16 +209,17 @@ class DQIssue:
     )
 
     def __init__(self, issue_type, column, severity, description, *,
-                 source_sheet=None, rowids=None, example_value=None,
-                 dep_col_ids=None, rule_name=None):
+                 view_sheet=None, source_sheet=None, rowids=None,
+                 example_value=None, dep_col_ids=None, rule_name=None):
         self.issue_type = issue_type
         self._column = column
         self.severity = severity
         self.description = description
-        self._source_sheet = source_sheet or (column.sheet if column else None)
+        self._view_sheet = view_sheet or source_sheet or (column.sheet if column else None)
+        self._source_sheet = source_sheet or _resolve_operation_source(self._view_sheet)
         self._rowids = frozenset(rowids) if rowids is not None else frozenset()
         self.example_value = example_value
-        if dep_col_ids is None and column is not None and source_sheet is not None:
+        if dep_col_ids is None and column is not None and self._view_sheet is not None:
             dep_col_ids = frozenset([id(column)])
         elif dep_col_ids is None:
             dep_col_ids = frozenset()
@@ -193,7 +235,13 @@ class DQIssue:
         return self._column
 
     @property
+    def view_sheet(self):
+        'The sheet on which the quality scan was originally performed.'
+        return self._view_sheet
+
+    @property
     def source_sheet(self):
+        'The canonical data sheet that owns the row objects; use for select/goto/filter.'
         return self._source_sheet
 
     @property
@@ -208,15 +256,38 @@ class DQIssue:
     def dep_col_ids(self):
         return self._dep_col_ids
 
-    def resolve_rows(self):
+    @property
+    def view_scope_label(self):
+        '''Human-readable label describing the scan scope of this issue.
+
+        Returns a short string like ``"full table"``, ``"filtered view (N rows)"``,
+        or ``"derived view: <sheet name>"`` so the user can tell whether the
+        quality result covers the full dataset or just a subset.
+        '''
+        vs = self._view_sheet
+        src = self._source_sheet
+        if vs is None or src is None:
+            return ''
+        if vs is src:
+            return 'full table'
+        vrows = len(getattr(vs, 'rows', ()))
+        srows = len(getattr(src, 'rows', ()))
+        if vrows != srows and srows > 0:
+            pct = vrows * 100.0 / srows
+            return f'filtered view ({vrows}/{srows} rows, {pct:.0f}%)'
+        return f'derived view: {getattr(vs, "name", "?")}'
+
+    def resolve_rows(self, on_source=True):
         '''Return (valid_rows, missing_count) tuple.
 
-        *valid_rows* are the actual row objects still present on the source sheet.
-        *missing_count* is how many stored rowids no longer resolve.
+        *on_source* selects which sheet to resolve against:
+          - ``True`` (default): resolve on :attr:`source_sheet` (canonical data sheet)
+          - ``False``: resolve on :attr:`view_sheet` (the sheet that was scanned)
         '''
-        if not self._source_sheet:
+        sheet = self._source_sheet if on_source else self._view_sheet
+        if not sheet:
             return [], 0
-        id_to_row = {self._source_sheet.rowid(r): r for r in self._source_sheet.rows}
+        id_to_row = {sheet.rowid(r): r for r in sheet.rows}
         valid = []
         missing = 0
         for rid in self._rowids:
@@ -226,9 +297,9 @@ class DQIssue:
                 missing += 1
         return valid, missing
 
-    def resolve_first_row(self):
+    def resolve_first_row(self, on_source=True):
         'Return (row, missing_count_since_scan). row is None if no rows resolvable.'
-        valid, missing = self.resolve_rows()
+        valid, missing = self.resolve_rows(on_source=on_source)
         return (valid[0], missing) if valid else (None, missing)
 
 
@@ -258,11 +329,18 @@ class DQRule:
         return True
 
     @classmethod
-    def _make_issue(cls, sheet, col, severity, description, *,
+    def _make_issue(cls, view_sheet, col, severity, description, *,
                     rowids, example_value=None, dep_col_ids=None):
+        '''Create a :class:`DQIssue` bound to the current scan context.
+
+        *view_sheet* is the sheet that was actually scanned (possibly a
+        filtered copy).  The canonical data sheet for operations is derived
+        automatically via :func:`_resolve_operation_source`.
+        '''
         return DQIssue(
             cls.rule_name, col, severity, description,
-            source_sheet=sheet, rowids=rowids,
+            view_sheet=view_sheet,
+            rowids=rowids,
             example_value=example_value,
             dep_col_ids=dep_col_ids,
             rule_name=cls.rule_name,
@@ -614,19 +692,37 @@ This sheet shows data quality issues found in *{sheet.displaySource}*.
 
 Each row represents one type of data quality issue detected.
 
+## Columns
+- `severity`: error / warning / info
+- `issue_type`: the quality rule that fired (null_values, type_errors, duplicates, ...)
+- `column`: the column the issue applies to (blank for sheet-level rules)
+- `count`: how many rows are affected
+- **`scope`**: whether the scan covered the **full table** or a **filtered/derived view**
+  (useful when the DQ panel was opened on a duplicate sheet with a row subset)
+- `description`: human-readable summary
+- `example`: an example value or diagnostic detail
+
 ## Commands
-- `Enter` on an issue row to open the source sheet filtered to only the problem rows
+- `Enter` on an issue row to open the canonical source sheet filtered to only the problem rows
 - `g Enter` to open filtered sheet for all selected issues
-- `s`/`u`/`t` to select/unselect/toggle the corresponding rows on the source sheet
-- `goto-source` to jump to the first problem row on the source sheet
+- `s`/`u`/`t` to select/unselect/toggle the corresponding rows on the canonical source sheet
+- `goto-source` to jump to the first problem row on the canonical source sheet
 - `Ctrl+R` to rescan and refresh the inspection results
 - `export-dq` to export the results as a regular table
 
+## View vs. Source sheet
+The panel distinguishes the **view sheet** (the sheet you opened DQ on) from the
+**canonical source sheet** (the original data sheet that owns the rows).  All
+select/goto/filter commands operate on the canonical source sheet so the identity
+chain remains stable even when you work on filtered copies.
+
 ## Source state tracking
 The panel captures a full snapshot of the source sheet at scan time:
-row identity ordering, selected rows, per-column signatures (name/type/visibility/key/error count),
+row identity ordering, per-column signatures (name/type/visibility/key/error count),
 and key columns.  Any change on the source sheet marks the DQ results stale, and
 the next command will trigger a refresh — or refresh only affected columns when possible.
+Row selection changes do NOT trigger a rescan (because selecting rows doesn't
+change whether they contain nulls, type errors, etc.).
 
 When rows referenced by an issue no longer exist on the source sheet, you will see
 an explicit warning rather than a silent skip.
@@ -638,6 +734,7 @@ an explicit warning rather than a silent skip.
         IssueColumn('issue_type', width=20, getter=lambda c, r: r.issue_type),
         IssueColumn('column', width=20, getter=lambda c, r: r.colname),
         IssueColumn('count', type=vlen, getter=lambda c, r: r.count),
+        IssueColumn('scope', width=28, getter=lambda c, r: r.view_scope_label),
         IssueColumn('description', width=60, getter=lambda c, r: r.description),
         IssueColumn('example', width=40, getter=lambda c, r: str(r.example_value) if r.example_value else ''),
     ]
@@ -656,6 +753,10 @@ an explicit warning rather than a silent skip.
         if isinstance(source, Sheet):
             if self not in source._dq_dependents:
                 source._dq_dependents.append(self)
+            op_source = _resolve_operation_source(source)
+            if op_source is not source and isinstance(op_source, Sheet):
+                if self not in op_source._dq_dependents:
+                    op_source._dq_dependents.append(self)
 
     # ---------- source change / staleness ----------
 
@@ -907,6 +1008,7 @@ def export_dq_results(dqsheet):
         Column('issue_type', type=str, getter=lambda c, r: r.get('issue_type', '')),
         Column('column', type=str, getter=lambda c, r: r.get('column', '')),
         Column('count', type=vlen, getter=lambda c, r: r.get('count', 0)),
+        Column('scope', type=str, getter=lambda c, r: r.get('scope', '')),
         Column('description', type=str, getter=lambda c, r: r.get('description', '')),
         Column('example', type=str, getter=lambda c, r: r.get('example', '')),
     ]
@@ -917,6 +1019,7 @@ def export_dq_results(dqsheet):
             'issue_type': issue.issue_type,
             'column': issue.colname,
             'count': issue.count,
+            'scope': issue.view_scope_label,
             'description': issue.description,
             'example': str(issue.example_value) if issue.example_value else '',
         })
@@ -953,4 +1056,6 @@ vd.addGlobals(
     HighCardinalityRule=HighCardinalityRule,
     TypeMismatchRule=TypeMismatchRule,
     scan_data_quality=scan_data_quality,
+    _resolve_operation_source=_resolve_operation_source,
+    _is_derived_view=_is_derived_view,
 )
