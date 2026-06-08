@@ -16,6 +16,10 @@ vd.theme_option('disp_zoom_incr', 2.0, 'amount to multiply current zoomlevel whe
 vd.theme_option('color_graph_hidden', '238 blue', 'color of legend for hidden attribute')
 vd.theme_option('color_graph_selected', 'bold', 'color of selected graph points')
 
+vd.option('auto_brush_select', True, 'automatically select source rows when brushing a region on canvas/graph', replay=True)
+
+vd.selections = vd.StoredList(name='selections')
+
 
 class Point:
     def __init__(self, x, y):
@@ -448,7 +452,15 @@ class Canvas(Plotter):
 
     @property
     def statusLine(self):
-        return 'canvas %s visible %s cursor %s' % (self.canvasBox, self.visibleBox, self.cursorBox)
+        extra = ''
+        if self.cursorBox and self.polylines and self.source:
+            try:
+                n = len(self.rowsWithinDataBox(self.cursorBox.xmin, self.cursorBox.ymin,
+                                               self.cursorBox.xmax, self.cursorBox.ymax))
+                extra = ' (%d %s selected)' % (n, self.source.rowtype)
+            except Exception:
+                pass
+        return 'canvas %s visible %s cursor %s%s' % (self.canvasBox, self.visibleBox, self.cursorBox, extra)
 
     @property
     def canvasMouse(self):
@@ -475,18 +487,38 @@ class Canvas(Plotter):
     def formatY(self, v):
         return str(v)
 
+    def parseX(self, txt):
+        return float(txt)
+
+    def parseY(self, txt):
+        return float(txt)
+
+    def moveToCol(self, colstr):
+        xmin, xmax = map(float, map(self.parseX, colstr.split()))
+        self.cursorBox.xmin = xmin
+        self.cursorBox.w = xmax-xmin
+        return True
+
+    def moveToRow(self, rowstr):
+        ymin, ymax = map(float, map(self.parseY, rowstr.split()))
+        self.cursorBox.ymin = ymin
+        self.cursorBox.h = ymax-ymin
+        return True
+
     def commandCursor(sheet, execstr):
         'Return (col, row) of cursor suitable for cmdlog replay of execstr.'
         contains = lambda s, *substrs: any((a in s) for a in substrs)
         colname, rowname = '', ''
-        if contains(execstr, 'plotterCursorBox'):
+        if contains(execstr, 'plotterCursorBox', 'brushSelect', 'brushToggle', 'brushUnselect', 'dive-cursor', 'delete-cursor', 'select-cursor', 'stoggle-cursor', 'unselect-cursor', 'saveNamedSelection', 'save-selection'):
             bb = sheet.cursorBox
-            colname = '%s %s' % (sheet.formatX(bb.xmin), sheet.formatX(bb.xmax))
-            rowname = '%s %s' % (sheet.formatY(bb.ymin), sheet.formatY(bb.ymax))
-        elif contains(execstr, 'plotterVisibleBox'):
+            if bb:
+                colname = '%s %s' % (sheet.formatX(bb.xmin), sheet.formatX(bb.xmax))
+                rowname = '%s %s' % (sheet.formatY(bb.ymin), sheet.formatY(bb.ymax))
+        elif contains(execstr, 'plotterVisibleBox', 'brushVisible', 'dive-visible', 'delete-visible', 'select-visible', 'stoggle-visible', 'unselect-visible'):
             bb = sheet.visibleBox
-            colname = '%s %s' % (sheet.formatX(bb.xmin), sheet.formatX(bb.xmax))
-            rowname = '%s %s' % (sheet.formatY(bb.ymin), sheet.formatY(bb.ymax))
+            if bb:
+                colname = '%s %s' % (sheet.formatX(bb.xmin), sheet.formatX(bb.xmax))
+                rowname = '%s %s' % (sheet.formatY(bb.ymin), sheet.formatY(bb.ymax))
         return colname, rowname
 
     @property
@@ -779,6 +811,156 @@ class Canvas(Plotter):
         for x, y, text, attr, row in Progress(self.gridlabels, 'labeling'):
             self.plotlabel(self.scaleX(x), self.scaleY(y), text, attr, row)
 
+    def rowsWithinDataBox(self, xmin, ymin, xmax, ymax):
+        'Return rows whose plotted points fall within the given data coordinate bounding box.  Works regardless of zoom, filter, or sort.'
+        ret = {}
+        x1, x2 = min(xmin, xmax), max(xmin, xmax)
+        y1, y2 = min(ymin, ymax), max(ymin, ymax)
+        for vertexes, attr, row in self.polylines:
+            if attr in self.hiddenAttrs:
+                continue
+            if row is None:
+                continue
+            for vx, vy in vertexes:
+                try:
+                    fx, fy = float(vx), float(vy)
+                except (TypeError, ValueError):
+                    continue
+                if x1 <= fx <= x2 and y1 <= fy <= y2:
+                    ret[self.source.rowid(row)] = row
+                    break
+        return list(ret.values())
+
+    def parseBbox(self, bboxstr):
+        'Parse "xmin xmax ymin ymax" string into tuple of floats.'
+        parts = str(bboxstr).split()
+        if len(parts) != 4:
+            vd.fail('expected "xmin xmax ymin ymax", got "%s"' % bboxstr)
+        return tuple(float(p) for p in parts)
+
+    def formatBbox(self, bbox):
+        'Format BoundingBox or (xmin,xmax,ymin,ymax) as "xmin xmax ymin ymax" string using sheet formatters.'
+        if isinstance(bbox, Box):
+            return '%s %s %s %s' % (self.formatX(bbox.xmin), self.formatX(bbox.xmax),
+                                    self.formatY(bbox.ymin), self.formatY(bbox.ymax))
+        xmin, xmax, ymin, ymax = bbox
+        return '%s %s %s %s' % (self.formatX(xmin), self.formatX(xmax),
+                                self.formatY(ymin), self.formatY(ymax))
+
+    @asyncthread
+    def selectBbox(self, bboxstr, add_undo=True):
+        'Select source rows whose data points fall within "xmin xmax ymin ymax".  Async.'
+        xmin, xmax, ymin, ymax = self.parseBbox(bboxstr)
+        rows = self.rowsWithinDataBox(xmin, ymin, xmax, ymax)
+        self.source.select(rows, add_undo=add_undo)
+
+    @asyncthread
+    def stoggleBbox(self, bboxstr, add_undo=True):
+        'Toggle selection of source rows whose data points fall within "xmin xmax ymin ymax".  Async.'
+        xmin, xmax, ymin, ymax = self.parseBbox(bboxstr)
+        rows = self.rowsWithinDataBox(xmin, ymin, xmax, ymax)
+        self.source.toggle(rows, add_undo=add_undo)
+
+    @asyncthread
+    def unselectBbox(self, bboxstr, add_undo=True):
+        'Unselect source rows whose data points fall within "xmin xmax ymin ymax".  Async.'
+        xmin, xmax, ymin, ymax = self.parseBbox(bboxstr)
+        rows = self.rowsWithinDataBox(xmin, ymin, xmax, ymax)
+        self.source.unselect(rows, add_undo=add_undo)
+
+    def brushSelect(self):
+        'Select source rows within current cursor box, recording bbox for cmdlog replay.'
+        if not self.cursorBox:
+            return
+        bboxstr = self.formatBbox(self.cursorBox)
+        vd.setLastArgs(bboxstr)
+        self.selectBbox(bboxstr)
+
+    def brushToggle(self):
+        'Toggle selection of source rows within current cursor box, recording bbox for cmdlog replay.'
+        if not self.cursorBox:
+            return
+        bboxstr = self.formatBbox(self.cursorBox)
+        vd.setLastArgs(bboxstr)
+        self.stoggleBbox(bboxstr)
+
+    def brushUnselect(self):
+        'Unselect source rows within current cursor box, recording bbox for cmdlog replay.'
+        if not self.cursorBox:
+            return
+        bboxstr = self.formatBbox(self.cursorBox)
+        vd.setLastArgs(bboxstr)
+        self.unselectBbox(bboxstr)
+
+    def brushVisibleSelect(self):
+        'Select source rows within visible canvas, recording bbox for cmdlog replay.'
+        if not self.visibleBox:
+            return
+        bboxstr = self.formatBbox(self.visibleBox)
+        vd.setLastArgs(bboxstr)
+        self.selectBbox(bboxstr)
+
+    def brushVisibleToggle(self):
+        'Toggle selection of source rows within visible canvas, recording bbox for cmdlog replay.'
+        if not self.visibleBox:
+            return
+        bboxstr = self.formatBbox(self.visibleBox)
+        vd.setLastArgs(bboxstr)
+        self.stoggleBbox(bboxstr)
+
+    def brushVisibleUnselect(self):
+        'Unselect source rows within visible canvas, recording bbox for cmdlog replay.'
+        if not self.visibleBox:
+            return
+        bboxstr = self.formatBbox(self.visibleBox)
+        vd.setLastArgs(bboxstr)
+        self.unselectBbox(bboxstr)
+
+    def saveNamedSelection(self, name):
+        'Save current cursor bounding box as a named selection.'
+        if not self.cursorBox:
+            vd.fail('no cursor box to save')
+        bb = self.cursorBox
+        sel = {
+            'name': name,
+            'sheet': self.name,
+            'xmin': float(bb.xmin),
+            'xmax': float(bb.xmax),
+            'ymin': float(bb.ymin),
+            'ymax': float(bb.ymax),
+        }
+        vd.selections.append(sel)
+        vd.status('saved selection "%s" (%d points in region)' % (name,
+            len(self.rowsWithinDataBox(bb.xmin, bb.ymin, bb.xmax, bb.ymax))))
+
+    def loadNamedSelection(self, name):
+        'Load/apply a named selection by selecting its rows on the source sheet.'
+        vd.selections.reload()
+        for sel in vd.selections:
+            if sel.name == name:
+                bboxstr = '%s %s %s %s' % (sel.xmin, sel.xmax, sel.ymin, sel.ymax)
+                vd.setLastArgs(bboxstr)
+                self.selectBbox(bboxstr)
+                vd.status('loaded selection "%s"' % name)
+                return
+        vd.fail('no selection named "%s"' % name)
+
+    def deleteNamedSelection(self, name):
+        'Delete a named selection from the stored list.'
+        vd.selections.reload()
+        for i, sel in enumerate(vd.selections):
+            if sel.name == name:
+                del vd.selections[i]
+                p = vd.selections.path
+                if p and p.exists():
+                    import json
+                    with p.open(mode='w', encoding='utf-8') as fp:
+                        for s in vd.selections:
+                            fp.write(json.dumps(dict(s)) + '\n')
+                vd.status('deleted selection "%s"' % name)
+                return
+        vd.fail('no selection named "%s"' % name)
+
     @asyncthread
     def deleteSourceRows(self, rows):
         rows = list(rows)
@@ -824,8 +1006,8 @@ Canvas.addCommand('z_', 'set-aspect', 'sheet.aspectRatio = float(input("aspect r
 
 # set cursor box with left click
 Canvas.addCommand('BUTTON1_PRESSED', 'start-cursor', 'startCursor()', 'start cursor box with left mouse button press')
-Canvas.addCommand('BUTTON1_RELEASED', 'end-cursor', 'cm=canvasMouse; setCursorSize(cm) if cm else None', 'end cursor box with left mouse button release')
-Canvas.addCommand('BUTTON1_CLICKED', 'remake-cursor', 'startCursor(); cm=canvasMouse; setCursorSize(cm) if cm else None', 'end cursor box with left mouse button release')
+Canvas.addCommand('BUTTON1_RELEASED', 'end-cursor', 'cm=canvasMouse; setCursorSize(cm) if cm else None; sheet.brushSelect() if cm and options.auto_brush_select else None', 'end cursor box with left mouse button release; auto-select source rows if auto_brush_select is enabled')
+Canvas.addCommand('BUTTON1_CLICKED', 'remake-cursor', 'startCursor(); cm=canvasMouse; setCursorSize(cm) if cm else None; sheet.brushSelect() if cm and options.auto_brush_select else None', 'end cursor box with left mouse button release; auto-select source rows if auto_brush_select is enabled')
 Canvas.bindkey('BUTTON1_DOUBLE_CLICKED', 'remake-cursor')
 Canvas.bindkey('BUTTON1_TRIPLE_CLICKED', 'remake-cursor')
 
@@ -839,17 +1021,25 @@ Canvas.bindkey('BUTTON3_TRIPLE_CLICKED', 'move-canvas')
 Canvas.addCommand('ScrollUp', 'zoomin-mouse', 'cm=canvasMouse; incrZoom(1.0/options.disp_zoom_incr) if cm else fail("cannot zoom in on unplotted canvas"); fixPoint(plotterMouse, cm)', 'zoom in with scroll wheel')
 Canvas.addCommand('ScrollDown', 'zoomout-mouse', 'cm=canvasMouse; incrZoom(options.disp_zoom_incr) if cm else fail("cannot zoom out on unplotted canvas"); fixPoint(plotterMouse, cm)', 'zoom out with scroll wheel')
 
-Canvas.addCommand('s', 'select-cursor', 'source.select(list(rowsWithin(plotterCursorBox)))', 'select rows on source sheet contained within canvas cursor')
-Canvas.addCommand('t', 'stoggle-cursor', 'source.toggle(list(rowsWithin(plotterCursorBox)))', 'toggle selection of rows on source sheet contained within canvas cursor')
-Canvas.addCommand('u', 'unselect-cursor', 'source.unselect(list(rowsWithin(plotterCursorBox)))', 'unselect rows on source sheet contained within canvas cursor')
-Canvas.addCommand('Enter', 'dive-cursor', 'vs=copy(source); vs.rows=list(rowsWithin(plotterCursorBox)); vd.push(vs)', 'open sheet of source rows contained within canvas cursor')
-Canvas.addCommand('d', 'delete-cursor', 'deleteSourceRows(rowsWithin(plotterCursorBox))', 'delete rows on source sheet contained within canvas cursor')
+Canvas.addCommand('s', 'select-cursor', 'sheet.brushSelect()', 'select rows on source sheet contained within canvas cursor; records bbox for replay')
+Canvas.addCommand('t', 'stoggle-cursor', 'sheet.brushToggle()', 'toggle selection of rows on source sheet contained within canvas cursor; records bbox for replay')
+Canvas.addCommand('u', 'unselect-cursor', 'sheet.brushUnselect()', 'unselect rows on source sheet contained within canvas cursor; records bbox for replay')
+Canvas.addCommand('Enter', 'dive-cursor', 'bboxstr=sheet.formatBbox(sheet.cursorBox); vd.setLastArgs(bboxstr); xmin,xmax,ymin,ymax=sheet.parseBbox(bboxstr); vs=copy(source); vs.rows=list(sheet.rowsWithinDataBox(xmin,ymin,xmax,ymax)); vd.push(vs)', 'open sheet of source rows contained within canvas cursor; records bbox for replay')
+Canvas.addCommand('d', 'delete-cursor', 'bboxstr=sheet.formatBbox(sheet.cursorBox); vd.setLastArgs(bboxstr); xmin,xmax,ymin,ymax=sheet.parseBbox(bboxstr); deleteSourceRows(sheet.rowsWithinDataBox(xmin,ymin,xmax,ymax))', 'delete rows on source sheet contained within canvas cursor; records bbox for replay')
 
-Canvas.addCommand('gs', 'select-visible', 'source.select(list(rowsWithin(plotterVisibleBox)))', 'select rows on source sheet visible on screen')
-Canvas.addCommand('gt', 'stoggle-visible', 'source.toggle(list(rowsWithin(plotterVisibleBox)))', 'toggle selection of rows on source sheet visible on screen')
-Canvas.addCommand('gu', 'unselect-visible', 'source.unselect(list(rowsWithin(plotterVisibleBox)))', 'unselect rows on source sheet visible on screen')
-Canvas.addCommand('gEnter', 'dive-visible', 'vs=copy(source); vs.rows=list(rowsWithin(plotterVisibleBox)); vd.push(vs)', 'open sheet of source rows visible on screen')
-Canvas.addCommand('gd', 'delete-visible', 'deleteSourceRows(rowsWithin(plotterVisibleBox))', 'delete rows on source sheet visible on screen')
+Canvas.addCommand('gs', 'select-visible', 'sheet.brushVisibleSelect()', 'select rows on source sheet visible on screen; records bbox for replay')
+Canvas.addCommand('gt', 'stoggle-visible', 'sheet.brushVisibleToggle()', 'toggle selection of rows on source sheet visible on screen; records bbox for replay')
+Canvas.addCommand('gu', 'unselect-visible', 'sheet.brushVisibleUnselect()', 'unselect rows on source sheet visible on screen; records bbox for replay')
+Canvas.addCommand('gEnter', 'dive-visible', 'bboxstr=sheet.formatBbox(sheet.visibleBox); vd.setLastArgs(bboxstr); xmin,xmax,ymin,ymax=sheet.parseBbox(bboxstr); vs=copy(source); vs.rows=list(sheet.rowsWithinDataBox(xmin,ymin,xmax,ymax)); vd.push(vs)', 'open sheet of source rows visible on screen; records bbox for replay')
+Canvas.addCommand('gd', 'delete-visible', 'bboxstr=sheet.formatBbox(sheet.visibleBox); vd.setLastArgs(bboxstr); xmin,xmax,ymin,ymax=sheet.parseBbox(bboxstr); deleteSourceRows(sheet.rowsWithinDataBox(xmin,ymin,xmax,ymax))', 'delete rows on source sheet visible on screen; records bbox for replay')
+
+Canvas.addCommand('', 'select-bbox', 'bbox=input("select bbox xmin xmax ymin ymax: ", defaultLast=True); sheet.selectBbox(bbox)', 'select rows within data bounding box "xmin xmax ymin ymax"')
+Canvas.addCommand('', 'stoggle-bbox', 'bbox=input("toggle bbox xmin xmax ymin ymax: ", defaultLast=True); sheet.stoggleBbox(bbox)', 'toggle rows within data bounding box "xmin xmax ymin ymax"')
+Canvas.addCommand('', 'unselect-bbox', 'bbox=input("unselect bbox xmin xmax ymin ymax: ", defaultLast=True); sheet.unselectBbox(bbox)', 'unselect rows within data bounding box "xmin xmax ymin ymax"')
+
+Canvas.addCommand('"s', 'save-selection', 'name=input("save selection as: "); sheet.saveNamedSelection(name)', 'save current cursor region as a named selection')
+Canvas.addCommand('"l', 'load-selection', 'vd.selections.reload(); names=[s.name for s in vd.selections]; name=input("load selection: ", completions=names) if names else fail("no saved selections"); sheet.loadNamedSelection(name)', 'apply a saved named selection to select rows on the source sheet')
+Canvas.addCommand('"d', 'delete-selection', 'vd.selections.reload(); names=[s.name for s in vd.selections]; name=input("delete selection: ", completions=names) if names else fail("no saved selections"); sheet.deleteNamedSelection(name)', 'delete a saved named selection')
 
 vd.addGlobals({
     'Canvas': Canvas,
@@ -857,6 +1047,7 @@ vd.addGlobals({
     'BoundingBox': BoundingBox,
     'Box': Box,
     'Point': Point,
+    'selections': vd.selections,
 })
 
 vd.addMenuItems('''
@@ -874,6 +1065,20 @@ vd.addMenuItems('''
     Plot > Zoom > out > zoomout-cursor
     Plot > Zoom > in > zoomin-cursor
     Plot > Zoom > cursor > zoom-all
+    Plot > Select > cursor region > select-cursor
+    Plot > Select > cursor region > toggle > stoggle-cursor
+    Plot > Select > cursor region > unselect > unselect-cursor
+    Plot > Select > visible region > select-visible
+    Plot > Select > visible region > toggle > stoggle-visible
+    Plot > Select > visible region > unselect > unselect-visible
+    Plot > Select > by bbox input > select-bbox
+    Plot > Select > by bbox input > toggle > stoggle-bbox
+    Plot > Select > by bbox input > unselect > unselect-bbox
+    Plot > Named selection > save cursor > save-selection
+    Plot > Named selection > load > load-selection
+    Plot > Named selection > delete > delete-selection
     View > Open subsheet > from cursor > dive-cursor
+    View > Open subsheet > visible region > dive-visible
     Edit > Delete > under cursor > delete-cursor
+    Edit > Delete > visible region > delete-visible
 ''')
