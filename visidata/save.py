@@ -4,13 +4,11 @@ from copy import copy
 
 from visidata import vd
 from visidata import Sheet, BaseSheet, VisiData, IndexSheet, Path, Progress, TypedExceptionWrapper, TypedWrapper, UNLOADED
-from visidata.normalizers import to_python_value, to_export_value
 
 vd.option('safe_error', '#ERR', 'error string to use while saving', replay=True)
 vd.option('save_encoding', 'utf-8', 'encoding passed to codecs.open when saving a file', replay=True, help=vd.help_encoding)
 
 _compression_formats = {'gz', 'bz2', 'xz', 'lzma', 'zst'}
-
 
 def parse_filetype(ft):
     'Parse filetype string like "json.gz" into (format, compression). Returns (ft, None) for plain types.'
@@ -59,7 +57,7 @@ def iterdispvals(sheet, *cols, format=False, delimiter=None):
         dispvals = collections.OrderedDict()  # [col] -> value
         for col, transforms in transformers.items():
             try:
-                dispval = to_python_value(col.getValue(r))
+                dispval = col.getValue(r)
 
             except Exception as e:
                 dispval = options_safe_error or str(e)

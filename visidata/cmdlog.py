@@ -1,4 +1,5 @@
 import threading
+import os
 
 from visidata import vd, UNLOADED, namedlist, vlen, asyncthread, globalCommand, date
 from visidata import VisiData, BaseSheet, Sheet, ColumnAttr, VisiDataMetaSheet, JsonLinesSheet, TypedWrapper, AttrDict, Progress, ErrorSheet, CompleteKey, Path
@@ -114,13 +115,41 @@ def getRowIndexFromStr(vs, row):
     return index
 
 
+_RECSEP = '\x1f'
+_COLSEP = _RECSEP
+_SHEETSEP = _RECSEP
+
+
 @Sheet.api
-def moveToCol(vs, col):
-    'Move cursor to column given by *col*, which can be either the column number or column name.'
-    if isinstance(col, str):
-        vcolidx = indexMatch(vs.availCols, lambda c,name=col: name == c.name)
-    elif isinstance(col, int):
+def moveToCol(vs, col, colidx=None):
+    'Move cursor to column given by *col*, which can be either the column number or column name.  *colidx* is fallback index if name lookup fails.'
+    vcolidx = None
+
+    if isinstance(col, int):
         vcolidx = col
+    elif isinstance(col, str):
+        if _COLSEP in col:
+            colname, _, fallback_idx = col.partition(_COLSEP)
+        else:
+            colname, fallback_idx = col, None
+
+        if colname:
+            vcolidx = indexMatch(vs.availCols, lambda c,name=colname: name == c.name)
+
+        if vcolidx is None:
+            if fallback_idx is not None:
+                try:
+                    vcolidx = int(fallback_idx)
+                except (ValueError, TypeError):
+                    pass
+            if vcolidx is None:
+                try:
+                    vcolidx = int(colname)
+                except (ValueError, TypeError):
+                    pass
+
+    if colidx is not None and vcolidx is None:
+        vcolidx = colidx
 
     if vcolidx is None or vcolidx >= len(vs.availCols):
         return False
@@ -140,7 +169,15 @@ def commandCursor(sheet, execstr):
 
     if contains(execstr, 'cursorTypedValue', 'cursorDisplay', 'cursorValue', 'cursorCell', 'cursorCol', 'cursorVisibleCol', 'ColumnAtCursor'):
         if sheet.cursorCol:
-            colname = sheet.cursorCol.name or sheet.visibleCols.index(sheet.cursorCol)
+            name = sheet.cursorCol.name
+            try:
+                idx = sheet.visibleCols.index(sheet.cursorCol)
+            except ValueError:
+                idx = None
+            if name and idx is not None:
+                colname = f'{name}{_COLSEP}{idx}'
+            else:
+                colname = name or idx
         else:
             colname = None
     return colname, rowname
@@ -174,7 +211,11 @@ class CommandLogBase:
 
         colname, rowname, sheetname = '', '', None
         if sheet and not (cmd.longname.startswith('open-') and not cmd.longname in ('open-row', 'open-cell')):
-            sheetname = sheet.name
+            try:
+                sheetidx = vd.sheets.index(sheet)
+                sheetname = f'{sheet.name}{_SHEETSEP}{sheetidx}'
+            except ValueError:
+                sheetname = sheet.name
 
             colname, rowname = sheet.commandCursor(cmd.execstr)
 
@@ -217,6 +258,24 @@ class CommandLogBase:
         r = self.newRow(keystrokes='o', input=str(src), longname='open-file', replayable=True)
         vs.cmdlog_sheet.addRow(r)
         self.addRow(r)
+
+        if isinstance(src, os.PathLike):
+            srcpath = Path(src)
+            srcname = str(srcpath)
+            for optname in list(vd._options.keys()):
+                optdef = vd._options._get(optname, 'default')
+                if not optdef or not optdef.replayable:
+                    continue
+                val = vd._options.getonly(optname, srcpath, None)
+                if val is None:
+                    continue
+                if val == optdef.value:
+                    continue
+                optrow = self.newRow(sheet=srcname, row=optname,
+                                     keystrokes='', input=str(val),
+                                     longname='set-option', replayable=True, undofuncs=[])
+                vs.cmdlog_sheet.addRow(optrow)
+                self.addRow(optrow)
 
 class CommandLog(CommandLogBase, VisiDataMetaSheet):
     pass

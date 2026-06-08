@@ -2,7 +2,6 @@ import json
 from collections import Counter
 
 from visidata import vd, date, anytype, VisiData, PyobjSheet, AttrDict, stacktrace, TypedExceptionWrapper, AlwaysDict, ItemColumn, wrapply, TypedWrapper, Progress, Sheet
-from visidata.normalizers import to_export_value
 
 vd.option('json_indent', None, 'indent to use when saving json')
 vd.option('json_sort_keys', False, 'sort object keys when saving to json')
@@ -101,13 +100,9 @@ JsonSheet.init('_knownKeys', set, copy=True)  # set of row keys already seen
 
 ## saving json and jsonl
 
-
 class _vjsonEncoder(json.JSONEncoder):
     def default(self, obj):
-        result = to_export_value(obj, fmt='json')
-        if isinstance(result, (dict, list, tuple)):
-            return result
-        return result
+        return str(obj)
 
 
 @VisiData.api
@@ -119,7 +114,7 @@ def get_json_value(vd, col, row):
         o = o.val
     elif isinstance(o, date):
         o = col.getDisplayValue(row)
-    return to_export_value(o, fmt='json')
+    return o
 
 
 def _rowdict(cols, row, keep_nulls=False):
