@@ -2,6 +2,92 @@
 
 Save named sets of loading options (filetype, encoding, delimiter, header,
 compression, etc.) and apply them when opening matching files or URLs.
+
+Profile Storage Format (profiles.json):
+----------------------------------------
+Profiles are persisted as JSON, by default at ``$VD_DIR/profiles.json``
+(or ``$XDG_DATA_HOME/visidata/profiles.json``).  The file is a dict mapping
+profile names to profile objects:
+
+    {
+      "semicolon-csv": {
+        "name": "semicolon-csv",
+        "description": "European CSV with ; separator",
+        "path_pattern": "*.csv",
+        "options": {
+          "csv_delimiter": ";",
+          "encoding": "latin-1",
+          "header": 1
+        },
+        "created_at": "2025-01-15T10:30:00",
+        "updated_at": "2025-01-15T10:30:00"
+      }
+    }
+
+Each profile has:
+  * ``name``         – unique identifier (string)
+  * ``description``  – free-text description (string, optional)
+  * ``path_pattern`` – fnmatch glob or substring matched against the given
+                       path (string, optional).  Example: ``"*.csv"`` or
+                       ``"financial_reports"``.
+  * ``options``      – dict of option-name → value.  Only non-default
+                       loading-format options are stored.  Recognised keys
+                       are listed in ``REPLAYABLE_LOAD_OPTS``.
+  * ``created_at`` / ``updated_at`` – ISO-8601 timestamps (auto-managed).
+
+Ways to Use Profiles:
+---------------------
+1. **Command line** – apply a profile when opening files::
+
+       vd --load-profile=semicolon-csv data.csv
+       vd --load-profile=utf16-tsv report.txt --batch -o cleaned.tsv
+
+2. **Interactive** – save, apply, list, delete via long commands or menu:
+
+       save-profile        – save current sheet's loading options as a profile
+       apply-profile       – apply a saved profile to the current sheet
+       open-file-with-profile  – pick a file and then pick a profile to apply
+       open-profile        – open the profile browser sheet
+       delete-profile      – remove a saved profile
+
+   Menu path:  ``File > Options > profiles > …``
+               ``File > Open > with profile > …``
+
+3. **Auto-prompt** – when ``options.profiles_auto_prompt`` is True (the
+   default) and you open a file whose path matches any saved
+   ``path_pattern``, VisiData prompts you to choose one of the matching
+   profiles.  This is automatically disabled in batch and replay modes.
+
+4. **Macros / VDX replay** – profiles are fully replayable:
+   * Every file opened with a profile automatically records a
+     ``set-option load_profile <name>`` command in the cmdlog immediately
+     before the ``open-file`` entry.  Saving the cmdlog (``Ctrl+D``) and
+     replaying it (``vd -p script.vdj``) reproduces the exact load.
+   * Minimal VDX format supports the following additional commands::
+
+         apply-profile myprofile          # same as the apply-profile command
+         save-profile newprof             # same as save-profile
+         delete-profile oldprof           # same as delete-profile
+         option global load_profile name  # set profile globally before open
+
+5. **Config file** – add ``option global load_profile myprofile`` to
+   ``~/.visidatarc`` to always apply a default profile, or put the
+   profile JSON directly into ``$VD_DIR/profiles.json``.
+
+Unified Resolution Order
+------------------------
+Every call to ``openSource`` / ``openPath`` resolves the profile through a
+single helper ``vd.resolveProfileForPath``:
+
+  1. Explicit ``profile=`` keyword argument passed by the caller.
+  2. ``path.options.load_profile`` (set per-path before opening).
+  3. ``vd.options.load_profile`` (CLI ``--load-profile`` or global setting).
+  4. (interactive only) Auto-prompt if matching profiles exist and
+     ``profiles_auto_prompt`` is enabled and neither batch nor replay is
+     active.
+
+This guarantees that command-line, interactive, and macro replay all go
+through the same code path.
 """
 
 import fnmatch
@@ -9,10 +95,23 @@ import json
 import os
 from datetime import datetime
 
-from visidata import vd, VisiData, BaseSheet, Sheet, Column, ColumnAttr, ItemColumn, AttrDict, Path, TableSheet
+from visidata import vd, VisiData, BaseSheet, Sheet, Column, ColumnAttr, ItemColumn, AttrDict, Path, TableSheet, CompleteKey
 
 
 vd.option('profiles_auto_prompt', True, 'prompt to apply matching profiles when opening files', replay=True)
+
+
+def _choose_name(prompt, names):
+    '''Prompt user to choose one name from a list of strings; return None on cancel.'''
+    if vd.cmdlog:
+        v = vd.getLastArgs()
+        if v is not None:
+            vd.setLastArgs(v)
+            return v
+    choice = vd.input(prompt, completer=CompleteKey(names))
+    if choice and choice in names:
+        return choice
+    return None
 
 
 REPLAYABLE_LOAD_OPTS = [
@@ -159,7 +258,69 @@ def deleteProfile(vd, name):
 
 
 @VisiData.api
-def applyProfile(vd, name, target=None):
+def resolveProfileForPath(vd, p, explicit_profile=None):
+    '''Unified profile resolution for a path.
+
+    Resolution order:
+    1. explicit_profile argument (from openSource/openPath call site)
+    2. path.options.load_profile (set per-path before open)
+    3. vd.options.load_profile (CLI --load-profile or global option)
+    4. (interactive only) auto-prompt if matching profiles exist and profiles_auto_prompt=True
+
+    Returns (profile_name_or_None, was_interactive):
+      - profile_name: name of profile to apply, or None if no profile
+      - was_interactive: True if chosen via interactive prompt (for cmdlog replay tracking)
+    '''
+    profile_name = explicit_profile or ''
+
+    if not profile_name and isinstance(p, Path):
+        profile_name = p.options.getonly('load_profile', p, '') or ''
+
+    if not profile_name:
+        profile_name = vd.options.getonly('load_profile', 'global', '') or ''
+
+    was_interactive = False
+    if not profile_name:
+        is_interactive = (not vd.options.batch
+                          and vd.currentReplay is None
+                          and getattr(vd, '_cmdlogReplaying', None) is None
+                          and vd.options.get('profiles_auto_prompt', True)
+                          and p.given not in ('', '-'))
+
+        if is_interactive:
+            matches = vd.getMatchingProfiles(p)
+            if matches:
+                names = [n for n, _ in matches]
+                names.append('(none)')
+                choice = _choose_name(f'{len(matches)} matching profile(s) found; apply which? ', names)
+                if choice and choice != '(none)':
+                    profile_name = choice
+                    was_interactive = True
+
+    return (profile_name if profile_name else None, was_interactive)
+
+
+@VisiData.api
+def _recordProfileToCmdlog(vd, name, target=None):
+    '''Record an apply-profile command to the current cmdlog for replay.'''
+    if not vd.cmdlog:
+        return
+    sheetname = target.name if isinstance(target, BaseSheet) else (str(target) if isinstance(target, Path) else 'global')
+    r = vd.cmdlog.newRow(
+        sheet=sheetname,
+        row='',
+        keystrokes='',
+        input=name,
+        longname='apply-profile',
+        undofuncs=[],
+    )
+    vd.cmdlog.addRow(r)
+    if isinstance(target, BaseSheet):
+        target.cmdlog_sheet.addRow(r)
+
+
+@VisiData.api
+def applyProfile(vd, name, target=None, record=True):
     profiles = vd.getProfiles()
     if name not in profiles:
         vd.fail(f'no profile named `{name}`')
@@ -178,6 +339,12 @@ def applyProfile(vd, name, target=None):
                 target.options.set(optname, optval, target)
                 if isinstance(target.source, Path):
                     target.source.options.set(optname, optval, target.source, cmdlog=False)
+
+    if isinstance(target, (Path, BaseSheet)):
+        target._applied_profile = name
+
+    if record and not vd.options.batch and vd.currentReplay is None:
+        vd._recordProfileToCmdlog(name, target)
 
     if isinstance(target, BaseSheet) and opts:
         vd.status(f'applied profile `{name}` ({len(opts)} option(s)); reload to take effect')
@@ -211,7 +378,7 @@ def chooseProfile(vd, path=None, prompt='choose profile: '):
         matching = [n for n, _ in vd.getMatchingProfiles(path)]
         if matching:
             names = matching + [n for n in names if n not in matching]
-    name = vd.choose(prompt, names)
+    name = _choose_name(prompt, names)
     if not name:
         return None
     return profiles.get(name)
@@ -308,7 +475,7 @@ BaseSheet.addCommand('', 'open-profile',
     'open the profiles sheet with all saved loading profiles')
 
 BaseSheet.addCommand('', 'open-file-with-profile',
-    'p=Path(inputFilename("open with profile: ")); prof=vd.chooseProfile(p, "choose profile for this file: "); prof and vd.applyProfile(prof.name, p); vd.push(openSource(p, create=True))',
+    'p=Path(inputFilename("open with profile: ")); prof=vd.chooseProfile(p, "choose profile for this file: "); vd.push(openSource(p, create=True, profile=prof.name if prof else None))',
     'open a file and apply a profile before loading')
 
 BaseSheet.addCommand('', 'delete-profile',
@@ -327,3 +494,43 @@ vd.addGlobals(
     ProfilesSheet=ProfilesSheet,
     ProfileDetailSheet=ProfileDetailSheet,
 )
+
+
+_orig_openHook = None
+_isLoggableSheet = None
+
+
+def _profile_openHook(self, vs, src):
+    global _orig_openHook, _isLoggableSheet
+    profile_name = getattr(vs, '_applied_profile', None)
+    if profile_name and not vd.options.batch and vd.currentReplay is None:
+        r = self.newRow(
+            sheet='global',
+            col='',
+            row='load_profile',
+            longname='set-option',
+            input=profile_name,
+            keystrokes='',
+            replayable=True,
+            comment=f'set loading profile to {profile_name}',
+            undofuncs=[],
+        )
+        self.addRow(r)
+        if _isLoggableSheet and _isLoggableSheet(vs):
+            vs.cmdlog_sheet.addRow(r)
+    _orig_openHook(self, vs, src)
+
+
+def _install_openHook_patch():
+    global _orig_openHook, _isLoggableSheet
+    try:
+        from visidata.cmdlog import CommandLogBase, isLoggableSheet
+        if _orig_openHook is None:
+            _orig_openHook = CommandLogBase.openHook
+            _isLoggableSheet = isLoggableSheet
+            CommandLogBase.openHook = _profile_openHook
+    except (ImportError, AttributeError):
+        pass
+
+
+_install_openHook_patch()

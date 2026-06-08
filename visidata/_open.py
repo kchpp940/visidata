@@ -6,7 +6,7 @@ from visidata import VisiData, vd, Path, BaseSheet, TableSheet, TextSheet, Setta
 
 
 vd.option('filetype', '', 'specify file type', replay=True)
-vd.option('profile', '', 'apply named loading profile when opening files', replay=True)
+vd.option('load_profile', '', 'apply named loading profile when opening files', replay=True)
 
 
 @VisiData.api
@@ -93,23 +93,22 @@ def guess_extension(vd, path):
         return dict(filetype=ext, _likelihood=3)
 
 
+def _attach_profile(vs, profile_name):
+    if vs and profile_name:
+        vs._applied_profile = profile_name
+    return vs
+
+
 @VisiData.api
 def openPath(vd, p, filetype=None, create=False, profile=None):
     '''Call ``open_<filetype>(p)`` or ``openurl_<p.scheme>(p, filetype)``.  Return constructed but unloaded sheet of appropriate type.
     If True, *create* will return a new, blank **Sheet** if file does not exist.'''
 
-    profile_name = profile or p.options.getonly('profile', p, '') or vd.options.getonly('profile', 'global', '')
-
+    profile_name, was_interactive = vd.resolveProfileForPath(p, explicit_profile=profile)
+    applied_profile = None
     if profile_name:
-        vd.applyProfile(profile_name, p)
-    elif vd.options.get('profiles_auto_prompt', True) and not vd.options.batch and p.given not in ('', '-'):
-        matches = vd.getMatchingProfiles(p)
-        if matches:
-            names = [n for n, _ in matches]
-            names.append('(none)')
-            choice = vd.choose(f'{len(matches)} matching profile(s) found; apply which? ', names)
-            if choice and choice != '(none)':
-                vd.applyProfile(choice, p)
+        applied_profile = vd.applyProfile(profile_name, p, record=False)
+        p._applied_profile = profile_name
 
     filetype = filetype or p.options.filetype  # resolve from path instance, Path class, global  #1710
 
@@ -121,7 +120,7 @@ def openPath(vd, p, filetype=None, create=False, profile=None):
         if not openfunc:
             vd.fail(f'no loader for url scheme: {p.scheme}')
 
-        return openfunc(p, filetype=filetype)
+        return _attach_profile(openfunc(p, filetype=filetype), profile_name)
 
     if not p.exists() and not create:
         return None
@@ -139,10 +138,10 @@ def openPath(vd, p, filetype=None, create=False, profile=None):
         newfunc = getattr(vd, 'new_' + filetype, vd.getGlobals().get('new_' + filetype))
         if not newfunc:
             vd.warning('%s does not exist, creating new sheet' % p)
-            return vd.newSheet(p.base_stem, 1, source=p)
+            return _attach_profile(vd.newSheet(p.base_stem, 1, source=p), profile_name)
 
         vd.status('creating blank %s' % (p.given))
-        return newfunc(p)
+        return _attach_profile(newfunc(p), profile_name)
 
     if p.is_fifo():
         # read the file as text, into a RepeatFile that can be opened multiple times
@@ -164,7 +163,7 @@ def openPath(vd, p, filetype=None, create=False, profile=None):
                 if k != 'filetype' and not k.startswith('_'):
                     setattr(vs.options, k, v)
             vd.status(f'guessed `{opts["filetype"]}` filetype based on contents')
-            return vs
+            return _attach_profile(vs, profile_name)
 
         vd.warning(f'unknown `{filetype}` filetype')
 
@@ -173,7 +172,7 @@ def openPath(vd, p, filetype=None, create=False, profile=None):
 
     vd.status('opening %s as %s' % (p.given, filetype))
 
-    return openfunc(p)
+    return _attach_profile(openfunc(p), profile_name)
 
 @VisiData.api
 def openSource(vd, p, filetype=None, create=False, profile=None, **kwargs):
