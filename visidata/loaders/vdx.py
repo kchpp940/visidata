@@ -103,8 +103,14 @@ def save_vdx(vd, p, *vsheets):
             prevrow = None
             for r in vs.rows:
                 if r.longname in ('set-option', 'unset-option'):
-                    scope = r.sheet or r.col or 'global'
                     optname = r.row or ''
+                    # Skip rows referencing options that don't exist in the current vd options.
+                    # Prevents stray metadata fields (e.g. old source_* placeholders) from being
+                    # written as replayable options that would fail on re-read.
+                    optdef = vd._options._get(optname, None)
+                    if r.longname == 'set-option' and optdef is None:
+                        continue
+                    scope = r.sheet or r.col or 'global'
                     optval = r.input or ''
                     if r.longname == 'set-option':
                         fp.write(f'option {scope} {optname} {optval}\n')

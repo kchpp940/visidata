@@ -163,27 +163,32 @@ def openPath(vd, p, filetype=None, create=False):
 @VisiData.api
 def openSource(vd, p, filetype=None, create=False, **kwargs):
     '''Return unloaded sheet object for *p* opened as the given *filetype* and with *kwargs* as option overrides. *p* can be a Path or a string (filename, url, or "-" for stdin).
-    when true, *create* will return a blank sheet, if file does not exist.
-    *p* can also be a JSON string from cmdlog containing structured source metadata like {"kind": "local", "given": "./data.csv", ...}.'''
+    For backwards compatibility, plain string paths (including old VDX/VDJ files and hand-written macros) work unchanged.
+    Structured JSON input (from cmdlog replay) supplements loader parameters without breaking plain path handling.'''
 
     if isinstance(p, BaseSheet):
         return p
 
     # Parse structured source metadata from JSON string (used in cmdlog replay)
+    # Falls back to plain string path on any parse error — backwards compatible with old VDX/VDJ/macros.
     src_meta = None
     if isinstance(p, str):
         p_stripped = p.strip()
-        if p_stripped.startswith('{') and p_stripped.endswith('}'):
+        # Quick shape check: JSON object strings must start with '{' and end with '}'
+        if len(p_stripped) >= 2 and p_stripped[0] == '{' and p_stripped[-1] == '}':
             try:
                 import json
-                src_meta = json.loads(p_stripped)
-                p = src_meta.get('given', p)
-                if not filetype and src_meta.get('filetype'):
-                    filetype = src_meta['filetype']
-                for k in ('encoding', 'encoding_errors', 'delimiter', 'header'):
-                    if src_meta.get(k) and k not in kwargs:
-                        kwargs[k] = src_meta[k]
-            except (ValueError, json.JSONDecodeError):
+                parsed = json.loads(p_stripped)
+                if isinstance(parsed, dict) and 'given' in parsed:
+                    src_meta = parsed
+                    p = src_meta.get('given', p)
+                    if not filetype and src_meta.get('filetype'):
+                        filetype = src_meta['filetype']
+                    for k in ('encoding', 'encoding_errors', 'delimiter', 'header'):
+                        if src_meta.get(k) is not None and k not in kwargs:
+                            kwargs[k] = src_meta[k]
+            except (ValueError, json.JSONDecodeError, TypeError):
+                # Not valid JSON, or not a dict with 'given' — treat as plain path
                 pass
 
     vs = None

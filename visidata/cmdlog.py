@@ -48,7 +48,21 @@ def save_vdj(vd, p, *vsheets):
         fp.write("#!/usr/bin/env -S vd -p\n")
         fp.write(f"# {visidata.__version_info__}\n")
         for vs in vsheets:
-            vs.write_jsonl(fp)
+            vcols = vs.visibleCols
+            for i, row in enumerate(vs.iterrows()):
+                # Skip set-option rows referencing non-existent options
+                longname = None
+                optname = ''
+                for c in vcols:
+                    if c.name == 'longname':
+                        longname = c.getValue(row)
+                    elif c.name == 'row':
+                        optname = c.getValue(row) or ''
+                if longname == 'set-option':
+                    optdef = vd._options._get(optname, None)
+                    if optdef is None:
+                        continue
+                fp.write(vd.encode_json(row, vcols) + '\n')
             for r in _collect_graph_state_rows(vd, vs):
                 fp.write(json.dumps(r) + '\n')
 
@@ -346,23 +360,6 @@ class CommandLogBase:
                     continue
                 optrow = self.newRow(sheet=srcname, row=optname,
                                      keystrokes='', input=str(val),
-                                     longname='set-option', replayable=True, undofuncs=[])
-                vs.cmdlog_sheet.addRow(optrow)
-                self.addRow(optrow)
-
-            # Record structured source metadata fields as options (even if default)
-            # to ensure full round-trip for non-path sources (stdin, URL, virtual)
-            meta = srcpath.source_meta()
-            for k, v in meta.items():
-                if k == 'given' or k == 'encoding' or k == 'filetype':
-                    continue  # given is already source id, encoding/filetype handled above
-                if not v:
-                    continue
-                optname = f'source_{k}'
-                if optname in replayable_opts:
-                    continue  # already handled above if set on path
-                optrow = self.newRow(sheet=srcname, row=optname,
-                                     keystrokes='', input=str(v),
                                      longname='set-option', replayable=True, undofuncs=[])
                 vs.cmdlog_sheet.addRow(optrow)
                 self.addRow(optrow)
