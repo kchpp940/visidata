@@ -163,10 +163,28 @@ def openPath(vd, p, filetype=None, create=False):
 @VisiData.api
 def openSource(vd, p, filetype=None, create=False, **kwargs):
     '''Return unloaded sheet object for *p* opened as the given *filetype* and with *kwargs* as option overrides. *p* can be a Path or a string (filename, url, or "-" for stdin).
-    when true, *create* will return a blank sheet, if file does not exist.'''
+    when true, *create* will return a blank sheet, if file does not exist.
+    *p* can also be a JSON string from cmdlog containing structured source metadata like {"kind": "local", "given": "./data.csv", ...}.'''
 
     if isinstance(p, BaseSheet):
         return p
+
+    # Parse structured source metadata from JSON string (used in cmdlog replay)
+    src_meta = None
+    if isinstance(p, str):
+        p_stripped = p.strip()
+        if p_stripped.startswith('{') and p_stripped.endswith('}'):
+            try:
+                import json
+                src_meta = json.loads(p_stripped)
+                p = src_meta.get('given', p)
+                if not filetype and src_meta.get('filetype'):
+                    filetype = src_meta['filetype']
+                for k in ('encoding', 'encoding_errors', 'delimiter', 'header'):
+                    if src_meta.get(k) and k not in kwargs:
+                        kwargs[k] = src_meta[k]
+            except (ValueError, json.JSONDecodeError):
+                pass
 
     vs = None
     if isinstance(p, str):
@@ -186,6 +204,15 @@ def openSource(vd, p, filetype=None, create=False, **kwargs):
         # Path is authoritative for format options  #2727
         if isinstance(vs.source, Path):
             vs.source.options.set(optname, optval, vs.source, cmdlog=False)
+
+    # Apply structured source metadata from replay
+    if src_meta and isinstance(vs.source, Path):
+        for k in ('compression', 'innerpath', 'kind', 'archive_source'):
+            if src_meta.get(k) and not getattr(vs.source, k, None):
+                try:
+                    setattr(vs.source, k, src_meta[k])
+                except AttributeError:
+                    pass
 
     return vs
 

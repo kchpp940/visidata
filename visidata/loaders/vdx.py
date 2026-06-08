@@ -128,6 +128,17 @@ def save_vdx(vd, p, *vsheets):
 
                 prevrow = r
 
+            from visidata.cmdlog import _collect_graph_state_rows
+            for gr in _collect_graph_state_rows(vd, vs):
+                if gr.get('sheet') and (prevrow is None or prevrow.sheet != gr['sheet']):
+                    fp.write(f'sheet {gr["sheet"]}\n')
+
+                line = gr.get('longname', '')
+                if gr.get('input'):
+                    line += ' ' + str(gr['input'])
+                fp.write(line + '\n')
+                prevrow = AttrDict(gr)
+
 
 @VisiData.api
 def runvdx(vd, vdx:str):

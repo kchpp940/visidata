@@ -1,5 +1,6 @@
 import threading
 import os
+import json
 
 from visidata import vd, UNLOADED, namedlist, vlen, asyncthread, globalCommand, date
 from visidata import VisiData, BaseSheet, Sheet, ColumnAttr, VisiDataMetaSheet, JsonLinesSheet, TypedWrapper, AttrDict, Progress, ErrorSheet, CompleteKey, Path
@@ -48,6 +49,47 @@ def save_vdj(vd, p, *vsheets):
         fp.write(f"# {visidata.__version_info__}\n")
         for vs in vsheets:
             vs.write_jsonl(fp)
+            for r in _collect_graph_state_rows(vd, vs):
+                fp.write(json.dumps(r) + '\n')
+
+
+_SHEETSEP = '\x1f'
+
+
+def _collect_graph_state_rows(vd, cmdlog_sheet):
+    'Return list of CommandLogRow dicts for current graph state of all GraphSheets.'
+    try:
+        from visidata.graph import GraphSheet
+    except ImportError:
+        return []
+
+    rows = []
+    for sheet_idx, sheet in enumerate(vd.sheets):
+        if not isinstance(sheet, GraphSheet):
+            continue
+
+        sheetid = f'{sheet.name}{_SHEETSEP}{sheet_idx}'
+
+        if hasattr(sheet, 'visibleBox') and sheet.visibleBox:
+            vb = sheet.visibleBox
+            rows.append(dict(sheet=sheetid, col='', row='',
+                             longname='set-view',
+                             input=f'{vb.xmin} {vb.ymin} {vb.xmax} {vb.ymax}',
+                             keystrokes='', comment='', replayable=True, undofuncs=[]))
+
+        if hasattr(sheet, 'reflines_x') and sheet.reflines_x:
+            rows.append(dict(sheet=sheetid, col='', row='',
+                             longname='set-reflines-x',
+                             input=' '.join(str(x) for x in sheet.reflines_x),
+                             keystrokes='', comment='', replayable=True, undofuncs=[]))
+
+        if hasattr(sheet, 'reflines_y') and sheet.reflines_y:
+            rows.append(dict(sheet=sheetid, col='', row='',
+                             longname='set-reflines-y',
+                             input=' '.join(str(y) for y in sheet.reflines_y),
+                             keystrokes='', comment='', replayable=True, undofuncs=[]))
+
+    return rows
 
 
 @VisiData.api
@@ -72,13 +114,25 @@ def indexMatch(L, func):
             return i
 
 @VisiData.api
-def isLoggableCommand(vd, cmd):
+def isLoggableCommand(vd, cmd, sheet=None):
     'Return whether command should be logged to the cmdlog, depending if it has a prefix in nonLogged, or was defined with replay=False.'
     if not cmd.replayable:
         return False
 
+    sheet = sheet or vd.activeSheet
+    is_graph_sheet = False
+    if sheet is not None:
+        try:
+            from visidata.graph import GraphSheet
+            from visidata.canvas import Canvas
+            is_graph_sheet = isinstance(sheet, (GraphSheet, Canvas))
+        except ImportError:
+            pass
+
     for n in nonLogged:
         if cmd.longname.startswith(n):
+            if is_graph_sheet and n in ('zoom', 'scroll', 'visibility'):
+                continue
             return False
     return True
 
@@ -245,7 +299,7 @@ class CommandLogBase:
             return
 
         # remove user-aborted commands and simple movements (unless first command on the sheet, which created the sheet)
-        if not sheet.cmdlog_sheet.rows or vd.isLoggableCommand(vd.activeCommand):
+        if not sheet.cmdlog_sheet.rows or vd.isLoggableCommand(vd.activeCommand, sheet=sheet):
             if isLoggableSheet(sheet):      # don't record actions from cmdlog or other internal sheets on global cmdlog
                 self.addRow(vd.activeCommand)  # add to global cmdlog
             sheet.cmdlog_sheet.addRow(vd.activeCommand)  # add to sheet-specific cmdlog
@@ -255,23 +309,36 @@ class CommandLogBase:
     def openHook(self, vs, src):
         while isinstance(src, BaseSheet):
             src = src.source
+        srcgiven = getattr(src, 'given', None)
         if isinstance(src, os.PathLike):
-            srcpath = Path(src)
-            srcgiven = srcpath.given
+            if isinstance(src, Path):
+                srcpath = src
+            else:
+                srcpath = Path(src)
+                srcgiven = srcgiven or srcpath.given
+            srcgiven = srcgiven or srcpath.given
         else:
             srcpath = None
             srcgiven = str(src)
-        r = self.newRow(keystrokes='o', input=srcgiven, longname='open-file', replayable=True)
+
+        if srcpath is not None:
+            meta = srcpath.source_meta()
+            meta_input = json.dumps(meta, ensure_ascii=False, sort_keys=True)
+        else:
+            meta_input = srcgiven
+        r = self.newRow(keystrokes='o', input=meta_input, longname='open-file', replayable=True)
         vs.cmdlog_sheet.addRow(r)
         self.addRow(r)
 
         if srcpath is not None:
-            srcname = str(srcpath)
+            srcname = srcgiven
             srcoptions = srcpath.options
+            replayable_opts = set()
             for optname in list(vd._options.keys()):
                 optdef = vd._options._get(optname, 'default')
                 if not optdef or not optdef.replayable:
                     continue
+                replayable_opts.add(optname)
                 val = srcoptions.getonly(optname, srcpath, None)
                 if val is None:
                     continue
@@ -279,6 +346,23 @@ class CommandLogBase:
                     continue
                 optrow = self.newRow(sheet=srcname, row=optname,
                                      keystrokes='', input=str(val),
+                                     longname='set-option', replayable=True, undofuncs=[])
+                vs.cmdlog_sheet.addRow(optrow)
+                self.addRow(optrow)
+
+            # Record structured source metadata fields as options (even if default)
+            # to ensure full round-trip for non-path sources (stdin, URL, virtual)
+            meta = srcpath.source_meta()
+            for k, v in meta.items():
+                if k == 'given' or k == 'encoding' or k == 'filetype':
+                    continue  # given is already source id, encoding/filetype handled above
+                if not v:
+                    continue
+                optname = f'source_{k}'
+                if optname in replayable_opts:
+                    continue  # already handled above if set on path
+                optrow = self.newRow(sheet=srcname, row=optname,
+                                     keystrokes='', input=str(v),
                                      longname='set-option', replayable=True, undofuncs=[])
                 vs.cmdlog_sheet.addRow(optrow)
                 self.addRow(optrow)
