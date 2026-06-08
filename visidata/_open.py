@@ -225,10 +225,20 @@ def open_txt(vd, p):
 
 @VisiData.api
 def _get_replay_profile(vd):
-    '''Return the profile name stored in the current replay row's col field, or None.'''
+    '''Return the profile name from the current replay row, or None.
+
+    Reads from the dedicated ``profile`` field first (new format).
+    Falls back to the ``col`` field for backward compatibility with
+    older cmdlogs/VDX files that stored the profile name in the col field.
+    '''
     r = getattr(vd, 'currentReplayRow', None)
     if r and getattr(r, 'longname', None) in ('open-file', 'open-file-with-profile'):
-        return getattr(r, 'col', None) or None
+        prof = getattr(r, 'profile', None)
+        if prof:
+            return prof
+        colprof = getattr(r, 'col', None)
+        if colprof:
+            return colprof
     return None
 
 

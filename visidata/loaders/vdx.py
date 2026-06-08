@@ -4,7 +4,7 @@ import re
 import visidata
 from visidata import VisiData, CommandLogBase, BaseSheet, Sheet, AttrDict, Progress
 
-VDX_VD_COLUMNS = ['sheet', 'col', 'row', 'longname', 'input', 'keystrokes', 'comment']
+VDX_VD_COLUMNS = ['sheet', 'col', 'row', 'longname', 'input', 'keystrokes', 'comment', 'profile']
 
 
 @VisiData.api
@@ -12,7 +12,7 @@ def open_vdx(vd, p):
     return CommandLogSimple(p.base_stem, source=p, precious=True)
 
 
-VDX_CONTEXT_COMMANDS = {'sheet', 'col', 'row'}
+VDX_CONTEXT_COMMANDS = {'sheet', 'col', 'row', 'profile'}
 
 class CommandLogSimple(CommandLogBase, Sheet):
     filetype = 'vdx'
@@ -80,6 +80,8 @@ def save_vdx(vd, p, *vsheets):
                     fp.write(f'col {r.col}\n')
                 if r.row and (prevrow is None or prevrow.row != r.row):
                     fp.write(f'row {r.row}\n')
+                if r.profile and (prevrow is None or prevrow.profile != r.profile):
+                    fp.write(f'profile {r.profile}\n')
 
                 line = r.longname
                 if r.input:

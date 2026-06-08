@@ -14,6 +14,8 @@ profile names to profile objects:
         "name": "semicolon-csv",
         "description": "European CSV with ; separator",
         "path_pattern": "*.csv",
+        "filetype": "csv",
+        "sheet_name": "",
         "options": {
           "csv_delimiter": ";",
           "encoding": "latin-1",
@@ -30,6 +32,10 @@ Each profile has:
   * ``path_pattern`` – fnmatch glob or substring matched against the given
                        path (string, optional).  Example: ``"*.csv"`` or
                        ``"financial_reports"``.
+  * ``filetype``     – explicit filetype override (string, optional).
+                       If set, forces the loader to use this filetype.
+  * ``sheet_name``   – sheet/table selector for multi-sheet sources like
+                       Excel workbooks (string, optional).
   * ``options``      – dict of option-name → value.  Only non-default
                        loading-format options are stored.  Recognised keys
                        are listed in ``REPLAYABLE_LOAD_OPTS``.
@@ -61,12 +67,12 @@ Ways to Use Profiles (all per-source, no global residue):
    profiles.  This is automatically disabled in batch and replay modes.
 
 4. **Macros / VDX replay** – every file opened with a profile records the
-   profile name directly in the ``open-file`` cmdlog row (in the ``col``
-   field).  On replay, the profile is extracted from that row and applied
-   **only to that specific open** – it does not leak to subsequent opens.
-   Minimal VDX format:
+   profile name directly in the ``open-file`` cmdlog row in the dedicated
+   ``profile`` field.  On replay, the profile is extracted from that row
+   and applied **only to that specific open** – it does not leak to
+   subsequent opens.  Minimal VDX format:
 
-         col semicolon
+         profile semicolon
          open-file data.csv
 
    The VDX loader also supports these standalone commands (recorded via
@@ -75,6 +81,9 @@ Ways to Use Profiles (all per-source, no global residue):
          apply-profile myprofile
          save-profile newprof
          delete-profile oldprof
+
+   Backward compatibility: older cmdlogs/VDX files that stored the profile
+   name in the ``col`` field are still recognised during replay.
 
 5. **Config file** – ``~/.visidatarc`` supports ``option`` statements for
    one-off configuration, but for reproducible loads prefer putting the
@@ -217,6 +226,9 @@ def saveProfile(vd, name, source=None, description='', path_pattern=None):
 
     opts = {}
     obj = None
+    captured_filetype = ''
+    captured_sheet_name = ''
+
     if isinstance(source, Path):
         obj = source
     elif isinstance(source, BaseSheet) and source.source:
@@ -225,12 +237,26 @@ def saveProfile(vd, name, source=None, description='', path_pattern=None):
         else:
             obj = source
 
+    # Capture sheet_name for multi-sheet sources (e.g., xlsx_sheet)
+    if isinstance(source, BaseSheet):
+        captured_sheet_name = getattr(source, 'name', '') or ''
+        # Try xlsx_sheet option first
+        if obj:
+            sheet_opt = obj.options.getonly('xlsx_sheet', obj, None)
+            if sheet_opt:
+                captured_sheet_name = str(sheet_opt)
+
     if obj:
         for optname in REPLAYABLE_LOAD_OPTS:
             if vd.options._get(optname):
                 val = obj.options.getonly(optname, obj, None)
                 if val is not None and val != vd.options.getdefault(optname):
                     opts[optname] = val
+
+        # Capture explicit filetype
+        ft = obj.options.getonly('filetype', obj, None)
+        if ft and ft != vd.options.getdefault('filetype'):
+            captured_filetype = str(ft)
 
     if source is None:
         for optname in REPLAYABLE_LOAD_OPTS:
@@ -242,22 +268,39 @@ def saveProfile(vd, name, source=None, description='', path_pattern=None):
     if not opts:
         vd.warning('no non-default loading options detected to save')
 
-    if not path_pattern and isinstance(source, Path):
-        path_pattern = source.given
-    elif not path_pattern and isinstance(source, BaseSheet) and isinstance(source.source, Path):
-        path_pattern = source.source.given
+    # Auto-generate path_pattern: prefer extension glob over exact filename
+    if not path_pattern:
+        if isinstance(source, Path):
+            ext = source.suffix
+            if ext:
+                path_pattern = '*' + ext
+            else:
+                path_pattern = source.given
+        elif isinstance(source, BaseSheet) and isinstance(source.source, Path):
+            ext = source.source.suffix
+            if ext:
+                path_pattern = '*' + ext
+            else:
+                path_pattern = source.source.given
 
     profile = AttrDict(
         name=name,
         description=description,
         path_pattern=path_pattern or '',
+        filetype=captured_filetype,
+        sheet_name=captured_sheet_name,
         options=opts,
         created_at=profiles.get(name, {}).get('created_at', _now_iso()),
         updated_at=_now_iso(),
     )
     profiles[name] = profile
     vd.saveProfiles(profiles)
-    vd.status(f'saved profile `{name}` with {len(opts)} option(s)')
+    parts = [f'{len(opts)} option(s)']
+    if captured_filetype:
+        parts.append(f'filetype={captured_filetype}')
+    if captured_sheet_name:
+        parts.append(f'sheet={captured_sheet_name}')
+    vd.status(f'saved profile `{name}` with {", ".join(parts)}')
     return profile
 
 
@@ -390,6 +433,8 @@ class ProfilesSheet(Sheet):
         ColumnAttr('name'),
         ColumnAttr('description'),
         ColumnAttr('path_pattern', width=30),
+        ColumnAttr('filetype'),
+        ColumnAttr('sheet_name'),
         Column('options_count', type=int, getter=lambda c,r: len(r.get('options', {}))),
         ColumnAttr('updated_at', width=19),
     ]
@@ -461,7 +506,18 @@ def delete_profile_cmd(sheet, name):
 
 
 BaseSheet.addCommand('', 'save-profile',
-    'sheet.save_profile_cmd(input("save profile as: "), input("description (optional): ", value=""), input("path pattern (glob, optional): ", value=""))',
+    '''
+name = input("save profile as: ")
+desc = input("description (optional): ", value="")
+p = sheet._source_path_or_sheet()
+default_pattern = ''
+if isinstance(p, Path):
+    default_pattern = '*' + p.suffix if p.suffix else p.given
+elif isinstance(p, BaseSheet) and isinstance(p.source, Path):
+    default_pattern = '*' + p.source.suffix if p.source.suffix else p.source.given
+pat = input(f"path pattern (glob, optional): ", value=default_pattern)
+sheet.save_profile_cmd(name, desc, pat)
+''',
     'save current loading options as a named profile')
 
 BaseSheet.addCommand('', 'apply-profile',

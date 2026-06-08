@@ -21,7 +21,7 @@ vd.option('rowkey_prefix', 'キ', 'string prefix for rowkey in the cmdlog', shee
 
 vd._nextCommands = []  # list[str|CommandLogRow] for vd.queueCommand
 
-CommandLogRow = namedlist('CommandLogRow', 'sheet col row longname input keystrokes comment undofuncs'.split())
+CommandLogRow = namedlist('CommandLogRow', 'sheet col row longname input keystrokes comment undofuncs profile'.split())
 
 @VisiData.api
 def queueCommand(vd, longname, input=None, sheet=None, col=None, row=None):
@@ -160,6 +160,7 @@ class CommandLogBase:
         ColumnAttr('input'),
         ColumnAttr('keystrokes'),
         ColumnAttr('comment'),
+        ColumnAttr('profile'),
         ColumnAttr('undo', 'undofuncs', type=vlen, width=0)
     ]
 
@@ -192,7 +193,8 @@ class CommandLogBase:
                                             longname=cmd.longname,
                                             comment=comment,
                                             replayable=cmd.replayable,
-                                            undofuncs=[])
+                                            undofuncs=[],
+                                            profile='')
 
     def afterExecSheet(self, sheet, escaped, err):
         'Records vd.activeCommand'
@@ -214,10 +216,10 @@ class CommandLogBase:
     def openHook(self, vs, src):
         while isinstance(src, BaseSheet):
             src = src.source
-        r = self.newRow(keystrokes='o', input=str(src), longname='open-file', replayable=True)
+        r = self.newRow(keystrokes='o', input=str(src), longname='open-file', replayable=True, profile='')
         profile_name = getattr(vs, '_applied_profile', None)
         if profile_name:
-            r.col = profile_name
+            r.profile = profile_name
         vs.cmdlog_sheet.addRow(r)
         self.addRow(r)
 
