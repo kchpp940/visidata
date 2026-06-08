@@ -608,15 +608,22 @@ def to_export_value(val, fmt=None, as_geometry=False):
 
     if as_geometry or is_geometry_value(val):
         if fmt in ('arrow', 'parquet'):
+            if isinstance(val, (bytes, bytearray, memoryview)):
+                try:
+                    return bytes(val)
+                except Exception:
+                    return None
+            if isinstance(val, str):
+                if all(c in '0123456789abcdefABCDEF' for c in val) and len(val) % 2 == 0 and len(val) > 4:
+                    try:
+                        return bytes.fromhex(val)
+                    except Exception:
+                        pass
             try:
                 import shapely
                 if hasattr(val, 'geom_type') or hasattr(val, '__geo_interface__'):
                     return shapely.to_wkb(val)
-                if isinstance(val, (bytes, bytearray, memoryview)):
-                    return bytes(val)
                 if isinstance(val, str):
-                    if all(c in '0123456789abcdefABCDEF' for c in val) and len(val) % 2 == 0 and len(val) > 4:
-                        return bytes.fromhex(val)
                     geom = shapely.from_wkt(val)
                     return shapely.to_wkb(geom)
                 if isinstance(val, dict) and 'type' in val and ('coordinates' in val or 'geometries' in val):
@@ -632,6 +639,20 @@ def to_export_value(val, fmt=None, as_geometry=False):
                 return _json.dumps(geojson, ensure_ascii=False, default=str)
             except Exception:
                 return str(geojson)
+        if fmt in ('arrow', 'parquet'):
+            if isinstance(val, (bytes, bytearray, memoryview)):
+                try:
+                    return bytes(val)
+                except Exception:
+                    return None
+            if isinstance(val, str):
+                return val
+            if isinstance(val, dict):
+                try:
+                    return _json.dumps(val, ensure_ascii=False, default=str)
+                except Exception:
+                    return str(val)
+            return str(val) if val is not None else None
         if isinstance(val, (bytes, bytearray, memoryview)):
             try:
                 return bytes(val).hex()
@@ -774,6 +795,21 @@ def _normalize_for_json(val):
     return val
 
 
+def geometry_values_all_bytes(vals):
+    '''Return True if all non-None geometry values in the list are bytes (WKB).
+
+    Used by save_parquet / save_arrow to decide whether to use pa.binary() or pa.string()
+    for geometry columns. If any non-None value is a str (GeoJSON/WKT fallback when
+    shapely is missing), returns False and the caller should use string type.
+    '''
+    for v in vals:
+        if v is None:
+            continue
+        if not isinstance(v, (bytes, bytearray, memoryview)):
+            return False
+    return True
+
+
 vd.addGlobals(
     to_python_value=to_python_value,
     to_export_value=to_export_value,
@@ -781,4 +817,5 @@ vd.addGlobals(
     format_geometry_value=format_geometry_value,
     detect_geometry_columns=detect_geometry_columns,
     is_geometry_value=is_geometry_value,
+    geometry_values_all_bytes=geometry_values_all_bytes,
 )

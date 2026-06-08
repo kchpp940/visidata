@@ -1,7 +1,9 @@
 from collections import defaultdict
 
 from visidata import Sheet, VisiData, TypedWrapper, anytype, date, vlen, Column, vd
-from visidata.normalizers import to_python_value, to_export_value
+from visidata.normalizers import (
+    to_python_value, to_export_value, geometry_values_all_bytes, is_geometry_value,
+)
 
 
 @VisiData.api
@@ -105,6 +107,24 @@ def save_arrow(vd, p, sheet, streaming=False):
         if t not in typemap:
             typemap[t] = pa.float64()
 
+    geom_cols = set()
+    for c in sheet.visibleCols:
+        if getattr(c, 'is_geometry', False):
+            geom_cols.add(c)
+            continue
+        sample = []
+        for i, row in enumerate(sheet.rows):
+            if i >= 10:
+                break
+            try:
+                val = c.getValue(row)
+                if val is not None:
+                    sample.append(val)
+            except Exception:
+                pass
+        if sample and any(is_geometry_value(v) for v in sample):
+            geom_cols.add(c)
+
     databycol = defaultdict(list)   # col -> [values]
 
     for typedvals in sheet.iterdispvals(format=False):
@@ -112,25 +132,38 @@ def save_arrow(vd, p, sheet, streaming=False):
             if isinstance(val, TypedWrapper):
                 val = None
 
-            databycol[col].append(to_export_value(val, fmt='arrow'))
+            as_geom = col in geom_cols
+            databycol[col].append(to_export_value(val, fmt='arrow', as_geometry=as_geom))
+
+    col_pa_types = {}
+    for col in sheet.visibleCols:
+        vals = databycol.get(col, [])
+        if col in geom_cols:
+            if geometry_values_all_bytes(vals):
+                col_pa_types[col] = pa.binary()
+            else:
+                col_pa_types[col] = pa.string()
+        else:
+            col_pa_types[col] = typemap.get(col.type, pa.string())
 
     data = []
-    for col, vals in databycol.items():
-        pa_type = typemap.get(col.type, pa.string())
+    for col in sheet.visibleCols:
+        vals = databycol.get(col, [])
+        pa_type = col_pa_types[col]
+        as_geom = col in geom_cols
         try:
             data.append(pa.array(vals, type=pa_type))
         except Exception:
+            fallback_type = pa.string()
             try:
-                data.append(pa.array([to_export_value(v, fmt='arrow') for v in vals], type=pa.string()))
+                data.append(pa.array([to_export_value(v, fmt='arrow', as_geometry=as_geom) for v in vals], type=fallback_type))
             except Exception:
-                data.append(pa.array([str(v) if v is not None else None for v in vals], type=pa.string()))
+                data.append(pa.array([str(v) if v is not None else None for v in vals], type=fallback_type))
+            col_pa_types[col] = fallback_type
 
     schema_fields = []
     for c in sheet.visibleCols:
-        try:
-            schema_fields.append((c.name, typemap.get(c.type, pa.string())))
-        except Exception:
-            schema_fields.append((c.name, pa.string()))
+        schema_fields.append((c.name, col_pa_types.get(c, pa.string())))
 
     schema = pa.schema(schema_fields)
     with p.open_bytes(mode='w') as outf:

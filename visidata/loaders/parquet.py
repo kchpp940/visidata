@@ -5,6 +5,7 @@ from visidata.loaders.arrow import arrow_to_vdtype
 from visidata.normalizers import (
     to_python_value, to_export_value, to_geometry_value,
     format_geometry_value, detect_geometry_columns, is_geometry_value,
+    geometry_values_all_bytes,
 )
 
 
@@ -33,6 +34,8 @@ class ParquetColumn(Column):
 
 class GeometryColumn(ParquetColumn):
     'Parquet column containing geometry values (WKB/WKT/GeoArrow, GeoParquet).'
+    is_geometry = True
+
     @property
     def readonly(self) -> bool:
         return True
@@ -150,7 +153,26 @@ def save_parquet(vd, p, sheet):
 
     databycol = defaultdict(list)  # col -> [values]
 
-    geom_cols = {c for c in sheet.visibleCols if isinstance(c, GeometryColumn)}
+    geom_cols = set()
+    for c in sheet.visibleCols:
+        if getattr(c, 'is_geometry', False):
+            geom_cols.add(c)
+            continue
+        if isinstance(c, GeometryColumn):
+            geom_cols.add(c)
+            continue
+        sample = []
+        for i, row in enumerate(sheet.rows):
+            if i >= 10:
+                break
+            try:
+                val = c.getValue(row)
+                if val is not None:
+                    sample.append(val)
+            except Exception:
+                pass
+        if sample and any(is_geometry_value(v) for v in sample):
+            geom_cols.add(c)
 
     for typedvals in sheet.iterdispvals(format=False):
         for col, val in typedvals.items():
@@ -160,26 +182,62 @@ def save_parquet(vd, p, sheet):
             as_geom = col in geom_cols
             databycol[col].append(to_export_value(val, fmt='parquet', as_geometry=as_geom))
 
+    col_pa_types = {}
+    for col in sheet.visibleCols:
+        vals = databycol.get(col, [])
+        if col in geom_cols:
+            if geometry_values_all_bytes(vals):
+                col_pa_types[col] = pa.binary()
+            else:
+                col_pa_types[col] = pa.string()
+        else:
+            col_pa_types[col] = typemap.get(col.type, pa.string())
+
     data = []
-    for col, vals in databycol.items():
-        pa_type = typemap.get(col.type, pa.string())
+    for col in sheet.visibleCols:
+        vals = databycol.get(col, [])
+        pa_type = col_pa_types[col]
         as_geom = col in geom_cols
         try:
             data.append(pa.array(vals, type=pa_type))
         except Exception:
+            fallback_type = pa.string()
             try:
-                data.append(pa.array([to_export_value(v, fmt='parquet', as_geometry=as_geom) for v in vals], type=pa.string()))
+                data.append(pa.array([to_export_value(v, fmt='parquet', as_geometry=as_geom) for v in vals], type=fallback_type))
             except Exception:
-                data.append(pa.array([str(v) if v is not None else None for v in vals], type=pa.string()))
+                data.append(pa.array([str(v) if v is not None else None for v in vals], type=fallback_type))
+            col_pa_types[col] = fallback_type
 
     schema_fields = []
+    binary_geom_cols = []
     for c in sheet.visibleCols:
-        try:
-            schema_fields.append((c.name, typemap.get(c.type, pa.string())))
-        except Exception:
-            schema_fields.append((c.name, pa.string()))
+        pa_type = col_pa_types.get(c, pa.string())
+        if c in geom_cols and pa_type.id == pa.lib.Type_BINARY:
+            binary_geom_cols.append(c.name)
+        schema_fields.append((c.name, pa_type))
 
     schema = pa.schema(schema_fields)
+    if binary_geom_cols:
+        import json as _json
+        geo_meta = {
+            'version': '1.1.0',
+            'primary_column': binary_geom_cols[0],
+            'columns': {
+                colname: {
+                    'encoding': 'WKB',
+                    'geometry_types': [],
+                    'crs': None,
+                    'orientation': 'counterclockwise',
+                    'edges': 'planar',
+                    'bbox': [None, None, None, None],
+                    'epoch': None,
+                }
+                for colname in binary_geom_cols
+            }
+        }
+        existing_meta = dict(schema.metadata or {})
+        existing_meta[b'geo'] = _json.dumps(geo_meta).encode('utf-8')
+        schema = schema.with_metadata(existing_meta)
     with p.open_bytes(mode="w") as outf:
         with pq.ParquetWriter(outf, schema) as writer:
             writer.write_batch(
