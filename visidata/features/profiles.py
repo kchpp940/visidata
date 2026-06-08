@@ -35,9 +35,11 @@ Each profile has:
                        are listed in ``REPLAYABLE_LOAD_OPTS``.
   * ``created_at`` / ``updated_at`` – ISO-8601 timestamps (auto-managed).
 
-Ways to Use Profiles:
----------------------
-1. **Command line** – apply a profile when opening files::
+Ways to Use Profiles (all per-source, no global residue):
+----------------------------------------------------------
+1. **Command line** – apply a profile when opening files.  The profile is
+   attached to each input source independently; opening a second file
+   without ``--load-profile`` will NOT inherit the first file's profile::
 
        vd --load-profile=semicolon-csv data.csv
        vd --load-profile=utf16-tsv report.txt --batch -o cleaned.tsv
@@ -58,36 +60,48 @@ Ways to Use Profiles:
    ``path_pattern``, VisiData prompts you to choose one of the matching
    profiles.  This is automatically disabled in batch and replay modes.
 
-4. **Macros / VDX replay** – profiles are fully replayable:
-   * Every file opened with a profile automatically records a
-     ``set-option load_profile <name>`` command in the cmdlog immediately
-     before the ``open-file`` entry.  Saving the cmdlog (``Ctrl+D``) and
-     replaying it (``vd -p script.vdj``) reproduces the exact load.
-   * Minimal VDX format supports the following additional commands::
+4. **Macros / VDX replay** – every file opened with a profile records the
+   profile name directly in the ``open-file`` cmdlog row (in the ``col``
+   field).  On replay, the profile is extracted from that row and applied
+   **only to that specific open** – it does not leak to subsequent opens.
+   Minimal VDX format:
 
-         apply-profile myprofile          # same as the apply-profile command
-         save-profile newprof             # same as save-profile
-         delete-profile oldprof           # same as delete-profile
-         option global load_profile name  # set profile globally before open
+         col semicolon
+         open-file data.csv
 
-5. **Config file** – add ``option global load_profile myprofile`` to
-   ``~/.visidatarc`` to always apply a default profile, or put the
-   profile JSON directly into ``$VD_DIR/profiles.json``.
+   The VDX loader also supports these standalone commands (recorded via
+   the respective interactive commands):
+
+         apply-profile myprofile
+         save-profile newprof
+         delete-profile oldprof
+
+5. **Config file** – ``~/.visidatarc`` supports ``option`` statements for
+   one-off configuration, but for reproducible loads prefer putting the
+   profile JSON directly into ``$VD_DIR/profiles.json`` and referencing it
+   per-source.
 
 Unified Resolution Order
 ------------------------
-Every call to ``openSource`` / ``openPath`` resolves the profile through a
-single helper ``vd.resolveProfileForPath``:
+Every call to ``openSource`` / ``openPath`` resolves the profile through
+``vd.resolveProfileForPath``.  The profile is always attached per-source –
+the cmdlog ``openHook`` never writes a sticky global option, so no residue
+leaks between recorded opens:
 
-  1. Explicit ``profile=`` keyword argument passed by the caller.
-  2. ``path.options.load_profile`` (set per-path before opening).
-  3. ``vd.options.load_profile`` (CLI ``--load-profile`` or global setting).
+  1. Explicit ``profile=`` keyword argument passed by the caller
+     (used by ``open-file`` replay, ``open-file-with-profile``, and the
+     CLI ``--load-profile`` handler in ``openSource``).
+  2. ``path.options.load_profile`` (set per-path before opening; used by
+     VDX ``option scope load_profile name`` when scoped to a specific
+     source).
+  3. ``vd.options.load_profile`` (fallback for explicitly-set global
+     options via VDX ``option global load_profile X`` or
+     ``~/.visidatarc``).  Crucially, this global is NEVER written
+     automatically by ``openHook`` – it only takes effect when the user
+     sets it deliberately.
   4. (interactive only) Auto-prompt if matching profiles exist and
      ``profiles_auto_prompt`` is enabled and neither batch nor replay is
      active.
-
-This guarantees that command-line, interactive, and macro replay all go
-through the same code path.
 """
 
 import fnmatch
@@ -259,17 +273,20 @@ def deleteProfile(vd, name):
 
 @VisiData.api
 def resolveProfileForPath(vd, p, explicit_profile=None):
-    '''Unified profile resolution for a path.
+    '''Unified per-source profile resolution.
 
     Resolution order:
-    1. explicit_profile argument (from openSource/openPath call site)
-    2. path.options.load_profile (set per-path before open)
-    3. vd.options.load_profile (CLI --load-profile or global option)
-    4. (interactive only) auto-prompt if matching profiles exist and profiles_auto_prompt=True
+    1. explicit_profile kwarg (from openSource/openPath call site – used by
+       replay, open-file-with-profile, and CLI --load-profile)
+    2. path.options.load_profile (set per-path before opening)
+    3. vd.options.load_profile (fallback for explicitly-set global options
+       via VDX ``option global load_profile X`` or ``.visidatarc`` – note
+       this is NEVER recorded automatically by openHook, so no residue
+       leaks between cmdlog-recorded opens)
+    4. (interactive only) auto-prompt if matching profiles exist and
+       profiles_auto_prompt=True, batch=False, no replay active
 
-    Returns (profile_name_or_None, was_interactive):
-      - profile_name: name of profile to apply, or None if no profile
-      - was_interactive: True if chosen via interactive prompt (for cmdlog replay tracking)
+    Returns (profile_name_or_None, was_interactive).
     '''
     profile_name = explicit_profile or ''
 
@@ -301,26 +318,10 @@ def resolveProfileForPath(vd, p, explicit_profile=None):
 
 
 @VisiData.api
-def _recordProfileToCmdlog(vd, name, target=None):
-    '''Record an apply-profile command to the current cmdlog for replay.'''
-    if not vd.cmdlog:
-        return
-    sheetname = target.name if isinstance(target, BaseSheet) else (str(target) if isinstance(target, Path) else 'global')
-    r = vd.cmdlog.newRow(
-        sheet=sheetname,
-        row='',
-        keystrokes='',
-        input=name,
-        longname='apply-profile',
-        undofuncs=[],
-    )
-    vd.cmdlog.addRow(r)
-    if isinstance(target, BaseSheet):
-        target.cmdlog_sheet.addRow(r)
-
-
-@VisiData.api
-def applyProfile(vd, name, target=None, record=True):
+def applyProfile(vd, name, target=None):
+    '''Apply the named profile's options to *target* (Path, BaseSheet, or vd.activeSheet).
+    Sets ``target._applied_profile`` so the profile name is recorded by the cmdlog
+    ``openHook`` when the sheet is pushed.'''
     profiles = vd.getProfiles()
     if name not in profiles:
         vd.fail(f'no profile named `{name}`')
@@ -342,9 +343,6 @@ def applyProfile(vd, name, target=None, record=True):
 
     if isinstance(target, (Path, BaseSheet)):
         target._applied_profile = name
-
-    if record and not vd.options.batch and vd.currentReplay is None:
-        vd._recordProfileToCmdlog(name, target)
 
     if isinstance(target, BaseSheet) and opts:
         vd.status(f'applied profile `{name}` ({len(opts)} option(s)); reload to take effect')
@@ -494,43 +492,3 @@ vd.addGlobals(
     ProfilesSheet=ProfilesSheet,
     ProfileDetailSheet=ProfileDetailSheet,
 )
-
-
-_orig_openHook = None
-_isLoggableSheet = None
-
-
-def _profile_openHook(self, vs, src):
-    global _orig_openHook, _isLoggableSheet
-    profile_name = getattr(vs, '_applied_profile', None)
-    if profile_name and not vd.options.batch and vd.currentReplay is None:
-        r = self.newRow(
-            sheet='global',
-            col='',
-            row='load_profile',
-            longname='set-option',
-            input=profile_name,
-            keystrokes='',
-            replayable=True,
-            comment=f'set loading profile to {profile_name}',
-            undofuncs=[],
-        )
-        self.addRow(r)
-        if _isLoggableSheet and _isLoggableSheet(vs):
-            vs.cmdlog_sheet.addRow(r)
-    _orig_openHook(self, vs, src)
-
-
-def _install_openHook_patch():
-    global _orig_openHook, _isLoggableSheet
-    try:
-        from visidata.cmdlog import CommandLogBase, isLoggableSheet
-        if _orig_openHook is None:
-            _orig_openHook = CommandLogBase.openHook
-            _isLoggableSheet = isLoggableSheet
-            CommandLogBase.openHook = _profile_openHook
-    except (ImportError, AttributeError):
-        pass
-
-
-_install_openHook_patch()

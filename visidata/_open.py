@@ -6,7 +6,7 @@ from visidata import VisiData, vd, Path, BaseSheet, TableSheet, TextSheet, Setta
 
 
 vd.option('filetype', '', 'specify file type', replay=True)
-vd.option('load_profile', '', 'apply named loading profile when opening files', replay=True)
+vd.option('load_profile', '', 'apply named loading profile when opening files (per-source, use --load-profile on CLI)', replay=False)
 
 
 @VisiData.api
@@ -107,7 +107,7 @@ def openPath(vd, p, filetype=None, create=False, profile=None):
     profile_name, was_interactive = vd.resolveProfileForPath(p, explicit_profile=profile)
     applied_profile = None
     if profile_name:
-        applied_profile = vd.applyProfile(profile_name, p, record=False)
+        applied_profile = vd.applyProfile(profile_name, p)
         p._applied_profile = profile_name
 
     filetype = filetype or p.options.filetype  # resolve from path instance, Path class, global  #1710
@@ -182,6 +182,10 @@ def openSource(vd, p, filetype=None, create=False, profile=None, **kwargs):
     if isinstance(p, BaseSheet):
         return p
 
+    load_profile = kwargs.pop('load_profile', None)
+    if load_profile and not profile:
+        profile = load_profile
+
     vs = None
     if isinstance(p, str):
         if '://' in p:
@@ -219,7 +223,20 @@ def open_txt(vd, p):
     return TextSheet(p.base_stem, source=p)
 
 
-BaseSheet.addCommand('o', 'open-file', 'vd.push(openSource(inputFilename("open: "), create=True))', 'Open file or URL')
+@VisiData.api
+def _get_replay_profile(vd):
+    '''Return the profile name stored in the current replay row's col field, or None.'''
+    r = getattr(vd, 'currentReplayRow', None)
+    if r and getattr(r, 'longname', None) in ('open-file', 'open-file-with-profile'):
+        return getattr(r, 'col', None) or None
+    return None
+
+
+BaseSheet.addCommand('o', 'open-file', '''
+p = inputFilename("open: ")
+prof = vd._get_replay_profile()
+vd.push(openSource(p, create=True, profile=prof))
+''', 'Open file or URL')
 TableSheet.addCommand('zo', 'open-cell-file', 'cd=cursorDisplay; (vd.push(openSource(cd) if cd else fail("no path given")) or fail(f"file {cd} does not exist"))', 'Open file or URL from path in current cell')
 BaseSheet.addCommand('gU', 'undo-last-quit', 'push(allSheets[-1])', 'reopen most recently closed sheet')
 

@@ -215,6 +215,9 @@ class CommandLogBase:
         while isinstance(src, BaseSheet):
             src = src.source
         r = self.newRow(keystrokes='o', input=str(src), longname='open-file', replayable=True)
+        profile_name = getattr(vs, '_applied_profile', None)
+        if profile_name:
+            r.col = profile_name
         vs.cmdlog_sheet.addRow(r)
         self.addRow(r)
 
@@ -300,7 +303,8 @@ def replayOne(vd, r):
                 vs = vd.cmdlog
 
             try:
-                vd.moveToReplayContext(r, vs)
+                if not (longname and longname.startswith('open-') and longname not in ('open-row', 'open-cell')):
+                    vd.moveToReplayContext(r, vs)
                 if r.comment:
                     vd.status(r.comment)
 
