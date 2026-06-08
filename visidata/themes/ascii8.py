@@ -84,5 +84,6 @@ vd.themes['ascii8'] = dict(
     plot_colors = 'white',
     disp_histogram='*',
     disp_graph_reflines_x_charset='||||',
-    disp_graph_reflines_y_charset='----'
+    disp_graph_reflines_y_charset='----',
+    disp_graph_reflines_cross_char='+'
 )

@@ -11,6 +11,7 @@ vd.theme_option('color_graph_refline', '', 'color for graph reference value line
 vd.theme_option('disp_graph_reflines_x_charset', '▏││▕', 'charset to render vertical reference lines on graph')
 vd.theme_option('disp_graph_reflines_y_charset', '▔──▁', 'charset to render horizontal reference lines on graph')
 vd.theme_option('disp_graph_multiple_reflines_char', '▒', 'char to render multiple parallel reflines')
+vd.theme_option('disp_graph_reflines_cross_char', '┼', 'char to render where vertical and horizontal reference lines cross')
 
 
 @VisiData.api
@@ -80,8 +81,7 @@ class GraphSheet(InvertedCanvas):
 
         self.reflines_x = []
         self.reflines_y = []
-        self.reflines_char_x = {}    # { x value in character coordinates -> character to use to draw that vertical line }
-        self.reflines_char_y = {}    # { y value in character coordinates -> character to use to draw that horizontal line }
+        self._clear_refline_cache()
 
         if not vd.numericCols(self.xcols):
             if self.xcols:
@@ -91,9 +91,23 @@ class GraphSheet(InvertedCanvas):
 
         self.ycols or vd.fail('%s is non-numeric' % '/'.join(yc.name for yc in kwargs.get('ycols')))
 
+    def _clear_refline_cache(self):
+        'Clear the computed character-coordinate cache for reference lines. Must be called whenever visibleBox, plotviewBox, canvasBox, reflines_x/y, or window dimensions change.'
+        self.reflines_char_x = {}
+        self.reflines_char_y = {}
+
+    def reset(self):
+        super().reset()
+        self._clear_refline_cache()
+
+    def render(self, h, w):
+        self._clear_refline_cache()
+        super().render(h, w)
+
     def resetCanvasDimensions(self, windowHeight, windowWidth):
         if self.left_margin < self.ylabel_maxw:
             self.left_margin = self.ylabel_maxw
+        self._clear_refline_cache()
         super().resetCanvasDimensions(windowHeight, windowWidth)
 
     @asyncthread
@@ -148,6 +162,7 @@ class GraphSheet(InvertedCanvas):
         cursorBBox = self.plotterCursorBox
         cursorX1, cursorY1 = cursorBBox.xmin, cursorBBox.ymin
         cursorX2, cursorY2 = cursorBBox.xmax, cursorBBox.ymax
+        cross_char = self.options.disp_graph_reflines_cross_char
         # draws only on character cells that have reflines, leaves other cells unaffected
         for char_y in range(0, self.plotheight//4):
             has_y_line = char_y in self.reflines_char_y
@@ -157,9 +172,15 @@ class GraphSheet(InvertedCanvas):
                 has_x_line = char_x in self.reflines_char_x
                 if has_x_line or has_y_line:
                     cattr = colors.color_graph_refline
-                    if has_x_line:
+                    # Composition priority (fixed, not dependent on draw order):
+                    #   1. Both x and y lines present -> cross_char
+                    #   2. Only x (vertical) line     -> vertical line char
+                    #   3. Only y (horizontal) line   -> horizontal line char
+                    if has_x_line and has_y_line:
+                        ch = cross_char
+                    elif has_x_line:
                         ch = self.reflines_char_x[char_x]
-                    elif has_y_line:
+                    else:
                         ch = self.reflines_char_y[char_y]
                     pixX1 = char_x*2
                     pixX2 = char_x*2 + 2
@@ -169,6 +190,7 @@ class GraphSheet(InvertedCanvas):
                     scr.addstr(char_y, char_x, ch, cattr.attr)
 
     def resetBounds(self, refresh=True):
+        self._clear_refline_cache()
         super().resetBounds(refresh=False)
         self.createLabels()
         if refresh:
@@ -185,8 +207,7 @@ class GraphSheet(InvertedCanvas):
         super().plot_elements(invert_y=True)
 
     def plot_reflines(self):
-        self.reflines_char_x = {}
-        self.reflines_char_y = {}
+        self._clear_refline_cache()
 
         bb = self.visibleBox
         xmin, ymin, xmax, ymax = bb.xmin, bb.ymin, bb.xmax, bb.ymax
@@ -334,6 +355,7 @@ class GraphSheet(InvertedCanvas):
             refval = xtype(xstr.strip())
             if refval not in self.reflines_x:
                 self.reflines_x.append(refval)
+        self._clear_refline_cache()
         self.refresh()
 
     def draw_refline_y(self):
@@ -343,6 +365,7 @@ class GraphSheet(InvertedCanvas):
         ystrs = vd.input("add line(s) at y = ", type="refliney", value=suggested, defaultLast=True).split()
 
         self.reflines_y += [ ytype(y) for y in ystrs if ytype(y) not in self.reflines_y ]
+        self._clear_refline_cache()
         self.refresh()
 
     def erase_refline_x(self):
@@ -357,6 +380,7 @@ class GraphSheet(InvertedCanvas):
                 self.reflines_x.remove(xtype(x))
             except ValueError:
                 vd.warning(f'value {x} not in reflines_x')
+        self._clear_refline_cache()
         self.refresh()
 
     def erase_refline_y(self):
@@ -370,6 +394,17 @@ class GraphSheet(InvertedCanvas):
                 self.reflines_y.remove(ytype(y))
             except ValueError:
                 vd.warning(f'value {y} not in reflines_y')
+        self._clear_refline_cache()
+        self.refresh()
+
+    def erase_reflines_x(self):
+        self.reflines_x = []
+        self._clear_refline_cache()
+        self.refresh()
+
+    def erase_reflines_y(self):
+        self.reflines_y = []
+        self._clear_refline_cache()
         self.refresh()
 
 def format_input_value(val, type):
@@ -418,8 +453,8 @@ GraphSheet.addCommand('gx', 'draw-refline-x', 'sheet.draw_refline_x()', 'draw a 
 GraphSheet.addCommand('gy', 'draw-refline-y', 'sheet.draw_refline_y()', 'draw a horizontal line at y-values (space-separated)')
 GraphSheet.addCommand('zx', 'erase-refline-x', 'sheet.erase_refline_x()', 'remove a horizontal line at x-values (space-separated)')
 GraphSheet.addCommand('zy', 'erase-refline-y', 'sheet.erase_refline_y()', 'remove a vertical line at y-values (space-separated)')
-GraphSheet.addCommand('gzx', 'erase-reflines-x', 'sheet.reflines_x = []; sheet.refresh()', 'erase all vertical x-value lines')
-GraphSheet.addCommand('gzy', 'erase-reflines-y', 'sheet.reflines_y = []; sheet.refresh()', 'erase any horizontal y-value lines')
+GraphSheet.addCommand('gzx', 'erase-reflines-x', 'sheet.erase_reflines_x()', 'erase all vertical x-value lines')
+GraphSheet.addCommand('gzy', 'erase-reflines-y', 'sheet.erase_reflines_y()', 'erase any horizontal y-value lines')
 
 @GraphSheet.after
 def reload(sheet):
