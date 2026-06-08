@@ -4,7 +4,7 @@ import re
 import visidata
 from visidata import VisiData, CommandLogBase, BaseSheet, Sheet, AttrDict, Progress
 
-VDX_VD_COLUMNS = ['sheet', 'col', 'row', 'longname', 'input', 'keystrokes', 'comment', 'profile']
+VDX_VD_COLUMNS = ['sheet', 'col', 'row', 'longname', 'input', 'keystrokes', 'comment']
 
 
 @VisiData.api
@@ -12,7 +12,7 @@ def open_vdx(vd, p):
     return CommandLogSimple(p.base_stem, source=p, precious=True)
 
 
-VDX_CONTEXT_COMMANDS = {'sheet', 'col', 'row', 'profile'}
+VDX_CONTEXT_COMMANDS = {'sheet', 'col', 'row'}
 
 class CommandLogSimple(CommandLogBase, Sheet):
     filetype = 'vdx'
@@ -50,15 +50,6 @@ class CommandLogSimple(CommandLogBase, Sheet):
                     value = parts[2] if len(parts) > 2 else ''
                     yield AttrDict(longname='set-option',
                                    sheet=scope, col='', row=name, input=value)
-                elif longname == 'apply-profile':
-                    yield AttrDict(longname='apply-profile',
-                                   input=rest[0] if rest else '')
-                elif longname == 'save-profile':
-                    yield AttrDict(longname='save-profile',
-                                   input=rest[0] if rest else '')
-                elif longname == 'delete-profile':
-                    yield AttrDict(longname='delete-profile',
-                                   input=rest[0] if rest else '')
                 else:
                     yield AttrDict(longname=longname,
                                    input=rest[0] if rest else '',
@@ -80,8 +71,6 @@ def save_vdx(vd, p, *vsheets):
                     fp.write(f'col {r.col}\n')
                 if r.row and (prevrow is None or prevrow.row != r.row):
                     fp.write(f'row {r.row}\n')
-                if r.profile and (prevrow is None or prevrow.profile != r.profile):
-                    fp.write(f'profile {r.profile}\n')
 
                 line = r.longname
                 if r.input:

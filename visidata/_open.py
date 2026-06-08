@@ -6,7 +6,6 @@ from visidata import VisiData, vd, Path, BaseSheet, TableSheet, TextSheet, Setta
 
 
 vd.option('filetype', '', 'specify file type', replay=True)
-vd.option('load_profile', '', 'apply named loading profile when opening files (per-source, use --load-profile on CLI)', replay=False)
 
 
 @VisiData.api
@@ -93,23 +92,10 @@ def guess_extension(vd, path):
         return dict(filetype=ext, _likelihood=3)
 
 
-def _attach_profile(vs, profile_name):
-    if vs and profile_name:
-        vs._applied_profile = profile_name
-    return vs
-
-
 @VisiData.api
-def openPath(vd, p, filetype=None, create=False, profile=None):
+def openPath(vd, p, filetype=None, create=False):
     '''Call ``open_<filetype>(p)`` or ``openurl_<p.scheme>(p, filetype)``.  Return constructed but unloaded sheet of appropriate type.
     If True, *create* will return a new, blank **Sheet** if file does not exist.'''
-
-    profile_name, was_interactive = vd.resolveProfileForPath(p, explicit_profile=profile)
-    applied_profile = None
-    if profile_name:
-        applied_profile = vd.applyProfile(profile_name, p)
-        p._applied_profile = profile_name
-
     filetype = filetype or p.options.filetype  # resolve from path instance, Path class, global  #1710
 
     if p.scheme and not p.has_fp():
@@ -120,7 +106,7 @@ def openPath(vd, p, filetype=None, create=False, profile=None):
         if not openfunc:
             vd.fail(f'no loader for url scheme: {p.scheme}')
 
-        return _attach_profile(openfunc(p, filetype=filetype), profile_name)
+        return openfunc(p, filetype=filetype)
 
     if not p.exists() and not create:
         return None
@@ -138,10 +124,10 @@ def openPath(vd, p, filetype=None, create=False, profile=None):
         newfunc = getattr(vd, 'new_' + filetype, vd.getGlobals().get('new_' + filetype))
         if not newfunc:
             vd.warning('%s does not exist, creating new sheet' % p)
-            return _attach_profile(vd.newSheet(p.base_stem, 1, source=p), profile_name)
+            return vd.newSheet(p.base_stem, 1, source=p)
 
         vd.status('creating blank %s' % (p.given))
-        return _attach_profile(newfunc(p), profile_name)
+        return newfunc(p)
 
     if p.is_fifo():
         # read the file as text, into a RepeatFile that can be opened multiple times
@@ -163,7 +149,7 @@ def openPath(vd, p, filetype=None, create=False, profile=None):
                 if k != 'filetype' and not k.startswith('_'):
                     setattr(vs.options, k, v)
             vd.status(f'guessed `{opts["filetype"]}` filetype based on contents')
-            return _attach_profile(vs, profile_name)
+            return vs
 
         vd.warning(f'unknown `{filetype}` filetype')
 
@@ -172,32 +158,28 @@ def openPath(vd, p, filetype=None, create=False, profile=None):
 
     vd.status('opening %s as %s' % (p.given, filetype))
 
-    return _attach_profile(openfunc(p), profile_name)
+    return openfunc(p)
 
 @VisiData.api
-def openSource(vd, p, filetype=None, create=False, profile=None, **kwargs):
+def openSource(vd, p, filetype=None, create=False, **kwargs):
     '''Return unloaded sheet object for *p* opened as the given *filetype* and with *kwargs* as option overrides. *p* can be a Path or a string (filename, url, or "-" for stdin).
     when true, *create* will return a blank sheet, if file does not exist.'''
 
     if isinstance(p, BaseSheet):
         return p
 
-    load_profile = kwargs.pop('load_profile', None)
-    if load_profile and not profile:
-        profile = load_profile
-
     vs = None
     if isinstance(p, str):
         if '://' in p:
-            vs = vd.openPath(Path(p), filetype=filetype, profile=profile)  # convert to Path and recurse
+            vs = vd.openPath(Path(p), filetype=filetype)  # convert to Path and recurse
         elif p == '-':
             if vd.stdinSource.fptext.isatty():
                 vd.fail('cannot open stdin when it is a tty')
-            vs = vd.openPath(vd.stdinSource, filetype=filetype, profile=profile)
+            vs = vd.openPath(vd.stdinSource, filetype=filetype)
         else:
-            vs = vd.openPath(Path(p), filetype=filetype, create=create, profile=profile)  # convert to Path and recurse
+            vs = vd.openPath(Path(p), filetype=filetype, create=create)  # convert to Path and recurse
     else:
-        vs = vd.openPath(p, filetype=filetype, create=create, profile=profile)
+        vs = vd.openPath(p, filetype=filetype, create=create)
 
     for optname, optval in kwargs.items():
         vs.options[optname] = optval
@@ -223,30 +205,7 @@ def open_txt(vd, p):
     return TextSheet(p.base_stem, source=p)
 
 
-@VisiData.api
-def _get_replay_profile(vd):
-    '''Return the profile name from the current replay row, or None.
-
-    Reads from the dedicated ``profile`` field first (new format).
-    Falls back to the ``col`` field for backward compatibility with
-    older cmdlogs/VDX files that stored the profile name in the col field.
-    '''
-    r = getattr(vd, 'currentReplayRow', None)
-    if r and getattr(r, 'longname', None) in ('open-file', 'open-file-with-profile'):
-        prof = getattr(r, 'profile', None)
-        if prof:
-            return prof
-        colprof = getattr(r, 'col', None)
-        if colprof:
-            return colprof
-    return None
-
-
-BaseSheet.addCommand('o', 'open-file', '''
-p = inputFilename("open: ")
-prof = vd._get_replay_profile()
-vd.push(openSource(p, create=True, profile=prof))
-''', 'Open file or URL')
+BaseSheet.addCommand('o', 'open-file', 'vd.push(openSource(inputFilename("open: "), create=True))', 'Open file or URL')
 TableSheet.addCommand('zo', 'open-cell-file', 'cd=cursorDisplay; (vd.push(openSource(cd) if cd else fail("no path given")) or fail(f"file {cd} does not exist"))', 'Open file or URL from path in current cell')
 BaseSheet.addCommand('gU', 'undo-last-quit', 'push(allSheets[-1])', 'reopen most recently closed sheet')
 
