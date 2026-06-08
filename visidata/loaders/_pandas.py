@@ -2,6 +2,43 @@ from functools import partial
 
 from visidata import VisiData, vd, Sheet, date, anytype, Path, options, Column, asyncthread, Progress, undoAttrCopyFunc, run
 
+
+def _pandas_to_python(val):
+    'Convert pandas/NumPy values to native Python types.'
+    if val is None:
+        return None
+
+    try:
+        np = vd.importExternal('numpy')
+        if isinstance(val, np.ndarray):
+            return val.tolist()
+        if isinstance(val, np.generic):
+            try:
+                return val.item()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if isinstance(val, (list, tuple)):
+        return [_pandas_to_python(v) for v in val]
+
+    if isinstance(val, dict):
+        return {k: _pandas_to_python(v) for k, v in val.items()}
+
+    try:
+        import pandas as pd
+        if isinstance(val, pd.Timestamp):
+            return val.to_pydatetime()
+        if isinstance(val, pd.Timedelta):
+            return int(val.total_seconds())
+        if pd.isna(val):
+            return None
+    except Exception:
+        pass
+
+    return val
+
 @VisiData.api
 def open_pandas(vd, p):
     return PandasSheet(p.base_stem, source=p)
@@ -90,9 +127,8 @@ class PandasSheet(Sheet):
         by the VisiData loader.
     '''
 
-    def dtype_to_type(self, dtype):
+    def dtype_to_type(self, dtype, sample_values=None):
         np = vd.importExternal('numpy')
-        # Find the underlying numpy dtype for any pandas extension dtypes
         dtype = getattr(dtype, 'numpy_dtype', dtype)
         try:
             if np.issubdtype(dtype, np.integer):
@@ -101,9 +137,31 @@ class PandasSheet(Sheet):
                 return float
             if np.issubdtype(dtype, np.datetime64):
                 return date
+            if np.issubdtype(dtype, np.bool_):
+                return bool
         except TypeError:
-            # For categoricals and other pandas-defined dtypes
             pass
+
+        if sample_values is not None:
+            for v in sample_values:
+                if v is None:
+                    continue
+                try:
+                    if np.isnan(v):
+                        continue
+                except Exception:
+                    pass
+                try:
+                    if isinstance(v, np.ndarray):
+                        return list
+                except Exception:
+                    pass
+                if isinstance(v, (list, tuple)):
+                    return list
+                if isinstance(v, dict):
+                    return dict
+                break
+
         return anytype
 
     def read_tsv(self, path, **kwargs):
@@ -125,7 +183,8 @@ class PandasSheet(Sheet):
 
     def getValue(self, col, row):
         '''Look up column values in the underlying DataFrame.'''
-        return col.sheet.df.loc[row.name, col.expr]
+        val = col.sheet.df.loc[row.name, col.expr]
+        return _pandas_to_python(val)
 
     def setValue(self, col, row, val):
         '''
@@ -184,9 +243,10 @@ class PandasSheet(Sheet):
 
         self.columns = []
         for col in (c for c in df.columns if not c.startswith("__vd_")):
+            sample_vals = df[col].head(min(10, len(df))).tolist() if len(df) > 0 else []
             self.addColumn(Column(
                 col,
-                type=self.dtype_to_type(df[col].dtype),
+                type=self.dtype_to_type(df[col].dtype, sample_values=sample_vals),
                 getter=self.getValue,
                 setter=self.setValue,
                 expr=col

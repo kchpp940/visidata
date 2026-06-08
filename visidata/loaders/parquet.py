@@ -3,10 +3,24 @@ import json
 from visidata import Sheet, VisiData, TypedWrapper, anytype, date, vlen, Column, vd, asyncthread, Progress, InvertedCanvas
 from collections import defaultdict
 
+from visidata.loaders.arrow import pyarrow_to_python, arrow_to_vdtype
+
 
 @VisiData.api
 def open_parquet(vd, p):
     return ParquetSheet(p.base_stem, source=p)
+
+
+def _python_to_pyarrow_val(val):
+    'Convert complex Python values to types pyarrow can serialize.'
+    if val is None:
+        return None
+    if isinstance(val, (dict, list, tuple)):
+        try:
+            return json.dumps(val, ensure_ascii=False, default=str)
+        except Exception:
+            return str(val)
+    return val
 
 
 class ParquetColumn(Column):
@@ -21,10 +35,7 @@ class ParquetColumn(Column):
         if rownum is None:
             return None
         val = self.source[rownum]
-        if val.type == 'large_string':
-            return memoryview(val.as_buffer())[:2**20].tobytes().decode('utf-8')
-        else:
-            return val.as_py()
+        return pyarrow_to_python(val)
 
     def putValue(self, row, val):
         row[self.name] = val
@@ -40,14 +51,48 @@ class GeometryColumn(ParquetColumn):
         val = super().calcValue(row)
         if val is None:
             return None
-        return vd.importExternal('shapely').from_wkb(val)
+        try:
+            shapely = vd.importExternal('shapely')
+        except Exception:
+            if isinstance(val, bytes):
+                try:
+                    return val.hex()
+                except Exception:
+                    return val
+            return val
+        try:
+            if isinstance(val, (bytes, bytearray, memoryview)):
+                if len(bytes(val)) == 0:
+                    return None
+                geom = shapely.from_wkb(bytes(val))
+                if geom.is_empty:
+                    return None
+                return geom
+            return val
+        except Exception:
+            if isinstance(val, bytes):
+                try:
+                    return val.hex()
+                except Exception:
+                    return val
+            return val
 
     def formatValue(self, typedval, width=None):
         if typedval is None:
             return None
-        shapely = vd.importExternal('shapely')
-        n = shapely.get_num_coordinates(typedval)
-        return f'{typedval.geom_type}[{n}]'
+        try:
+            shapely = vd.importExternal('shapely')
+            if hasattr(typedval, 'geom_type'):
+                n = shapely.get_num_coordinates(typedval)
+                return f'{typedval.geom_type}[{n}]'
+        except Exception:
+            pass
+        if isinstance(typedval, (bytes, bytearray)):
+            try:
+                return f'WKB[{len(typedval)}]'
+            except Exception:
+                pass
+        return str(typedval)
 
 
 def _geoparquet_columns(schema):
@@ -60,11 +105,22 @@ def _geoparquet_columns(schema):
             names.update(json.loads(geo).get('columns', {}).keys())
         except Exception as e:
             vd.exceptionCaught(e)
-    # fallback: per-field ARROW extension marker
+    geoarrow_extensions = (
+        b'geoarrow.wkb',
+        b'geoarrow.wkt',
+        b'geoarrow.point',
+        b'geoarrow.linestring',
+        b'geoarrow.polygon',
+        b'geoarrow.multipoint',
+        b'geoarrow.multilinestring',
+        b'geoarrow.multipolygon',
+        b'geoarrow.geometrycollection',
+    )
     for i in range(len(schema)):
         field = schema.field(i)
         fmd = field.metadata or {}
-        if fmd.get(b'ARROW:extension:name') == b'geoarrow.wkb':
+        extname = fmd.get(b'ARROW:extension:name')
+        if extname in geoarrow_extensions:
             names.add(field.name)
     return names
 
@@ -74,7 +130,6 @@ class ParquetSheet(Sheet):
     def iterload(self):
         pa = vd.importExternal("pyarrow", "pyarrow")
         pq = vd.importExternal("pyarrow.parquet", "pyarrow")
-        from visidata.loaders.arrow import arrow_to_vdtype
 
         if self.source.is_dir():
             self.tbl = pq.read_table(str(self.source))
@@ -92,7 +147,7 @@ class ParquetSheet(Sheet):
                 c = ParquetColumn(colname,
                                   type=arrow_to_vdtype(col.type),
                                   source=col,
-                                  cache=(col.type.id == pa.lib.Type_LARGE_STRING))
+                                  cache=True)
             self.addColumn(c)
 
         for i in range(self.tbl.num_rows):
@@ -116,11 +171,21 @@ class ParquetGeoCanvas(InvertedCanvas):
         if geocol is None:
             vd.warning('no geometry column')
             return
+        try:
+            shapely = vd.importExternal('shapely')
+        except Exception:
+            vd.warning('shapely not available for plotting geometries')
+            return
         for row in Progress(self.sourceRows):
             g = geocol.getTypedValue(row)
             if g is None:
                 continue
-            self._plot_geom(g, self.plotColor(self.source.rowkey(row)), row)
+            if not hasattr(g, 'geom_type'):
+                continue
+            try:
+                self._plot_geom(g, self.plotColor(self.source.rowkey(row)), row)
+            except Exception as e:
+                vd.exceptionCaught(e)
         self.refresh()
 
     def _plot_geom(self, g, attr, row):
@@ -155,7 +220,8 @@ def save_parquet(vd, p, sheet):
         float: pa.float64(),
         str: pa.string(),
         date: pa.date64(),
-        # list: pa.array(),
+        list: pa.string(),
+        dict: pa.string(),
     }
 
     for t in vd.numericTypes:
@@ -169,16 +235,27 @@ def save_parquet(vd, p, sheet):
             if isinstance(val, TypedWrapper):
                 val = None
 
-            databycol[col].append(val)
+            databycol[col].append(_python_to_pyarrow_val(val))
 
-    data = [
-        pa.array(vals, type=typemap.get(col.type, pa.string()))
-        for col, vals in databycol.items()
-    ]
+    data = []
+    for col, vals in databycol.items():
+        pa_type = typemap.get(col.type, pa.string())
+        try:
+            data.append(pa.array(vals, type=pa_type))
+        except Exception:
+            try:
+                data.append(pa.array([_python_to_pyarrow_val(v) for v in vals], type=pa.string()))
+            except Exception:
+                data.append(pa.array([str(v) if v is not None else None for v in vals], type=pa.string()))
 
-    schema = pa.schema(
-        [(c.name, typemap.get(c.type, pa.string())) for c in sheet.visibleCols]
-    )
+    schema_fields = []
+    for c in sheet.visibleCols:
+        try:
+            schema_fields.append((c.name, typemap.get(c.type, pa.string())))
+        except Exception:
+            schema_fields.append((c.name, pa.string()))
+
+    schema = pa.schema(schema_fields)
     with p.open_bytes(mode="w") as outf:
         with pq.ParquetWriter(outf, schema) as writer:
             writer.write_batch(

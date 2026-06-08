@@ -243,18 +243,13 @@ class Plotter(BaseSheet):
     def draw_empty(self, scr):
         # use draw_empty() when calling draw_pixels() with clear_empty_squares=False
         cursorBBox = self.plotterCursorBox
-        cursorX1, cursorY1 = cursorBBox.xmin, cursorBBox.ymin
-        cursorX2, cursorY2 = cursorBBox.xmax, cursorBBox.ymax
         for char_y in range(0, self.plotheight//4):
-            pixY1 = char_y*4
-            pixY2 = char_y*4 + 4
             for char_x in range(0, self.plotwidth//2):
                 cattr = ColorAttr()
                 ch = ' '
-                pixX1 = char_x*2
-                pixX2 = char_x*2 + 2
-                if pixX1 < cursorX2 and pixX2 > cursorX1 and \
-                   pixY1 < cursorY2 and pixY2 > cursorY1:
+                # draw cursor
+                if cursorBBox.contains(char_x*2, char_y*4) or \
+                    cursorBBox.contains(char_x*2+1, char_y*4+3):
                     cattr = update_attr(cattr, colors.color_current_row)
                 scr.addstr(char_y, char_x, ch, cattr.attr)
 
@@ -263,13 +258,9 @@ class Plotter(BaseSheet):
         disp_canvas_charset += (256 - len(disp_canvas_charset)) * disp_canvas_charset[-1]
         if self.pixels:
             cursorBBox = self.plotterCursorBox
-            cursorX1, cursorY1 = cursorBBox.xmin, cursorBBox.ymin
-            cursorX2, cursorY2 = cursorBBox.xmax, cursorBBox.ymax
             getPixelAttr = self.getPixelAttrRandom if self.options.disp_graph_pixel_random else self.getPixelAttrMost
 
             for char_y in range(0, self.plotheight//4):
-                pixY1 = char_y*4
-                pixY2 = char_y*4 + 4
                 for char_x in range(0, self.plotwidth//2):
                     block_attrs = [
                         getPixelAttr(char_x*2  , char_y*4  ),
@@ -300,10 +291,9 @@ class Plotter(BaseSheet):
                         if not clear_empty_squares:
                             continue
 
-                    pixX1 = char_x*2
-                    pixX2 = char_x*2 + 2
-                    if pixX1 < cursorX2 and pixX2 > cursorX1 and \
-                       pixY1 < cursorY2 and pixY2 > cursorY1:
+                    # draw cursor
+                    if cursorBBox.contains(char_x*2, char_y*4) or \
+                       cursorBBox.contains(char_x*2+1, char_y*4+3):
                         cattr = update_attr(cattr, colors.color_current_row)
 
                     if cattr.attr:
@@ -349,16 +339,10 @@ class Plotter(BaseSheet):
                         cattr = colors.get_color(attr)
                         clipdraw(scr, char_y, char_x, txt, cattr, dispwidth(txt, literal=True), literal=True)
                         cursorBBox = self.plotterCursorBox
-                        cursorX1, cursorY1 = cursorBBox.xmin, cursorBBox.ymin
-                        cursorX2, cursorY2 = cursorBBox.xmax, cursorBBox.ymax
-                        pixY1 = char_y*4
-                        pixY2 = char_y*4 + 4
                         for c in txt:
                             w = dispwidth(c, literal=True)
-                            pixX1 = char_x*2
-                            pixX2 = (char_x + w)*2
-                            if pixX1 < cursorX2 and pixX2 > cursorX1 and \
-                               pixY1 < cursorY2 and pixY2 > cursorY1:
+                            # draw cursor if the cursor contains the midpoint of the character cell
+                            if cursorBBox.contains(char_x*2+1, char_y*4+2):
                                 char_attr = update_attr(cattr, colors.color_current_row)
                                 clipdraw(scr, char_y, char_x, c, char_attr, w, literal=True)
                             char_x += w
