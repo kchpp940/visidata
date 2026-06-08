@@ -16,6 +16,15 @@ profile names to profile objects:
         "path_pattern": "*.csv",
         "filetype": "csv",
         "sheet_name": "",
+        "match_rules": {
+          "source_kind": "local",
+          "filetype": "csv",
+          "compression": null,
+          "innerpath": null,
+          "url_host": null,
+          "url_scheme": null,
+          "schema_digest": "sha256:abcdef1234..."
+        },
         "options": {
           "csv_delimiter": ";",
           "encoding": "latin-1",
@@ -36,10 +45,44 @@ Each profile has:
                        If set, forces the loader to use this filetype.
   * ``sheet_name``   – sheet/table selector for multi-sheet sources like
                        Excel workbooks (string, optional).
+  * ``match_rules``  – dict of fine-grained compatibility checks.  When
+                       opening a source, every non-null field in
+                       ``match_rules`` must agree with the source; if any
+                       field explicitly contradicts, the profile is treated
+                       as ``mismatch`` and is never auto-applied.  Fields:
+                         - ``source_kind`` – one of ``local``, ``url``,
+                           ``stdin``, ``archive_member``, ``memory``
+                         - ``filetype``    – detected or explicit filetype
+                         - ``compression`` – ``gz``/``bz2``/``xz``/``lzma``/
+                           ``zst`` or ``null``
+                         - ``innerpath``   – member path inside an archive
+                         - ``url_host``    – hostname for URL sources
+                         - ``url_scheme``  – ``http``/``https``/``s3``/…
+                         - ``schema_digest`` – SHA-256 of sorted column
+                           names (after a successful load).  When present
+                           the profile will only auto-match sources whose
+                           post-load column set matches.
   * ``options``      – dict of option-name → value.  Only non-default
                        loading-format options are stored.  Recognised keys
                        are listed in ``REPLAYABLE_LOAD_OPTS``.
   * ``created_at`` / ``updated_at`` – ISO-8601 timestamps (auto-managed).
+
+Compatibility / Match Levels
+----------------------------
+``vd.profileMatchLevel(profile, source)`` returns one of four levels:
+
+  * ``exact``       – all non-null ``match_rules`` fields agree, and at
+                      least ``schema_digest`` or ``innerpath``+``url_host``
+                      matches.  Safe to apply silently.
+  * ``strong``      – ``path_pattern`` + ``filetype`` + ``compression`` all
+                      agree, and no ``match_rules`` field contradicts.
+                      Safe to apply silently when auto-prompt is disabled
+                      or only one strong match exists.
+  * ``weak``        – only ``path_pattern`` or a subset of fields match.
+                      The user is always asked; the profile is *never*
+                      applied silently.
+  * ``mismatch``    – at least one non-null ``match_rules`` field
+                      contradicts the source.  Not offered as a match.
 
 Ways to Use Profiles (all per-source, no global residue):
 ----------------------------------------------------------
@@ -62,9 +105,10 @@ Ways to Use Profiles (all per-source, no global residue):
                ``File > Open > with profile > …``
 
 3. **Auto-prompt** – when ``options.profiles_auto_prompt`` is True (the
-   default) and you open a file whose path matches any saved
-   ``path_pattern``, VisiData prompts you to choose one of the matching
-   profiles.  This is automatically disabled in batch and replay modes.
+   default) and you open a file with ``strong`` or ``exact`` matching
+   profiles, VisiData prompts you to choose one.  Only ``exact`` matches
+   are ever applied silently (and only when a single exact match exists
+   and the user has confirmed once).
 
 4. **Macros / VDX replay** – every file opened with a profile records the
    profile name directly in the ``open-file`` cmdlog row in the dedicated
@@ -108,15 +152,18 @@ leaks between recorded opens:
      ``~/.visidatarc``).  Crucially, this global is NEVER written
      automatically by ``openHook`` – it only takes effect when the user
      sets it deliberately.
-  4. (interactive only) Auto-prompt if matching profiles exist and
-     ``profiles_auto_prompt`` is enabled and neither batch nor replay is
-     active.
+  4. (interactive only) Auto-prompt if ``exact`` or ``strong`` matching
+     profiles exist and ``profiles_auto_prompt`` is enabled and neither
+     batch nor replay is active.  ``weak`` matches only appear in the
+     menu, never as a default.
 """
 
 import fnmatch
+import hashlib
 import json
 import os
 from datetime import datetime
+from urllib.parse import urlparse
 
 from visidata import vd, VisiData, BaseSheet, Sheet, Column, ColumnAttr, ItemColumn, AttrDict, Path, TableSheet, CompleteKey
 
@@ -167,6 +214,173 @@ def _now_iso():
     return datetime.now().isoformat(timespec='seconds')
 
 
+MATCH_RULE_FIELDS = [
+    'source_kind', 'filetype', 'compression',
+    'innerpath', 'url_host', 'url_scheme', 'schema_digest',
+]
+
+SOURCE_KINDS = ('local', 'url', 'stdin', 'archive_member', 'memory')
+
+
+def _empty_match_rules():
+    return {k: None for k in MATCH_RULE_FIELDS}
+
+
+@VisiData.api
+def detectSourceKind(vd, source):
+    if isinstance(source, BaseSheet) and isinstance(source.source, Path):
+        p = source.source
+    elif isinstance(source, Path):
+        p = source
+    else:
+        return 'memory'
+
+    if p.given == '-':
+        return 'stdin'
+    if p.has_fp():
+        return 'archive_member'
+    if p.is_url():
+        return 'url'
+    return 'local'
+
+
+@VisiData.api
+def extractSourceAttrs(vd, source):
+    attrs = _empty_match_rules()
+
+    if isinstance(source, BaseSheet):
+        srcsheet = source
+        if isinstance(source.source, Path):
+            p = source.source
+        else:
+            p = None
+    elif isinstance(source, Path):
+        p = source
+        srcsheet = None
+    else:
+        p = None
+        srcsheet = None
+
+    attrs['source_kind'] = vd.detectSourceKind(source)
+
+    if p is not None:
+        if p.compression:
+            attrs['compression'] = p.compression
+        if p.is_url():
+            parsed = urlparse(p.given)
+            attrs['url_host'] = parsed.hostname or None
+            attrs['url_scheme'] = parsed.scheme or None
+
+        ft = p.options.getonly('filetype', p, None)
+        if ft:
+            attrs['filetype'] = ft
+        elif p.ext:
+            attrs['filetype'] = p.ext
+
+    elif srcsheet is not None:
+        ft = srcsheet.options.getonly('filetype', srcsheet, None)
+        if ft:
+            attrs['filetype'] = ft
+
+    if isinstance(source, BaseSheet) and source.source is not None:
+        if isinstance(source.source, Path) and source.source.has_fp():
+            attrs['innerpath'] = source.source.given
+
+    if isinstance(source, BaseSheet):
+        try:
+            if hasattr(source, 'columns') and source.columns:
+                attrs['schema_digest'] = vd.computeSchemaDigest(source)
+        except Exception:
+            pass
+
+    return attrs
+
+
+@VisiData.api
+def computeSchemaDigest(vd, sheet):
+    colnames = []
+    for c in getattr(sheet, 'columns', []) or []:
+        n = getattr(c, 'name', None)
+        if n is not None:
+            colnames.append(str(n))
+    if not colnames:
+        return None
+    colnames.sort()
+    h = hashlib.sha256()
+    for n in colnames:
+        h.update(n.encode('utf-8'))
+        h.update(b'\x00')
+    return 'sha256:' + h.hexdigest()[:16]
+
+
+def _norm(v):
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s if s else None
+
+
+def _rule_agrees(profile_val, source_val):
+    pv = _norm(profile_val)
+    sv = _norm(source_val)
+    if pv is None:
+        return True
+    if sv is None:
+        return False
+    return pv == sv
+
+
+@VisiData.api
+def profileMatchLevel(vd, profile, source):
+    rules = profile.get('match_rules') or {}
+    if not rules:
+        rules = _empty_match_rules()
+
+    source_attrs = vd.extractSourceAttrs(source)
+
+    for field in MATCH_RULE_FIELDS:
+        if not _rule_agrees(rules.get(field), source_attrs.get(field)):
+            return 'mismatch'
+
+    has_nonnull_rules = any(_norm(rules.get(f)) is not None for f in MATCH_RULE_FIELDS)
+
+    exact_markers = 0
+    if _norm(rules.get('schema_digest')) and _rule_agrees(rules.get('schema_digest'), source_attrs.get('schema_digest')):
+        exact_markers += 1
+    if _norm(rules.get('innerpath')) and _rule_agrees(rules.get('innerpath'), source_attrs.get('innerpath')):
+        exact_markers += 1
+    if _norm(rules.get('url_host')) and _rule_agrees(rules.get('url_host'), source_attrs.get('url_host')):
+        exact_markers += 1
+
+    if exact_markers >= 1 and has_nonnull_rules:
+        return 'exact'
+
+    pattern = profile.get('path_pattern', '')
+    path_str = ''
+    p = None
+    if isinstance(source, Path):
+        p = source
+    elif isinstance(source, BaseSheet) and isinstance(source.source, Path):
+        p = source.source
+    if p is not None:
+        path_str = str(p.given)
+
+    pattern_ok = bool(pattern) and (fnmatch.fnmatch(path_str, pattern) or pattern in path_str)
+    ft_ok = _rule_agrees(rules.get('filetype'), source_attrs.get('filetype'))
+    comp_ok = _rule_agrees(rules.get('compression'), source_attrs.get('compression'))
+
+    if pattern_ok and ft_ok and comp_ok:
+        return 'strong'
+
+    if pattern_ok:
+        return 'weak'
+
+    return 'weak' if has_nonnull_rules else 'mismatch'
+
+
+MATCH_LEVEL_SCORE = {'exact': 4, 'strong': 3, 'weak': 2, 'mismatch': 0}
+
+
 vd.option('profiles_file', '', 'path to profiles.json file (default: $VD_DIR/profiles.json or $XDG_DATA_HOME/visidata/profiles.json)', sheettype=None)
 
 
@@ -188,10 +402,25 @@ def loadProfiles(vd):
     try:
         with p.open(encoding='utf-8') as fp:
             data = json.load(fp)
+            out = {}
             if isinstance(data, list):
-                return {pr['name']: AttrDict(pr) for pr in data}
+                items = [(pr.get('name', ''), pr) for pr in data]
             elif isinstance(data, dict):
-                return {k: AttrDict(v) for k, v in data.items()}
+                items = list(data.items())
+            else:
+                return {}
+            for k, v in items:
+                pr = AttrDict(v)
+                if 'match_rules' not in pr:
+                    pr['match_rules'] = _empty_match_rules()
+                else:
+                    mr = _empty_match_rules()
+                    for field in MATCH_RULE_FIELDS:
+                        if field in pr['match_rules']:
+                            mr[field] = pr['match_rules'][field]
+                    pr['match_rules'] = mr
+                out[k] = pr
+            return out
     except Exception as e:
         vd.warning(f'failed to load profiles: {e}')
     return {}
@@ -228,6 +457,7 @@ def saveProfile(vd, name, source=None, description='', path_pattern=None):
     obj = None
     captured_filetype = ''
     captured_sheet_name = ''
+    match_rules = _empty_match_rules()
 
     if isinstance(source, Path):
         obj = source
@@ -237,10 +467,8 @@ def saveProfile(vd, name, source=None, description='', path_pattern=None):
         else:
             obj = source
 
-    # Capture sheet_name for multi-sheet sources (e.g., xlsx_sheet)
     if isinstance(source, BaseSheet):
         captured_sheet_name = getattr(source, 'name', '') or ''
-        # Try xlsx_sheet option first
         if obj:
             sheet_opt = obj.options.getonly('xlsx_sheet', obj, None)
             if sheet_opt:
@@ -253,7 +481,6 @@ def saveProfile(vd, name, source=None, description='', path_pattern=None):
                 if val is not None and val != vd.options.getdefault(optname):
                     opts[optname] = val
 
-        # Capture explicit filetype
         ft = obj.options.getonly('filetype', obj, None)
         if ft and ft != vd.options.getdefault('filetype'):
             captured_filetype = str(ft)
@@ -268,7 +495,13 @@ def saveProfile(vd, name, source=None, description='', path_pattern=None):
     if not opts:
         vd.warning('no non-default loading options detected to save')
 
-    # Auto-generate path_pattern: prefer extension glob over exact filename
+    if source is not None:
+        extracted = vd.extractSourceAttrs(source)
+        for k in MATCH_RULE_FIELDS:
+            v = extracted.get(k)
+            if v not in (None, ''):
+                match_rules[k] = v
+
     if not path_pattern:
         if isinstance(source, Path):
             ext = source.suffix
@@ -283,14 +516,21 @@ def saveProfile(vd, name, source=None, description='', path_pattern=None):
             else:
                 path_pattern = source.source.given
 
+    old = profiles.get(name, {})
+    if isinstance(old, dict) and old.get('match_rules'):
+        for k, v in old['match_rules'].items():
+            if k in match_rules and match_rules[k] in (None, '') and v not in (None, ''):
+                match_rules[k] = v
+
     profile = AttrDict(
         name=name,
         description=description,
         path_pattern=path_pattern or '',
         filetype=captured_filetype,
         sheet_name=captured_sheet_name,
+        match_rules=match_rules,
         options=opts,
-        created_at=profiles.get(name, {}).get('created_at', _now_iso()),
+        created_at=old.get('created_at', _now_iso()),
         updated_at=_now_iso(),
     )
     profiles[name] = profile
@@ -300,6 +540,9 @@ def saveProfile(vd, name, source=None, description='', path_pattern=None):
         parts.append(f'filetype={captured_filetype}')
     if captured_sheet_name:
         parts.append(f'sheet={captured_sheet_name}')
+    mr_info = [f'{k}={v}' for k, v in match_rules.items() if v not in (None, '')]
+    if mr_info:
+        parts.append('match={' + ','.join(mr_info) + '}')
     vd.status(f'saved profile `{name}` with {", ".join(parts)}')
     return profile
 
@@ -326,8 +569,9 @@ def resolveProfileForPath(vd, p, explicit_profile=None):
        via VDX ``option global load_profile X`` or ``.visidatarc`` – note
        this is NEVER recorded automatically by openHook, so no residue
        leaks between cmdlog-recorded opens)
-    4. (interactive only) auto-prompt if matching profiles exist and
-       profiles_auto_prompt=True, batch=False, no replay active
+    4. (interactive only) auto-prompt if exact/strong matching profiles
+       exist and profiles_auto_prompt=True, batch=False, no replay active.
+       Weak matches are offered as choices but never applied silently.
 
     Returns (profile_name_or_None, was_interactive).
     '''
@@ -348,14 +592,25 @@ def resolveProfileForPath(vd, p, explicit_profile=None):
                           and p.given not in ('', '-'))
 
         if is_interactive:
-            matches = vd.getMatchingProfiles(p)
-            if matches:
-                names = [n for n, _ in matches]
-                names.append('(none)')
-                choice = _choose_name(f'{len(matches)} matching profile(s) found; apply which? ', names)
-                if choice and choice != '(none)':
-                    profile_name = choice
-                    was_interactive = True
+            matches = vd.getMatchingProfiles(p, include_weak=True)
+            exact_strong = [(n, pr, lvl) for n, pr, lvl in matches if lvl in ('exact', 'strong')]
+            weak = [(n, pr, lvl) for n, pr, lvl in matches if lvl == 'weak']
+
+            if exact_strong or weak:
+                names = [n for n, _, _ in exact_strong] + [n for n, _, _ in weak]
+                if len(exact_strong) == 1 and not weak and False:
+                    profile_name = exact_strong[0][0]
+                    was_interactive = False
+                else:
+                    names.append('(none)')
+                    if exact_strong:
+                        prompt = f'{len(exact_strong)} strong/exact + {len(weak)} weak matching profile(s); apply which? '
+                    else:
+                        prompt = f'{len(weak)} weak matching profile(s) (may be incompatible); apply which? '
+                    choice = _choose_name(prompt, names)
+                    if choice and choice != '(none)':
+                        profile_name = choice
+                        was_interactive = True
 
     return (profile_name if profile_name else None, was_interactive)
 
@@ -396,17 +651,22 @@ def applyProfile(vd, name, target=None):
 
 
 @VisiData.api
-def getMatchingProfiles(vd, path):
+def getMatchingProfiles(vd, source, include_weak=True):
+    '''Return list of (name, profile, match_level) sorted by match strength
+    (exact > strong > weak).  *mismatch* profiles are never returned.
+
+    When *include_weak* is False only exact/strong matches are returned.'''
     profiles = vd.getProfiles()
-    matches = []
-    path_str = str(path.given) if isinstance(path, Path) else str(path)
+    scored = []
     for name, profile in profiles.items():
-        pattern = profile.get('path_pattern', '')
-        if not pattern:
+        lvl = vd.profileMatchLevel(profile, source)
+        if lvl == 'mismatch':
             continue
-        if fnmatch.fnmatch(path_str, pattern) or pattern in path_str:
-            matches.append((name, profile))
-    return matches
+        if not include_weak and lvl == 'weak':
+            continue
+        scored.append((MATCH_LEVEL_SCORE[lvl], name, profile, lvl))
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    return [(n, pr, lvl) for _, n, pr, lvl in scored]
 
 
 @VisiData.api
@@ -416,7 +676,7 @@ def chooseProfile(vd, path=None, prompt='choose profile: '):
         vd.fail('no profiles saved')
     names = sorted(profiles.keys())
     if path:
-        matching = [n for n, _ in vd.getMatchingProfiles(path)]
+        matching = [n for n, _, _ in vd.getMatchingProfiles(path, include_weak=True)]
         if matching:
             names = matching + [n for n in names if n not in matching]
     name = _choose_name(prompt, names)
@@ -429,12 +689,27 @@ def chooseProfile(vd, path=None, prompt='choose profile: '):
 class ProfilesSheet(Sheet):
     'List of saved loading profiles.'
     rowtype = 'profiles'
+
+    @staticmethod
+    def _match_summary(row):
+        mr = row.get('match_rules') or {}
+        parts = []
+        for k in MATCH_RULE_FIELDS:
+            v = mr.get(k)
+            if v not in (None, ''):
+                if k == 'schema_digest' and isinstance(v, str) and len(v) > 20:
+                    parts.append(f'schema={v[:14]}…')
+                else:
+                    parts.append(f'{k}={v}')
+        return ','.join(parts) if parts else ''
+
     columns = [
         ColumnAttr('name'),
         ColumnAttr('description'),
         ColumnAttr('path_pattern', width=30),
         ColumnAttr('filetype'),
         ColumnAttr('sheet_name'),
+        Column('match_rules', width=40, getter=lambda c, r: ProfilesSheet._match_summary(r)),
         Column('options_count', type=int, getter=lambda c,r: len(r.get('options', {}))),
         ColumnAttr('updated_at', width=19),
     ]
