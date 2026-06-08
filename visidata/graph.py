@@ -81,7 +81,9 @@ class GraphSheet(InvertedCanvas):
 
         self.reflines_x = []
         self.reflines_y = []
-        self._clear_refline_cache()
+        self.reflines_char_x = {}
+        self.reflines_char_y = {}
+        self._reflines_dirty = True
 
         if not vd.numericCols(self.xcols):
             if self.xcols:
@@ -91,23 +93,27 @@ class GraphSheet(InvertedCanvas):
 
         self.ycols or vd.fail('%s is non-numeric' % '/'.join(yc.name for yc in kwargs.get('ycols')))
 
-    def _clear_refline_cache(self):
-        'Clear the computed character-coordinate cache for reference lines. Must be called whenever visibleBox, plotviewBox, canvasBox, reflines_x/y, or window dimensions change.'
-        self.reflines_char_x = {}
-        self.reflines_char_y = {}
+    def _mark_reflines_dirty(self):
+        '''Mark the reference-line character-coordinate cache as needing recomputation.
+        Called whenever visibleBox, plotviewBox, canvasBox, reflines_x/y, or window dimensions change.
+        The actual recomputation happens lazily in plot_reflines() or draw_reflines().'''
+        self._reflines_dirty = True
+
+    def _ensure_reflines_cache(self):
+        '''Synchronously recompute the refline character-coordinate cache if it is marked dirty.
+        Safe to call from the draw() path: plot_reflines() depends only on synchronously-committed
+        state (visibleBox, plotviewBox, scalers, reflines_x/y), never on in-flight async data.'''
+        if self._reflines_dirty:
+            self.plot_reflines()
 
     def reset(self):
         super().reset()
-        self._clear_refline_cache()
-
-    def render(self, h, w):
-        self._clear_refline_cache()
-        super().render(h, w)
+        self._mark_reflines_dirty()
 
     def resetCanvasDimensions(self, windowHeight, windowWidth):
         if self.left_margin < self.ylabel_maxw:
             self.left_margin = self.ylabel_maxw
-        self._clear_refline_cache()
+        self._mark_reflines_dirty()
         super().resetCanvasDimensions(windowHeight, windowWidth)
 
     @asyncthread
@@ -159,6 +165,8 @@ class GraphSheet(InvertedCanvas):
         self.draw_labels(scr)
 
     def draw_reflines(self, scr):
+        self._ensure_reflines_cache()
+
         cursorBBox = self.plotterCursorBox
         cursorX1, cursorY1 = cursorBBox.xmin, cursorBBox.ymin
         cursorX2, cursorY2 = cursorBBox.xmax, cursorBBox.ymax
@@ -190,7 +198,7 @@ class GraphSheet(InvertedCanvas):
                     scr.addstr(char_y, char_x, ch, cattr.attr)
 
     def resetBounds(self, refresh=True):
-        self._clear_refline_cache()
+        self._mark_reflines_dirty()
         super().resetBounds(refresh=False)
         self.createLabels()
         if refresh:
@@ -207,7 +215,8 @@ class GraphSheet(InvertedCanvas):
         super().plot_elements(invert_y=True)
 
     def plot_reflines(self):
-        self._clear_refline_cache()
+        self.reflines_char_x = {}
+        self.reflines_char_y = {}
 
         bb = self.visibleBox
         xmin, ymin, xmax, ymax = bb.xmin, bb.ymin, bb.xmax, bb.ymax
@@ -240,6 +249,8 @@ class GraphSheet(InvertedCanvas):
                         self.reflines_char_x[char_x] = multiple_char
                     elif existing is None:
                         self.reflines_char_x[char_x] = chars[offset]
+
+        self._reflines_dirty = False
 
     def moveToCol(self, colstr):
         xmin, xmax = map(float, map(self.parseX, colstr.split()))
@@ -355,7 +366,7 @@ class GraphSheet(InvertedCanvas):
             refval = xtype(xstr.strip())
             if refval not in self.reflines_x:
                 self.reflines_x.append(refval)
-        self._clear_refline_cache()
+        self._mark_reflines_dirty()
         self.refresh()
 
     def draw_refline_y(self):
@@ -365,7 +376,7 @@ class GraphSheet(InvertedCanvas):
         ystrs = vd.input("add line(s) at y = ", type="refliney", value=suggested, defaultLast=True).split()
 
         self.reflines_y += [ ytype(y) for y in ystrs if ytype(y) not in self.reflines_y ]
-        self._clear_refline_cache()
+        self._mark_reflines_dirty()
         self.refresh()
 
     def erase_refline_x(self):
@@ -380,7 +391,7 @@ class GraphSheet(InvertedCanvas):
                 self.reflines_x.remove(xtype(x))
             except ValueError:
                 vd.warning(f'value {x} not in reflines_x')
-        self._clear_refline_cache()
+        self._mark_reflines_dirty()
         self.refresh()
 
     def erase_refline_y(self):
@@ -394,17 +405,17 @@ class GraphSheet(InvertedCanvas):
                 self.reflines_y.remove(ytype(y))
             except ValueError:
                 vd.warning(f'value {y} not in reflines_y')
-        self._clear_refline_cache()
+        self._mark_reflines_dirty()
         self.refresh()
 
     def erase_reflines_x(self):
         self.reflines_x = []
-        self._clear_refline_cache()
+        self._mark_reflines_dirty()
         self.refresh()
 
     def erase_reflines_y(self):
         self.reflines_y = []
-        self._clear_refline_cache()
+        self._mark_reflines_dirty()
         self.refresh()
 
 def format_input_value(val, type):
