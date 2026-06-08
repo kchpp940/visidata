@@ -1,7 +1,7 @@
-from visidata import vd, Sheet, options, Column, asyncthread, Progress, PivotGroupRow, HistogramColumn, TypedWrapper, TypedExceptionWrapper, wrapply
+from visidata import vd, Sheet, options, Column, asyncthread, Progress, PivotGroupRow, HistogramColumn, TypedWrapper, wrapply
 
 from visidata.loaders._pandas import PandasSheet
-from visidata.pivot import PivotSheet, normalizeGroupValue, GROUPING_NULL, GROUPING_ERROR
+from visidata.pivot import PivotSheet, normalizeGroupValue, GROUPING_NULL
 
 class DataFrameRowSliceAdapter:
     """Tracks original dataframe and a boolean row mask
@@ -74,12 +74,6 @@ def _pandasIsNA(v):
     return bool(pd.isna(v))
 
 
-def _pandasNormalizeGroupValue(v):
-    if _pandasIsNA(v):
-        return GROUPING_NULL
-    return normalizeGroupValue(v)
-
-
 class PandasFreqTableSheet(PivotSheet):
     'Generate frequency-table sheet on currently selected column.'
     rowtype = 'bins'  # rowdef FreqRow(keys, sourcerows)
@@ -130,27 +124,22 @@ class PandasFreqTableSheet(PivotSheet):
             norm_vals = []
             for col in self.groupByCols:
                 raw = col.getValue(sourcerow)
-                typed = wrapply(col.type, raw)
-                norm = _pandasNormalizeGroupValue(typed)
+                if _pandasIsNA(raw):
+                    norm = GROUPING_NULL
+                    typed = TypedWrapper(col.type, None)
+                else:
+                    typed = wrapply(col.type, raw)
+                    norm = normalizeGroupValue(typed)
                 typed_vals.append(typed)
                 norm_vals.append(norm)
 
             norm_key = tuple(norm_vals)
 
             if norm_key not in buckets:
-                display_keys = []
-                for j, col in enumerate(self.groupByCols):
-                    nk = norm_vals[j]
-                    if nk is GROUPING_NULL:
-                        display_keys.append(TypedWrapper(col.type, None))
-                    elif nk is GROUPING_ERROR:
-                        display_keys.append(TypedExceptionWrapper(col.type, exception=ValueError('type conversion error')))
-                    else:
-                        display_keys.append(typed_vals[j])
-
+                display_keys = tuple(typed_vals)
                 buckets[norm_key] = {
                     'ilocs': [],
-                    'display_keys': tuple(display_keys),
+                    'display_keys': display_keys,
                 }
 
             buckets[norm_key]['ilocs'].append(i)
