@@ -3,6 +3,245 @@ import json as _json
 from visidata import vd, TypedWrapper, TypedExceptionWrapper
 
 
+_GEOARROW_EXTENSIONS = (
+    b'geoarrow.wkb',
+    b'geoarrow.wkt',
+    b'geoarrow.point',
+    b'geoarrow.linestring',
+    b'geoarrow.polygon',
+    b'geoarrow.multipoint',
+    b'geoarrow.multilinestring',
+    b'geoarrow.multipolygon',
+    b'geoarrow.geometrycollection',
+)
+
+
+def detect_geometry_columns(schema):
+    '''Return set of column names that are geometries per GeoParquet metadata or GeoArrow extensions.'''
+    names = set()
+    meta = schema.metadata or {}
+    geo = meta.get(b'geo')
+    if geo:
+        try:
+            names.update(_json.loads(geo).get('columns', {}).keys())
+        except Exception as e:
+            vd.exceptionCaught(e)
+    for i in range(len(schema)):
+        field = schema.field(i)
+        fmd = field.metadata or {}
+        extname = fmd.get(b'ARROW:extension:name')
+        if extname in _GEOARROW_EXTENSIONS:
+            names.add(field.name)
+    return names
+
+
+def is_geometry_value(val):
+    '''Return True if val looks like a geometry value (shapely obj, WKB bytes, GeoJSON dict, __geo_interface__).'''
+    if val is None:
+        return False
+    if hasattr(val, '__geo_interface__'):
+        return True
+    if hasattr(val, 'geom_type'):
+        return True
+    if isinstance(val, dict) and 'type' in val and 'coordinates' in val:
+        return True
+    return False
+
+
+def to_geometry_value(val):
+    '''Convert raw geometry storage value (WKB bytes, WKT str, GeoJSON dict) to display-ready value.
+
+    If shapely is available:
+        WKB bytes → shapely geometry object (empty geometry → None)
+        WKT str   → shapely geometry object
+        GeoJSON dict → shapely geometry object (via shape())
+    If shapely is missing or parsing fails:
+        WKB bytes → hex-encoded str
+        WKT str   → original str
+        GeoJSON dict → original dict
+    Already a shapely geometry → passed through as-is (empty → None)
+    '''
+    if val is None:
+        return None
+
+    if hasattr(val, '__geo_interface__') or hasattr(val, 'geom_type'):
+        try:
+            import shapely
+            if hasattr(val, 'is_empty') and val.is_empty:
+                return None
+        except Exception:
+            pass
+        return val
+
+    if isinstance(val, (bytes, bytearray, memoryview)):
+        raw = bytes(val)
+        if len(raw) == 0:
+            return None
+        try:
+            import shapely
+            geom = shapely.from_wkb(raw)
+            if geom.is_empty:
+                return None
+            return geom
+        except Exception:
+            try:
+                return raw.hex()
+            except Exception:
+                return raw
+
+    if isinstance(val, str):
+        if val.strip() == '':
+            return None
+        try:
+            import shapely
+            geom = shapely.from_wkt(val)
+            if geom.is_empty:
+                return None
+            return geom
+        except Exception:
+            return val
+
+    if isinstance(val, dict) and 'type' in val and 'coordinates' in val:
+        try:
+            import shapely
+            geom = shapely.geometry.shape(val)
+            if geom.is_empty:
+                return None
+            return geom
+        except Exception:
+            return val
+
+    return val
+
+
+def format_geometry_value(typedval, width=None):
+    '''Format a geometry value for display.
+
+    - shapely geometry → "PointType[123]" (geom_type with coordinate count)
+    - WKB bytes → "WKB[42]"
+    - hex str (from WKB fallback) → "WKB[21]" (decoded length)
+    - WKT str / GeoJSON dict → truncated str
+    - None → None
+    '''
+    if typedval is None:
+        return None
+
+    try:
+        import shapely
+        if hasattr(typedval, 'geom_type') and hasattr(typedval, 'is_empty'):
+            try:
+                n = shapely.get_num_coordinates(typedval)
+                return f'{typedval.geom_type}[{n}]'
+            except Exception:
+                return str(typedval.geom_type)
+    except Exception:
+        pass
+
+    if isinstance(typedval, (bytes, bytearray, memoryview)):
+        try:
+            return f'WKB[{len(bytes(typedval))}]'
+        except Exception:
+            pass
+
+    if isinstance(typedval, str):
+        if all(c in '0123456789abcdefABCDEF' for c in typedval) and len(typedval) % 2 == 0 and len(typedval) > 4:
+            try:
+                return f'WKB[{len(typedval) // 2}]'
+            except Exception:
+                pass
+        if len(typedval) > 60:
+            return typedval[:57] + '...'
+        return typedval
+
+    if isinstance(typedval, dict):
+        try:
+            t = typedval.get('type', '?')
+            coords = typedval.get('coordinates')
+            if coords:
+                return f'{t}[GeoJSON]'
+        except Exception:
+            pass
+        s = _json.dumps(typedval)
+        if len(s) > 60:
+            return s[:57] + '...'
+        return s
+
+    return str(typedval)
+
+
+def _shapely_mapping(geom):
+    'Convert a shapely geometry to a GeoJSON dict, handling shapely API differences.'
+    try:
+        import shapely.geometry
+        return shapely.geometry.mapping(geom)
+    except Exception:
+        pass
+    try:
+        import shapely
+        import json as _json
+        return _json.loads(shapely.to_geojson(geom))
+    except Exception:
+        return None
+
+
+def _geometry_to_geojson(val):
+    '''Convert any geometry value (shapely, WKB bytes, hex, WKT str, GeoJSON dict) to a GeoJSON dict.
+
+    Returns None on failure.
+    '''
+    if val is None:
+        return None
+
+    if hasattr(val, '__geo_interface__'):
+        try:
+            return _normalize_for_json(val.__geo_interface__)
+        except Exception:
+            pass
+
+    if hasattr(val, 'geom_type'):
+        geo = _shapely_mapping(val)
+        if geo is not None:
+            return _normalize_for_json(geo)
+
+    if isinstance(val, (bytes, bytearray, memoryview)):
+        try:
+            import shapely
+            geom = shapely.from_wkb(bytes(val))
+            geo = _shapely_mapping(geom)
+            if geo is not None:
+                return _normalize_for_json(geo)
+        except Exception:
+            pass
+        return None
+
+    if isinstance(val, str):
+        if all(c in '0123456789abcdefABCDEF' for c in val) and len(val) % 2 == 0 and len(val) > 4:
+            try:
+                import shapely
+                raw = bytes.fromhex(val)
+                geom = shapely.from_wkb(raw)
+                geo = _shapely_mapping(geom)
+                if geo is not None:
+                    return _normalize_for_json(geo)
+            except Exception:
+                pass
+            return None
+        try:
+            import shapely
+            geom = shapely.from_wkt(val)
+            geo = _shapely_mapping(geom)
+            if geo is not None:
+                return _normalize_for_json(geo)
+        except Exception:
+            pass
+        return None
+
+    if isinstance(val, dict) and 'type' in val and 'coordinates' in val:
+        return _normalize_for_json(val)
+
+    return None
+
+
 def to_python_value(val):
     '''Normalize raw values from loaders (PyArrow, Pandas, NumPy) into native Python types.
 
@@ -156,24 +395,28 @@ def _pyarrow_scalar_to_python(val):
         return str(val)
 
 
-def to_export_value(val, fmt=None):
-    '''Convert a Python value (from to_python_value) to a format-appropriate export value.
+def to_export_value(val, fmt=None, as_geometry=False):
+    '''Convert a Python value (from to_python_value / to_geometry_value) to a format-appropriate export value.
 
     Formats:
     - 'csv'/'tsv'/'txt' (default):
         list/dict → JSON string, bytes → UTF-8 string,
-        geometry (with __geo_interface__) → GeoJSON string,
+        geometry → GeoJSON string,
         everything else → as-is (will be str()'d by text formatters if needed)
     - 'json'/'jsonl':
         list/dict → kept as list/dict (recursively normalized),
         bytes → UTF-8 string,
-        geometry → GeoJSON dict (via __geo_interface__),
+        geometry → GeoJSON dict,
         dict keys coerced to str,
         TypedExceptionWrapper → str
     - 'arrow'/'parquet':
         list/dict → JSON string,
         bytes → preserved as bytes,
-        geometry → GeoJSON string (via __geo_interface__)
+        geometry → WKB bytes (if shapely available) or GeoJSON string
+
+    as_geometry: when True, treat val as a geometry value (WKB bytes, hex str, WKT str,
+    shapely obj, GeoJSON dict) and export it with geometry semantics even if it doesn't
+    have __geo_interface__.
     '''
     if val is None:
         return None
@@ -185,13 +428,52 @@ def to_export_value(val, fmt=None):
     stringify_complex = fmt in ('csv', 'tsv', 'txt', 'arrow', 'parquet')
     json_fmt = fmt.startswith('json')
 
+    if as_geometry or is_geometry_value(val):
+        if fmt in ('arrow', 'parquet'):
+            try:
+                import shapely
+                if hasattr(val, 'geom_type') or hasattr(val, '__geo_interface__'):
+                    return shapely.to_wkb(val)
+                if isinstance(val, (bytes, bytearray, memoryview)):
+                    return bytes(val)
+                if isinstance(val, str):
+                    if all(c in '0123456789abcdefABCDEF' for c in val) and len(val) % 2 == 0 and len(val) > 4:
+                        return bytes.fromhex(val)
+                    geom = shapely.from_wkt(val)
+                    return shapely.to_wkb(geom)
+                if isinstance(val, dict) and 'type' in val and 'coordinates' in val:
+                    geom = shapely.geometry.shape(val)
+                    return shapely.to_wkb(geom)
+            except Exception:
+                pass
+        geojson = _geometry_to_geojson(val)
+        if geojson is not None:
+            if json_fmt:
+                return geojson
+            try:
+                return _json.dumps(geojson, ensure_ascii=False, default=str)
+            except Exception:
+                return str(geojson)
+        if isinstance(val, (bytes, bytearray, memoryview)):
+            try:
+                return bytes(val).hex()
+            except Exception:
+                return str(val)
+        if isinstance(val, str):
+            return val
+        if isinstance(val, dict):
+            try:
+                return _json.dumps(val, ensure_ascii=False, default=str) if not json_fmt else _normalize_for_json(val)
+            except Exception:
+                return str(val)
+
     if isinstance(val, TypedExceptionWrapper):
         if json_fmt:
             return str(val)
         return val
 
     if isinstance(val, TypedWrapper):
-        return to_export_value(val.val, fmt)
+        return to_export_value(val.val, fmt, as_geometry=as_geometry)
 
     try:
         import numpy as np
@@ -314,4 +596,11 @@ def _normalize_for_json(val):
     return val
 
 
-vd.addGlobals(to_python_value=to_python_value, to_export_value=to_export_value)
+vd.addGlobals(
+    to_python_value=to_python_value,
+    to_export_value=to_export_value,
+    to_geometry_value=to_geometry_value,
+    format_geometry_value=format_geometry_value,
+    detect_geometry_columns=detect_geometry_columns,
+    is_geometry_value=is_geometry_value,
+)

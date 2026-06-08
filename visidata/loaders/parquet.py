@@ -1,10 +1,11 @@
-import json
-
 from visidata import Sheet, VisiData, TypedWrapper, anytype, date, vlen, Column, vd, asyncthread, Progress, InvertedCanvas
 from collections import defaultdict
 
 from visidata.loaders.arrow import arrow_to_vdtype
-from visidata.normalizers import to_python_value, to_export_value
+from visidata.normalizers import (
+    to_python_value, to_export_value, to_geometry_value,
+    format_geometry_value, detect_geometry_columns, is_geometry_value,
+)
 
 
 @VisiData.api
@@ -31,87 +32,17 @@ class ParquetColumn(Column):
 
 
 class GeometryColumn(ParquetColumn):
-    'Parquet column containing WKB-encoded geometries (GeoParquet).'
+    'Parquet column containing geometry values (WKB/WKT/GeoArrow, GeoParquet).'
     @property
     def readonly(self) -> bool:
         return True
 
     def calcValue(self, row):
         val = super().calcValue(row)
-        if val is None:
-            return None
-        try:
-            shapely = vd.importExternal('shapely')
-        except Exception:
-            if isinstance(val, bytes):
-                try:
-                    return val.hex()
-                except Exception:
-                    return val
-            return val
-        try:
-            if isinstance(val, (bytes, bytearray, memoryview)):
-                if len(bytes(val)) == 0:
-                    return None
-                geom = shapely.from_wkb(bytes(val))
-                if geom.is_empty:
-                    return None
-                return geom
-            return val
-        except Exception:
-            if isinstance(val, bytes):
-                try:
-                    return val.hex()
-                except Exception:
-                    return val
-            return val
+        return to_geometry_value(val)
 
     def formatValue(self, typedval, width=None):
-        if typedval is None:
-            return None
-        try:
-            shapely = vd.importExternal('shapely')
-            if hasattr(typedval, 'geom_type'):
-                n = shapely.get_num_coordinates(typedval)
-                return f'{typedval.geom_type}[{n}]'
-        except Exception:
-            pass
-        if isinstance(typedval, (bytes, bytearray)):
-            try:
-                return f'WKB[{len(typedval)}]'
-            except Exception:
-                pass
-        return str(typedval)
-
-
-def _geoparquet_columns(schema):
-    'Return set of column names that are WKB geometries per GeoParquet metadata.'
-    names = set()
-    meta = schema.metadata or {}
-    geo = meta.get(b'geo')
-    if geo:
-        try:
-            names.update(json.loads(geo).get('columns', {}).keys())
-        except Exception as e:
-            vd.exceptionCaught(e)
-    geoarrow_extensions = (
-        b'geoarrow.wkb',
-        b'geoarrow.wkt',
-        b'geoarrow.point',
-        b'geoarrow.linestring',
-        b'geoarrow.polygon',
-        b'geoarrow.multipoint',
-        b'geoarrow.multilinestring',
-        b'geoarrow.multipolygon',
-        b'geoarrow.geometrycollection',
-    )
-    for i in range(len(schema)):
-        field = schema.field(i)
-        fmd = field.metadata or {}
-        extname = fmd.get(b'ARROW:extension:name')
-        if extname in geoarrow_extensions:
-            names.add(field.name)
-    return names
+        return format_geometry_value(typedval, width)
 
 
 class ParquetSheet(Sheet):
@@ -126,7 +57,7 @@ class ParquetSheet(Sheet):
             with self.source.open('rb') as f:
                 self.tbl = pq.read_table(f)
 
-        geocols = _geoparquet_columns(self.tbl.schema)
+        geocols = detect_geometry_columns(self.tbl.schema)
 
         self.columns = []
         for colname, col in zip(self.tbl.column_names, self.tbl.columns):
@@ -219,21 +150,25 @@ def save_parquet(vd, p, sheet):
 
     databycol = defaultdict(list)  # col -> [values]
 
+    geom_cols = {c for c in sheet.visibleCols if isinstance(c, GeometryColumn)}
+
     for typedvals in sheet.iterdispvals(format=False):
         for col, val in typedvals.items():
             if isinstance(val, TypedWrapper):
                 val = None
 
-            databycol[col].append(to_export_value(val, fmt='parquet'))
+            as_geom = col in geom_cols
+            databycol[col].append(to_export_value(val, fmt='parquet', as_geometry=as_geom))
 
     data = []
     for col, vals in databycol.items():
         pa_type = typemap.get(col.type, pa.string())
+        as_geom = col in geom_cols
         try:
             data.append(pa.array(vals, type=pa_type))
         except Exception:
             try:
-                data.append(pa.array([to_export_value(v, fmt='parquet') for v in vals], type=pa.string()))
+                data.append(pa.array([to_export_value(v, fmt='parquet', as_geometry=as_geom) for v in vals], type=pa.string()))
             except Exception:
                 data.append(pa.array([str(v) if v is not None else None for v in vals], type=pa.string()))
 
