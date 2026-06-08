@@ -120,6 +120,20 @@ class DQSourceSnapshot:
     def all_col_ids(self):
         return frozenset(sig[0] for sig in self.col_signatures)
 
+    def scan_deps_changed(self, other):
+        '''True iff the rule-output-affecting state differs between snapshots.
+
+        This covers row identity/ordering, column signatures, and key columns —
+        everything that can change the result of a DQ rule scan.  Selection state
+        is deliberately excluded: selecting/unselecting rows on the source sheet
+        does not change which rows have nulls, type errors, duplicates, etc.
+        '''
+        if not isinstance(other, DQSourceSnapshot):
+            return True
+        return (self.rowids_tuple != other.rowids_tuple or
+                self.col_signatures != other.col_signatures or
+                self.keycol_ids != other.keycol_ids)
+
     def __eq__(self, other):
         if not isinstance(other, DQSourceSnapshot):
             return NotImplemented
@@ -535,9 +549,8 @@ ALL_DQ_RULES = [
 ]
 
 
-def _scan_columns_for_issues(sheet, cols, rules, isNull, progress_label=None):
-    'Run per-column *rules* on specific *cols*; yield DQIssue objects.'
-    rows = sheet.rows
+def _scan_columns_for_issues(sheet, cols, rules, isNull, rows, progress_label=None):
+    'Run per-column *rules* on specific *cols* across *rows*; yield DQIssue objects.'
     for col in (Progress(cols, gerund=progress_label or 'scanning columns') if progress_label else cols):
         for rule in rules:
             if not rule.per_column:
@@ -551,9 +564,8 @@ def _scan_columns_for_issues(sheet, cols, rules, isNull, progress_label=None):
                 vd.exceptionCaught(e)
 
 
-def _scan_sheet_rules(sheet, rules, isNull):
-    'Run per-sheet *rules*; yield DQIssue objects.'
-    rows = sheet.rows
+def _scan_sheet_rules(sheet, rules, isNull, rows):
+    'Run per-sheet *rules* across *rows*; yield DQIssue objects.'
     for rule in rules:
         if rule.per_column:
             continue
@@ -569,17 +581,22 @@ def _scan_sheet_rules(sheet, rules, isNull):
 @Sheet.api
 def scan_data_quality(sheet, rules=None):
     '''Scan *sheet* for data quality issues using *rules* (default: ALL_DQ_RULES).
+
+    Scans the rows currently present on *sheet* (``sheet.rows``) — which reflects
+    any filtering via duplicate-sheet, row selection subsets, etc. — and only the
+    visible, non-hidden columns.
     Yields ``DQIssue`` objects.
     '''
-    if sheet.nRows == 0:
+    rows = sheet.rows
+    if not rows:
         return
 
     rules = rules or ALL_DQ_RULES
     isNull = sheet.isNullFunc()
     visible_cols = [c for c in sheet.visibleCols if not c.hidden]
 
-    yield from _scan_sheet_rules(sheet, rules, isNull)
-    yield from _scan_columns_for_issues(sheet, visible_cols, rules, isNull, progress_label='scanning columns')
+    yield from _scan_sheet_rules(sheet, rules, isNull, rows)
+    yield from _scan_columns_for_issues(sheet, visible_cols, rules, isNull, rows, progress_label='scanning columns')
 
 
 class IssueColumn(Column):
@@ -635,6 +652,7 @@ an explicit warning rather than a silent skip.
         super().__init__(*names, **kwargs)
         self.source = source
         self._dq_snapshot = None
+        self._dq_dirty = True
         if isinstance(source, Sheet):
             if self not in source._dq_dependents:
                 source._dq_dependents.append(self)
@@ -643,26 +661,40 @@ an explicit warning rather than a silent skip.
 
     def _dq_source_changed(self):
         'Called by source sheet when its version counter increments.'
-        self._dq_snapshot = None  # cheap invalidation
+        self._dq_dirty = True
 
     def _dq_is_stale(self):
+        '''True iff rule outputs need recomputation.
+
+        Only scan dependencies (rows, columns, keycols) trigger staleness.
+        Selection-only changes update the snapshot in place without rescanning.
+        '''
         src = self.source
         if not isinstance(src, Sheet):
             return False
+        if not self._dq_dirty:
+            return False
         if self._dq_snapshot is None:
             return True
-        current = DQSourceSnapshot(src)
-        return self._dq_snapshot != current
+        new_snap = DQSourceSnapshot(src)
+        if self._dq_snapshot.scan_deps_changed(new_snap):
+            return True
+        self._dq_snapshot = new_snap
+        self._dq_dirty = False
+        return False
 
     def _dq_incremental_refresh(self):
         '''Refresh only the rules/columns affected by the source change.
 
         Falls back to full reload when the row identity set itself has changed.
+        Selection changes on the source sheet do NOT trigger any rule rescan —
+        they only update the cached snapshot for accurate联动 warnings.
         '''
         src = self.source
         if not isinstance(src, Sheet):
             self.rows = []
             self._dq_snapshot = None
+            self._dq_dirty = False
             return
 
         old_snap = self._dq_snapshot
@@ -672,15 +704,16 @@ an explicit warning rather than a silent skip.
             vd.debug(f'{self.name}: rows changed; full DQ rescan')
             self.rows = list(scan_data_quality(src))
             self._dq_snapshot = new_snap
+            self._dq_dirty = False
             return
 
         isNull = src.isNullFunc()
         changed_col_ids = old_snap.changed_col_ids(new_snap)
         keycols_changed = old_snap.keycols_changed(new_snap)
-        selection_changed = old_snap.selection_changed(new_snap)
 
-        if not changed_col_ids and not keycols_changed and not selection_changed:
+        if not changed_col_ids and not keycols_changed:
             self._dq_snapshot = new_snap
+            self._dq_dirty = False
             return
 
         rules = ALL_DQ_RULES
@@ -690,10 +723,14 @@ an explicit warning rather than a silent skip.
             if rule.per_column:
                 rules_to_rescan_cols.append(rule)
             else:
-                if keycols_changed or selection_changed:
+                if keycols_changed:
+                    rules_to_rescan_sheet.append(rule)
+                elif rule is DuplicateRowsRule and (
+                    changed_col_ids & new_snap.all_col_ids()
+                ):
                     rules_to_rescan_sheet.append(rule)
                 elif any(dep in changed_col_ids for dep in
-                         (set() if rule != DuplicateRowsRule else new_snap.all_col_ids())):
+                         (new_snap.all_col_ids() if rule is DuplicateRowsRule else set())):
                     rules_to_rescan_sheet.append(rule)
 
         # Determine which columns to rescan for per-column rules
@@ -724,16 +761,17 @@ an explicit warning rather than a silent skip.
 
         # Re-scan sheet-level rules
         if rules_to_rescan_sheet:
-            for issue in _scan_sheet_rules(src, rules_to_rescan_sheet, isNull):
+            for issue in _scan_sheet_rules(src, rules_to_rescan_sheet, isNull, src.rows):
                 new_rows.append(issue)
 
         # Re-scan affected columns
         if cols_to_rescan and rules_to_rescan_cols:
-            for issue in _scan_columns_for_issues(src, cols_to_rescan, rules_to_rescan_cols, isNull):
+            for issue in _scan_columns_for_issues(src, cols_to_rescan, rules_to_rescan_cols, isNull, src.rows):
                 new_rows.append(issue)
 
         self.rows = new_rows
         self._dq_snapshot = new_snap
+        self._dq_dirty = False
 
     def _dq_refresh_if_stale(self):
         if self._dq_is_stale():
@@ -743,9 +781,11 @@ an explicit warning rather than a silent skip.
         if not isinstance(self.source, Sheet):
             self.rows = []
             self._dq_snapshot = None
+            self._dq_dirty = False
             return
         self.rows = list(scan_data_quality(self.source))
         self._dq_snapshot = DQSourceSnapshot(self.source)
+        self._dq_dirty = False
 
     def ensureLoaded(self):
         self._dq_refresh_if_stale()
