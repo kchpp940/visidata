@@ -324,51 +324,25 @@ def isLongname(self, ks:str):
     return ('-' in ks) and (ks[-1] != '-') or (len(ks) > 3 and ks.islower())
 
 
-_SHEETSEP = '\x1f'
-
-
 @VisiData.api
-def getSheet(vd, sheetname, sheetidx=None):
-    '''Return Sheet from the sheet stack.  *sheetname* can be:
-    - a sheet name (optionally followed by \\x1f and a numeric fallback index)
-    - a sheet number indexing directly into ``vd.sheets``.
-    *sheetidx* is an optional numeric fallback index.
-    '''
+def getSheet(vd, sheetname):
+    'Return Sheet from the sheet stack.  *sheetname* can be a sheet name or a sheet number indexing directly into ``vd.sheets``.'
     if isinstance(sheetname, BaseSheet):
         return sheetname
 
-    fallback_idx = sheetidx
-    searchname = sheetname
-    if isinstance(sheetname, str) and _SHEETSEP in sheetname:
-        searchname, _, idxstr = sheetname.partition(_SHEETSEP)
-        try:
-            fallback_idx = int(idxstr)
-        except (ValueError, TypeError):
-            pass
-
-    matchingSheets = [x for x in vd.sheets if x.name == searchname]
+    matchingSheets = [x for x in vd.sheets if x.name == sheetname]
     if matchingSheets:
-        if len(matchingSheets) == 1:
-            return matchingSheets[0]
-        if fallback_idx is not None and 0 <= fallback_idx < len(vd.sheets):
-            if vd.sheets[fallback_idx] in matchingSheets:
-                return vd.sheets[fallback_idx]
-            return vd.sheets[fallback_idx]
+        if len(matchingSheets) > 1:
+            vd.warning(f'more than one sheet named `{sheetname}`')
         return matchingSheets[0]
 
-    if fallback_idx is not None:
-        try:
-            return vd.sheets[fallback_idx]
-        except (ValueError, IndexError):
-            pass
-
     try:
-        sheetidx = int(searchname)
+        sheetidx = int(sheetname)
         return vd.sheets[sheetidx]
     except (ValueError, IndexError):
         pass
 
-    if searchname == 'options':
+    if sheetname == 'options':
         vs = vd.globalOptionsSheet
         vs.reload()
         vs.vd = vd

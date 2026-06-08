@@ -6,6 +6,7 @@ from visidata import VisiData, vd, Path, BaseSheet, TableSheet, TextSheet, Setta
 
 
 vd.option('filetype', '', 'specify file type', replay=True)
+vd.option('profile', '', 'apply named loading profile when opening files', replay=True)
 
 
 @VisiData.api
@@ -93,9 +94,23 @@ def guess_extension(vd, path):
 
 
 @VisiData.api
-def openPath(vd, p, filetype=None, create=False):
+def openPath(vd, p, filetype=None, create=False, profile=None):
     '''Call ``open_<filetype>(p)`` or ``openurl_<p.scheme>(p, filetype)``.  Return constructed but unloaded sheet of appropriate type.
     If True, *create* will return a new, blank **Sheet** if file does not exist.'''
+
+    profile_name = profile or p.options.getonly('profile', p, '') or vd.options.getonly('profile', 'global', '')
+
+    if profile_name:
+        vd.applyProfile(profile_name, p)
+    elif vd.options.get('profiles_auto_prompt', True) and not vd.options.batch and p.given not in ('', '-'):
+        matches = vd.getMatchingProfiles(p)
+        if matches:
+            names = [n for n, _ in matches]
+            names.append('(none)')
+            choice = vd.choose(f'{len(matches)} matching profile(s) found; apply which? ', names)
+            if choice and choice != '(none)':
+                vd.applyProfile(choice, p)
+
     filetype = filetype or p.options.filetype  # resolve from path instance, Path class, global  #1710
 
     if p.scheme and not p.has_fp():
@@ -161,63 +176,31 @@ def openPath(vd, p, filetype=None, create=False):
     return openfunc(p)
 
 @VisiData.api
-def openSource(vd, p, filetype=None, create=False, **kwargs):
+def openSource(vd, p, filetype=None, create=False, profile=None, **kwargs):
     '''Return unloaded sheet object for *p* opened as the given *filetype* and with *kwargs* as option overrides. *p* can be a Path or a string (filename, url, or "-" for stdin).
-    For backwards compatibility, plain string paths (including old VDX/VDJ files and hand-written macros) work unchanged.
-    Structured JSON input (from cmdlog replay) supplements loader parameters without breaking plain path handling.'''
+    when true, *create* will return a blank sheet, if file does not exist.'''
 
     if isinstance(p, BaseSheet):
         return p
 
-    # Parse structured source metadata from JSON string (used in cmdlog replay)
-    # Falls back to plain string path on any parse error — backwards compatible with old VDX/VDJ/macros.
-    src_meta = None
-    if isinstance(p, str):
-        p_stripped = p.strip()
-        # Quick shape check: JSON object strings must start with '{' and end with '}'
-        if len(p_stripped) >= 2 and p_stripped[0] == '{' and p_stripped[-1] == '}':
-            try:
-                import json
-                parsed = json.loads(p_stripped)
-                if isinstance(parsed, dict) and 'given' in parsed:
-                    src_meta = parsed
-                    p = src_meta.get('given', p)
-                    if not filetype and src_meta.get('filetype'):
-                        filetype = src_meta['filetype']
-                    for k in ('encoding', 'encoding_errors', 'delimiter', 'header'):
-                        if src_meta.get(k) is not None and k not in kwargs:
-                            kwargs[k] = src_meta[k]
-            except (ValueError, json.JSONDecodeError, TypeError):
-                # Not valid JSON, or not a dict with 'given' — treat as plain path
-                pass
-
     vs = None
     if isinstance(p, str):
         if '://' in p:
-            vs = vd.openPath(Path(p), filetype=filetype)  # convert to Path and recurse
+            vs = vd.openPath(Path(p), filetype=filetype, profile=profile)  # convert to Path and recurse
         elif p == '-':
             if vd.stdinSource.fptext.isatty():
                 vd.fail('cannot open stdin when it is a tty')
-            vs = vd.openPath(vd.stdinSource, filetype=filetype)
+            vs = vd.openPath(vd.stdinSource, filetype=filetype, profile=profile)
         else:
-            vs = vd.openPath(Path(p), filetype=filetype, create=create)  # convert to Path and recurse
+            vs = vd.openPath(Path(p), filetype=filetype, create=create, profile=profile)  # convert to Path and recurse
     else:
-        vs = vd.openPath(p, filetype=filetype, create=create)
+        vs = vd.openPath(p, filetype=filetype, create=create, profile=profile)
 
     for optname, optval in kwargs.items():
         vs.options[optname] = optval
         # Path is authoritative for format options  #2727
         if isinstance(vs.source, Path):
             vs.source.options.set(optname, optval, vs.source, cmdlog=False)
-
-    # Apply structured source metadata from replay
-    if src_meta and isinstance(vs.source, Path):
-        for k in ('compression', 'innerpath', 'kind', 'archive_source'):
-            if src_meta.get(k) and not getattr(vs.source, k, None):
-                try:
-                    setattr(vs.source, k, src_meta[k])
-                except AttributeError:
-                    pass
 
     return vs
 

@@ -175,31 +175,6 @@ class Path(os.PathLike):
         self.rfile = None
 
     @property
-    def source_kind(self):
-        'Return the kind of source this path represents: stdin, url, local, virtual, or archive.'
-        if self.given == '-':
-            return 'stdin'
-        if self.is_url():
-            return 'url'
-        if self.has_fp():
-            return 'virtual'
-        return 'local'
-
-    def source_meta(self):
-        'Return dict of structured metadata about this source, suitable for cmdlog recording.'
-        meta = {
-            'kind': self.source_kind,
-            'given': self.given,
-            'filetype': getattr(self.options, 'filetype', None) or self.ext or '',
-            'encoding': getattr(self.options, 'encoding', None) or '',
-            'compression': self.compression or '',
-        }
-        inner = getattr(self, 'innerpath', None)
-        if inner:
-            meta['innerpath'] = inner
-        return meta
-
-    @property
     def name(self):
         'Full filename including extensions. Same as pathlib.Path.name.'
         if self._given == '.':

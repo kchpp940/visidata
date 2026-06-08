@@ -1,29 +1,10 @@
 import json
 import re
-import os
 
 import visidata
-from visidata import VisiData, CommandLogBase, BaseSheet, Sheet, AttrDict, Progress, Path
+from visidata import VisiData, CommandLogBase, BaseSheet, Sheet, AttrDict, Progress
 
 VDX_VD_COLUMNS = ['sheet', 'col', 'row', 'longname', 'input', 'keystrokes', 'comment']
-
-_RECSEP = '\x1f'
-_COLSEP = _RECSEP
-_SHEETSEP = _RECSEP
-
-
-def _clean_col(col):
-    'Return just the column name portion of a composite col identifier.'
-    if isinstance(col, str) and _COLSEP in col:
-        return col.split(_COLSEP, 1)[0]
-    return col
-
-
-def _clean_sheet(sheetname):
-    'Return just the sheet name portion of a composite sheet identifier.'
-    if isinstance(sheetname, str) and _SHEETSEP in sheetname:
-        return sheetname.split(_SHEETSEP, 1)[0]
-    return sheetname
 
 
 @VisiData.api
@@ -69,29 +50,20 @@ class CommandLogSimple(CommandLogBase, Sheet):
                     value = parts[2] if len(parts) > 2 else ''
                     yield AttrDict(longname='set-option',
                                    sheet=scope, col='', row=name, input=value)
-                elif longname == 'unset-option':
-                    # unset-option scope name -> unset-option
-                    parts = (rest[0] if rest else '').split(' ', maxsplit=1)
-                    scope = parts[0] if len(parts) > 0 else 'global'
-                    name = parts[1] if len(parts) > 1 else ''
-                    yield AttrDict(longname='unset-option',
-                                   sheet=scope, col='', row=name, input='')
+                elif longname == 'apply-profile':
+                    yield AttrDict(longname='apply-profile',
+                                   input=rest[0] if rest else '')
+                elif longname == 'save-profile':
+                    yield AttrDict(longname='save-profile',
+                                   input=rest[0] if rest else '')
+                elif longname == 'delete-profile':
+                    yield AttrDict(longname='delete-profile',
+                                   input=rest[0] if rest else '')
                 else:
                     yield AttrDict(longname=longname,
                                    input=rest[0] if rest else '',
                                    **context)
                     context = {}
-
-
-def _is_path_scope(scope):
-    'Return True if scope string looks like a filesystem path or URL.'
-    if not scope:
-        return False
-    if scope in ('global', 'default', 'override'):
-        return False
-    if '/' in scope or '\\' in scope or scope.startswith('-') or '://' in scope:
-        return True
-    return False
 
 
 @VisiData.api
@@ -102,26 +74,8 @@ def save_vdx(vd, p, *vsheets):
         for vs in vsheets:
             prevrow = None
             for r in vs.rows:
-                if r.longname in ('set-option', 'unset-option'):
-                    optname = r.row or ''
-                    # Skip rows referencing options that don't exist in the current vd options.
-                    # Prevents stray metadata fields (e.g. old source_* placeholders) from being
-                    # written as replayable options that would fail on re-read.
-                    optdef = vd._options._get(optname, None)
-                    if r.longname == 'set-option' and optdef is None:
-                        continue
-                    scope = r.sheet or r.col or 'global'
-                    optval = r.input or ''
-                    if r.longname == 'set-option':
-                        fp.write(f'option {scope} {optname} {optval}\n')
-                    else:
-                        fp.write(f'unset-option {scope} {optname}\n')
-                    prevrow = r
-                    continue
-
-                if r.sheet and (prevrow is None or prevrow.sheet != r.sheet):
+                if prevrow is not None and r.sheet and prevrow.sheet != r.sheet:
                     fp.write(f'sheet {r.sheet}\n')
-
                 if r.col and (prevrow is None or prevrow.col != r.col):
                     fp.write(f'col {r.col}\n')
                 if r.row and (prevrow is None or prevrow.row != r.row):
@@ -133,17 +87,6 @@ def save_vdx(vd, p, *vsheets):
                 fp.write(line + '\n')
 
                 prevrow = r
-
-            from visidata.cmdlog import _collect_graph_state_rows
-            for gr in _collect_graph_state_rows(vd, vs):
-                if gr.get('sheet') and (prevrow is None or prevrow.sheet != gr['sheet']):
-                    fp.write(f'sheet {gr["sheet"]}\n')
-
-                line = gr.get('longname', '')
-                if gr.get('input'):
-                    line += ' ' + str(gr['input'])
-                fp.write(line + '\n')
-                prevrow = AttrDict(gr)
 
 
 @VisiData.api

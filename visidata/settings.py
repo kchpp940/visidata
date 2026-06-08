@@ -33,9 +33,7 @@ class SettingsMgr(collections.OrderedDict):
         elif inspect.isclass(obj) and issubclass(obj, BaseSheet):
             v = obj.__name__
         elif isinstance(obj, os.PathLike):
-            v = getattr(obj, 'given', None)
-            if v is None:
-                v = str(obj)
+            v = str(obj)
         elif inspect.isclass(obj) and issubclass(obj, os.PathLike):
             v = obj.__name__
         else:

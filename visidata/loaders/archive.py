@@ -78,10 +78,7 @@ Commands:
     def openRow(self, row):
             fi, zpath = row
             fp = self.openZipFile(self.zfp, fi)
-            inner_path = Path(fi.filename, fp=fp, filesize=fi.file_size)
-            inner_path.innerpath = fi.filename
-            inner_path.archive_source = str(self.source)
-            return vd.openSource(inner_path)
+            return vd.openSource(Path(fi.filename, fp=fp, filesize=fi.file_size))
 
     def extract(self, *rows, path=None):
         path = path or Path('.')
@@ -164,10 +161,7 @@ class TarSheet(Sheet):
 
     def openRow(self, fi):
             tfp = tarfile.open(name=str(self.source))
-            inner_path = Path(fi.name, fp=tfp.extractfile(fi), filesize=fi.size)
-            inner_path.innerpath = fi.name
-            inner_path.archive_source = str(self.source)
-            return vd.openSource(inner_path)
+            return vd.openSource(Path(fi.name, fp=tfp.extractfile(fi), filesize=fi.size))
 
     def iterload(self):
         with tarfile.open(name=str(self.source)) as tf:
