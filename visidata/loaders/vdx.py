@@ -104,25 +104,20 @@ def save_vdx(vd, p, *vsheets):
             for r in vs.rows:
                 if r.longname in ('set-option', 'unset-option'):
                     scope = r.sheet or r.col or 'global'
-                    if _is_path_scope(scope) or (r.sheet and r.sheet not in ('global', 'default', 'override')):
-                        optname = r.row or ''
-                        optval = r.input or ''
-                        if r.longname == 'set-option':
-                            fp.write(f'option {scope} {optname} {optval}\n')
-                        else:
-                            fp.write(f'unset-option {scope} {optname}\n')
-                        prevrow = r
-                        continue
+                    optname = r.row or ''
+                    optval = r.input or ''
+                    if r.longname == 'set-option':
+                        fp.write(f'option {scope} {optname} {optval}\n')
+                    else:
+                        fp.write(f'unset-option {scope} {optname}\n')
+                    prevrow = r
+                    continue
 
-                clean_sheet = _clean_sheet(r.sheet)
-                prev_clean_sheet = _clean_sheet(prevrow.sheet) if prevrow else None
-                if prevrow is not None and clean_sheet and prev_clean_sheet != clean_sheet:
-                    fp.write(f'sheet {clean_sheet}\n')
+                if r.sheet and (prevrow is None or prevrow.sheet != r.sheet):
+                    fp.write(f'sheet {r.sheet}\n')
 
-                clean_col = _clean_col(r.col)
-                prev_clean_col = _clean_col(prevrow.col) if prevrow else None
-                if clean_col and (prevrow is None or prev_clean_col != clean_col):
-                    fp.write(f'col {clean_col}\n')
+                if r.col and (prevrow is None or prevrow.col != r.col):
+                    fp.write(f'col {r.col}\n')
                 if r.row and (prevrow is None or prevrow.row != r.row):
                     fp.write(f'row {r.row}\n')
 

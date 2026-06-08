@@ -404,8 +404,33 @@ def set_x(sheet, s):
     sheet.zoomTo(BoundingBox(xmin, sheet.visibleBox.ymin, xmax, sheet.visibleBox.ymax))
     sheet.refresh()
 
+@Canvas.api
+def set_view(sheet, s):
+    'Set the exact visible bounding box. Args: xmin ymin xmax ymax (space-separated).'
+    parts = s.split()
+    if len(parts) != 4:
+        vd.fail('set-view requires xmin ymin xmax ymax')
+    xmin, ymin, xmax, ymax = map(float, parts)
+    sheet.zoomTo(BoundingBox(xmin, ymin, xmax, ymax))
+    sheet.refresh()
+
+@GraphSheet.api
+def set_reflines_x(sheet, s):
+    'Set all x reference lines at once. Args: space-separated x-values.'
+    xtype = vd.numericCols(sheet.xcols)[0].type if vd.numericCols(sheet.xcols) else float
+    sheet.reflines_x = [xtype(x) for x in s.split()]
+    sheet.refresh()
+
+@GraphSheet.api
+def set_reflines_y(sheet, s):
+    'Set all y reference lines at once. Args: space-separated y-values.'
+    ytype = sheet.ycols[0].type if sheet.ycols else float
+    sheet.reflines_y = [ytype(y) for y in s.split()]
+    sheet.refresh()
+
 Canvas.addCommand('y', 'resize-y-input', 'sheet.set_y(input("set ymin ymax="))', 'set ymin/ymax on graph axes')
 Canvas.addCommand('x', 'resize-x-input', 'sheet.set_x(input("set xmin xmax="))', 'set xmin/xmax on graph axes')
+Canvas.addCommand(None, 'set-view', 'sheet.set_view(input("set xmin ymin xmax ymax="))', 'set exact visible view bounds on canvas')
 
 GraphSheet.addCommand('gx', 'draw-refline-x', 'sheet.draw_refline_x()', 'draw a vertical line at x-values (space-separated)')
 GraphSheet.addCommand('gy', 'draw-refline-y', 'sheet.draw_refline_y()', 'draw a horizontal line at y-values (space-separated)')
@@ -413,6 +438,8 @@ GraphSheet.addCommand('zx', 'erase-refline-x', 'sheet.erase_refline_x()', 'remov
 GraphSheet.addCommand('zy', 'erase-refline-y', 'sheet.erase_refline_y()', 'remove a vertical line at y-values (space-separated)')
 GraphSheet.addCommand('gzx', 'erase-reflines-x', 'sheet.reflines_x = []; sheet.refresh()', 'erase all vertical x-value lines')
 GraphSheet.addCommand('gzy', 'erase-reflines-y', 'sheet.reflines_y = []; sheet.refresh()', 'erase any horizontal y-value lines')
+GraphSheet.addCommand(None, 'set-reflines-x', 'sheet.set_reflines_x(input("set x reflines (space-separated): "))', 'set all x-axis reference lines')
+GraphSheet.addCommand(None, 'set-reflines-y', 'sheet.set_reflines_y(input("set y reflines (space-separated): "))', 'set all y-axis reference lines')
 
 @GraphSheet.after
 def reload(sheet):

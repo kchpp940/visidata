@@ -255,18 +255,24 @@ class CommandLogBase:
     def openHook(self, vs, src):
         while isinstance(src, BaseSheet):
             src = src.source
-        r = self.newRow(keystrokes='o', input=str(src), longname='open-file', replayable=True)
+        if isinstance(src, os.PathLike):
+            srcpath = Path(src)
+            srcgiven = srcpath.given
+        else:
+            srcpath = None
+            srcgiven = str(src)
+        r = self.newRow(keystrokes='o', input=srcgiven, longname='open-file', replayable=True)
         vs.cmdlog_sheet.addRow(r)
         self.addRow(r)
 
-        if isinstance(src, os.PathLike):
-            srcpath = Path(src)
+        if srcpath is not None:
             srcname = str(srcpath)
+            srcoptions = srcpath.options
             for optname in list(vd._options.keys()):
                 optdef = vd._options._get(optname, 'default')
                 if not optdef or not optdef.replayable:
                     continue
-                val = vd._options.getonly(optname, srcpath, None)
+                val = srcoptions.getonly(optname, srcpath, None)
                 if val is None:
                     continue
                 if val == optdef.value:
