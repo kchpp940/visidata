@@ -77,7 +77,6 @@ class GraphSheet(InvertedCanvas):
 
     def __init__(self, *names, **kwargs):
         self.ylabel_maxw = 0
-        super().__init__(*names, **kwargs)
 
         self.reflines_x = []
         self.reflines_y = []
@@ -85,6 +84,8 @@ class GraphSheet(InvertedCanvas):
         self.reflines_char_y = {}
         self._reflines_dirty = True
         self._reflines_signature = None
+
+        super().__init__(*names, **kwargs)
 
         if not vd.numericCols(self.xcols):
             if self.xcols:
@@ -131,8 +132,14 @@ class GraphSheet(InvertedCanvas):
     def resetCanvasDimensions(self, windowHeight, windowWidth):
         if self.left_margin < self.ylabel_maxw:
             self.left_margin = self.ylabel_maxw
-        self._mark_reflines_dirty()
+        old_sig = self._reflines_signature
         super().resetCanvasDimensions(windowHeight, windowWidth)
+        if old_sig is not None:
+            curr_sig = self._compute_reflines_signature()
+            if curr_sig != old_sig:
+                self._mark_reflines_dirty()
+        else:
+            self._mark_reflines_dirty()
 
     @asyncthread
     def reload(self):
@@ -216,9 +223,15 @@ class GraphSheet(InvertedCanvas):
                     scr.addstr(char_y, char_x, ch, cattr.attr)
 
     def resetBounds(self, refresh=True):
-        self._mark_reflines_dirty()
+        old_sig = self._reflines_signature
         super().resetBounds(refresh=False)
         self.createLabels()
+        if old_sig is not None:
+            curr_sig = self._compute_reflines_signature()
+            if curr_sig != old_sig:
+                self._mark_reflines_dirty()
+        else:
+            self._mark_reflines_dirty()
         if refresh:
             self.refresh()
 
@@ -229,7 +242,8 @@ class GraphSheet(InvertedCanvas):
         return True
 
     def plot_elements(self, invert_y=True):
-        self.plot_reflines()
+        if self._reflines_dirty:
+            self.plot_reflines()
         super().plot_elements(invert_y=True)
 
     def plot_reflines(self):
