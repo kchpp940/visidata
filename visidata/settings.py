@@ -233,9 +233,6 @@ class OptionsObject:
                 if obj != 'default' and type(obj) is not type:  # default and class options set on init aren't recorded
                     if vd.cmdlog:
                         self.add_option_to_cmdlogs(obj, optname, value, 'set-option')
-
-            if curval != value and obj != 'default' and type(obj) is not type:
-                self._persist_option(optname, value, obj)
         else:
             curval = None
             vd.warning(f'setting unknown option `{optname}`')
@@ -250,36 +247,7 @@ class OptionsObject:
         if vd.cmdlog and opt and opt.replayable:
             self.add_option_to_cmdlogs(obj, optname, value='', longname='unset-option')
         self._cache.clear()  # invalidate entire cache on any change
-        self._unpersist_option(optname, obj)
         return v
-
-    def _persist_option(self, optname, value, obj):
-        'Write option to the unified options StateStore (if available).'
-        try:
-            store = vd.optionsStore
-            objname = self._opts.objname(obj)
-            rec_id = f'opt_{objname}_{optname}'
-            store.add({
-                '_id': rec_id,
-                '_scope': objname,
-                'optname': optname,
-                'value': value,
-                'scope': objname,
-            })
-            store.save()
-        except Exception:
-            pass
-
-    def _unpersist_option(self, optname, obj):
-        'Remove option from the unified options StateStore (if available).'
-        try:
-            store = vd.optionsStore
-            objname = self._opts.objname(obj)
-            rec_id = f'opt_{objname}_{optname}'
-            if store.remove(rec_id):
-                store.save()
-        except Exception:
-            pass
 
     def add_option_to_cmdlogs(self, obj, optname, value='', longname='set-option'):
         'Records option-set on cmdlogs'

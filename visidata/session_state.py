@@ -1,24 +1,34 @@
 '''Unified session state persistence for VisiData.
 
-Provides a common StateStore interface used by options, macros, cmdlog,
-profiles, named selections, cache manifest, and graph state.
+This module provides two core abstractions:
 
-Standard record envelope (all optional):
+**StateDescriptor** -- the common interface that every piece of session state
+(options, cmdlog, macros, selections, cache manifest, graph state, etc.)
+must implement.  Each descriptor has a name, a restore *phase*, and five
+operations:  ``describe``, ``restore``, ``persist``, ``get_state``, ``set_state``.
+
+**StateStore** -- a concrete ``StateDescriptor`` that stores a collection of
+records as JSON Lines on disk.  Simple record-based state (options, selections,
+cache manifest, graph reflines) can use ``StateStore`` directly.  More complex
+state (cmdlog with its replay semantics, macros with per-macro .vdj files)
+wraps a ``StateStore`` in a custom ``StateDescriptor`` that knows how to
+translate between the on-disk records and the live in-memory objects.
+
+Standard record envelope (all optional, auto-filled by ``StateStore.add``):
     _v      -- schema version of this record (int)
     _ts     -- ISO-8601 timestamp when record was written
     _id     -- stable unique identifier (string)
     _scope  -- sheet/global context where this record applies
 
-Standard store features:
-    - JSON Lines backend (backwards compatible with plain JSONL records)
-    - Sensitive field redaction on save (opt-in via ``sensitive_fields``)
-    - Relative path normalization against ``vd.data_dir``
-    - Ordered restore phases (StatePhase enum)
+Standard restore phases (lower = restored earlier):
+    OPTIONS (10) -> PROFILES (20) -> MACROS (30) -> SELECTIONS (40) ->
+    CACHE (50) -> GRAPH (60) -> LAYOUT (70)
 '''
 
 import json
 import os
 import time
+from abc import ABC, abstractmethod
 from copy import copy
 from datetime import datetime, timezone
 
@@ -37,13 +47,13 @@ class StatePhase:
     '''Ordered phases for session state restoration.
     Lower-numbered phases are restored before higher-numbered ones.
     '''
-    OPTIONS   = 10   # options, global settings
-    PROFILES  = 20   # user profiles, environment
-    MACROS    = 30   # macros and custom commands (need options first)
-    SELECTIONS = 40  # named selections (need sheets loaded)
-    CACHE     = 50   # cache manifest
-    GRAPH     = 60   # graph state (reflines, viewport)
-    LAYOUT    = 70   # window/layout state (restored last)
+    OPTIONS    = 10   # options, global settings
+    PROFILES   = 20   # user profiles, environment
+    MACROS     = 30   # macros and custom commands (need options first)
+    SELECTIONS = 40   # named selections (need sheets loaded)
+    CACHE      = 50   # cache manifest
+    GRAPH      = 60   # graph state (reflines, viewport)
+    LAYOUT     = 70   # window/layout state (restored last)
 
     _order = [OPTIONS, PROFILES, MACROS, SELECTIONS, CACHE, GRAPH, LAYOUT]
 
@@ -51,6 +61,92 @@ class StatePhase:
     def all_phases(cls):
         return sorted(cls._order)
 
+    @classmethod
+    def phase_name(cls, phase_val: int) -> str:
+        for name, val in vars(cls).items():
+            if isinstance(val, int) and val == phase_val:
+                return name
+        return f'PHASE_{phase_val}'
+
+
+# ---------------------------------------------------------------------------
+# StateDescriptor -- the common interface
+# ---------------------------------------------------------------------------
+
+class StateDescriptor(ABC):
+    '''Abstract interface implemented by every piece of session state.
+
+    Subclasses must define ``name`` (str) and ``phase`` (StatePhase value),
+    and implement the five lifecycle methods.
+    '''
+
+    name: str = ''
+    phase: int = StatePhase.LAYOUT
+
+    # -- lifecycle ---------------------------------------------------------
+
+    @abstractmethod
+    def describe(self) -> dict:
+        '''Return a JSON-serialisable dict describing this state bundle.
+
+        At minimum should contain keys ``name``, ``phase``, ``phase_name``
+        and ``kind`` (a short label like "records", "cmdlog", "options").
+        '''
+        ...
+
+    @abstractmethod
+    def restore(self) -> None:
+        '''Load persisted state from disk and apply it to the live session.
+
+        Called on startup (in ``phase`` order) and on explicit user request.
+        Must be idempotent.
+        '''
+        ...
+
+    @abstractmethod
+    def persist(self) -> None:
+        '''Capture the current live state and write it to persistent storage.
+
+        Called on explicit user request (e.g. ``save-session``).  May also be
+        called automatically by the descriptor on every change.
+        '''
+        ...
+
+    @abstractmethod
+    def get_state(self):
+        '''Return the current in-memory state (for inspection / debug).'''
+        ...
+
+    @abstractmethod
+    def set_state(self, state) -> None:
+        '''Replace the current in-memory state with *state*.'''
+        ...
+
+    # -- convenience -------------------------------------------------------
+
+    def register(self):
+        '''Register this descriptor with the global registry so it is
+        included in ``restoreAllState`` / ``persistAllState`` / ``describeAllState``.
+        '''
+        if not hasattr(vd, '_state_descriptors'):
+            vd._state_descriptors = {}
+        vd._state_descriptors.setdefault(self.phase, [])
+        if self not in vd._state_descriptors[self.phase]:
+            vd._state_descriptors[self.phase].append(self)
+        return self
+
+    # Backwards-compat alias -- old code used ``register_for_restore``.
+    # Deprecated; prefer ``register``.
+    def register_for_restore(self):
+        return self.register()
+
+    def __repr__(self):
+        return f'<{type(self).__name__} {self.name!r} phase={StatePhase.phase_name(self.phase)}>'
+
+
+# ---------------------------------------------------------------------------
+# StateStore -- JSONL-backed record store that implements StateDescriptor
+# ---------------------------------------------------------------------------
 
 def _is_sensitive_field(name: str) -> bool:
     '''Return True if *name* looks like it holds a sensitive value.'''
@@ -76,54 +172,84 @@ def _redact_value(v):
     return v
 
 
-class StateStore:
-    '''Abstract base for a persistent keyed collection of state records.
+class StateStore(StateDescriptor):
+    '''Persistent keyed collection of state records, stored as JSON Lines.
 
-    Subclasses must implement ``_read_records``, ``_write_records``, and
-    may override ``_serialize`` / ``_deserialize``.
-
-    Each record is a dict-like (AttrDict) with a standard envelope:
-        _v, _ts, _id, _scope
-    plus caller-supplied data fields.
+    Implements the full ``StateDescriptor`` interface.  Each record is a
+    dict-like (``AttrDict``) with a standard envelope ``_v``, ``_ts``, ``_id``,
+    ``_scope`` plus caller-supplied data fields.
     '''
 
-    phase = StatePhase.LAYOUT
+    kind = 'records'
     sensitive_fields = ()  # tuple of field names to redact on save
 
-    def __init__(self, name: str, **kwargs):
+    def __init__(self, name: str, phase: int = StatePhase.LAYOUT, **kwargs):
         self.name = name
+        self.phase = phase
         self._records = []
         self._by_id = {}
         self._dirty = False
         for k, v in kwargs.items():
             setattr(self, k, v)
 
-    # -- path helpers ---------------------------------------------------
+    # -- StateDescriptor interface ----------------------------------------
+
+    def describe(self) -> dict:
+        return {
+            'name': self.name,
+            'phase': self.phase,
+            'phase_name': StatePhase.phase_name(self.phase),
+            'kind': self.kind,
+            'path': str(self.path) if self.path else None,
+            'record_count': len(self._records),
+        }
+
+    def restore(self) -> None:
+        self.reload()
+
+    def persist(self) -> None:
+        self.save()
+
+    def get_state(self):
+        return [dict(r) for r in self._records]
+
+    def set_state(self, state) -> None:
+        self._records = []
+        self._by_id = {}
+        for rec in state or []:
+            self.add(rec)
+        self._dirty = True
+
+    # -- path helpers -----------------------------------------------------
 
     @property
     def path(self) -> Path:
-        vdpath = vd.data_dir
+        try:
+            vdpath = vd.data_dir
+        except Exception:
+            return None
         if not vdpath.exists():
-            if vd.options.nothing:
+            try:
+                if vd.options.nothing:
+                    return None
+                vdpath.mkdir(parents=True)
+            except Exception:
                 return None
-            vdpath.mkdir(parents=True)
         return vdpath / (self.name + '.jsonl')
 
     def _normalize_relative_paths(self, record, base_path=None):
-        '''Convert absolute paths inside record to relative against *base_path*.'''
         base = base_path or (self.path.parent if self.path else None)
         if not base:
             return record
         return _walk_paths(record, lambda p: _relpath_if_under(p, base))
 
     def _resolve_relative_paths(self, record, base_path=None):
-        '''Resolve relative paths inside record against *base_path*.'''
         base = base_path or (self.path.parent if self.path else None)
         if not base:
             return record
         return _walk_paths(record, lambda p: _abspath_if_relative(p, base))
 
-    # -- core CRUD ------------------------------------------------------
+    # -- core CRUD --------------------------------------------------------
 
     def reload(self):
         '''(Re)load all records from disk.'''
@@ -150,7 +276,7 @@ class StateStore:
         return self._by_id.get(id, default)
 
     def add(self, record):
-        '''Add or replace a record.  ``record`` is dict-like.'''
+        '''Add or replace a record.  ``record`` is dict-like.  Returns it with envelope.'''
         if not isinstance(record, AttrDict):
             record = AttrDict(record)
         self._ensure_envelope(record)
@@ -187,7 +313,12 @@ class StateStore:
                 fp.write(self._serialize(rec) + '\n')
         self._dirty = False
 
-    # -- subclass hooks -------------------------------------------------
+    # -- internal helpers -------------------------------------------------
+
+    def _register(self, rec):
+        self._records.append(rec)
+        if rec.get('_id'):
+            self._by_id[rec._id] = rec
 
     def _ensure_envelope(self, rec):
         rec.setdefault('_v', STATE_VERSION)
@@ -197,7 +328,6 @@ class StateStore:
             rec['_id'] = f'{self.name}-{len(self._records)}-{int(time.time()*1000)}'
 
     def _deserialize(self, line: str):
-        '''Parse one line from the backing store into a record dict.'''
         obj = json.loads(line)
         if isinstance(obj, dict):
             obj = AttrDict(obj)
@@ -206,35 +336,23 @@ class StateStore:
         return AttrDict(data=obj)
 
     def _serialize(self, record) -> str:
-        '''Convert one record to its on-disk string representation.'''
         out = self._normalize_relative_paths(dict(record))
         out = self._redact(out)
         return json.dumps(out, ensure_ascii=False, default=str)
 
     def _redact(self, record: dict) -> dict:
-        '''Return a shallow copy with sensitive fields replaced.'''
-        if not self.sensitive_fields:
+        if not self.sensitive_fields and not any(_is_sensitive_field(k) for k in record):
             return record
         out = dict(record)
         for fname in self.sensitive_fields:
             if fname in out:
                 out[fname] = _redact_value(out[fname])
-        # also auto-redact fields whose names look sensitive
         for k, v in list(out.items()):
             if _is_sensitive_field(k):
                 out[k] = _redact_value(v)
         return out
 
-    # -- registration with global restore manager ----------------------
-
-    def register_for_restore(self):
-        '''Register this store so it is reloaded on startup in the right phase.'''
-        if not hasattr(vd, '_state_stores'):
-            vd._state_stores = {}
-        vd._state_stores.setdefault(self.phase, []).append(self)
-        return self
-
-    # -- list compatibility (backwards compat with StoredList) ---------
+    # -- list compatibility (backwards compat with StoredList) ------------
 
     def __iter__(self):
         return iter(self._records)
@@ -252,7 +370,6 @@ class StateStore:
         self._dirty = True
 
     def append(self, v):
-        '''Drop-in compatible with ``list.append`` / ``StoredList.append``.'''
         self.add(v)
 
 
@@ -284,7 +401,6 @@ def _relpath_if_under(pathstr: str, base: Path) -> str:
         abs_p = p if p.is_absolute() else base_p / p
         if not abs_p.is_absolute():
             return pathstr
-        # try to make relative; fall back to original
         common = os.path.commonpath([str(abs_p), str(base_p)])
         if common:
             return os.path.relpath(str(abs_p), str(base_p))
@@ -303,68 +419,148 @@ def _abspath_if_relative(pathstr: str, base: Path) -> str:
     return pathstr
 
 
-# -- global restore manager -----------------------------------------------
+# ---------------------------------------------------------------------------
+# Global descriptor registry and orchestration
+# ---------------------------------------------------------------------------
+
+VisiData.init('_state_descriptors', dict)  # phase -> [StateDescriptor]
+VisiData.init('_state_stores', dict)       # legacy alias, kept for compat
+
 
 @VisiData.api
-def restoreState(vd, phases=None):
-    '''Reload all registered StateStores, in phase order.'''
+def describeAllState(vd) -> list:
+    '''Return a list of ``describe()`` dicts for every registered state
+    descriptor, sorted by phase.  Useful for debugging and UI.
+    '''
+    out = []
+    for phase in sorted(vd._state_descriptors.keys()):
+        for desc in vd._state_descriptors[phase]:
+            try:
+                out.append(desc.describe())
+            except Exception as e:
+                out.append({'name': getattr(desc, 'name', '?'), 'phase': phase,
+                            'phase_name': StatePhase.phase_name(phase),
+                            'error': str(e)})
+    return out
+
+
+@VisiData.api
+def restoreAllState(vd, phases=None) -> None:
+    '''Call ``restore()`` on every registered state descriptor, in phase order.
+
+    If *phases* is given, only descriptors whose phase is in the set/list
+    are restored.  Called automatically from the ``run`` startup hook.
+    '''
     if phases is None:
         phases = StatePhase.all_phases()
-    for phase in sorted(phases):
-        for store in vd._state_stores.get(phase, []):
-            vd.callNoExceptions(store.reload)
-
-
-VisiData.init('_state_stores', dict)  # phase -> [StateStore]
-
-
-# -- backwards-compatible StoredList lives in visidata.stored_list  -------
-#    (see stored_list.py) which subclasses StateStore.
-
-
-# -- convenience: define some standard stores -----------------------------
-
-@VisiData.lazy_property
-def optionsStore(vd):
-    '''Persistent store for global option overrides.'''
-    store = StateStore(name='options')
-    store.phase = StatePhase.OPTIONS
-    store.sensitive_fields = ()  # auto-detect redaction handles tokens etc.
-    store.register_for_restore()
-    return store
-
-
-@VisiData.lazy_property
-def profilesStore(vd):
-    '''Persistent store for user profiles.'''
-    store = StateStore(name='profiles')
-    store.phase = StatePhase.PROFILES
-    store.register_for_restore()
-    return store
-
-
-@VisiData.lazy_property
-def cacheManifest(vd):
-    '''Persistent store mapping cache keys to metadata.'''
-    store = StateStore(name='cache_manifest')
-    store.phase = StatePhase.CACHE
-    store.register_for_restore()
-    return store
-
-
-@VisiData.lazy_property
-def graphStateStore(vd):
-    '''Persistent store for per-sheet graph view state (reflines, viewport).'''
-    store = StateStore(name='graph_state')
-    store.phase = StatePhase.GRAPH
-    store.register_for_restore()
-    return store
+    phases = set(phases)
+    for phase in sorted(vd._state_descriptors.keys()):
+        if phase not in phases:
+            continue
+        for desc in vd._state_descriptors.get(phase, []):
+            vd.callNoExceptions(desc.restore)
 
 
 @VisiData.api
-def applyPersistedOptions(vd):
-    '''Apply option values that were persisted to optionsStore.'''
-    try:
+def persistAllState(vd, phases=None) -> None:
+    '''Call ``persist()`` on every registered state descriptor, in phase order.'''
+    if phases is None:
+        phases = StatePhase.all_phases()
+    phases = set(phases)
+    for phase in sorted(vd._state_descriptors.keys()):
+        if phase not in phases:
+            continue
+        for desc in vd._state_descriptors.get(phase, []):
+            vd.callNoExceptions(desc.persist)
+
+
+# Legacy name alias -- ``restoreState`` used to only reload StateStores; now
+# it is a thin wrapper over ``restoreAllState`` which handles all descriptors.
+@VisiData.api
+def restoreState(vd, phases=None):
+    vd.restoreAllState(phases=phases)
+
+
+# ---------------------------------------------------------------------------
+# OptionsState -- manages option persistence via StateStore + legacy .visidatarc
+# ---------------------------------------------------------------------------
+
+class OptionsState(StateDescriptor):
+    '''StateDescriptor for VisiData options.
+
+    Primary persistence: ``optionsStore`` (JSON Lines under the data dir).
+    Legacy compatibility:  on first-run migration, reads any existing
+    ``.visidatarc`` and imports the ``options.name=value`` assignments into
+    the new JSONL store.  After migration the .visidatarc is not written to
+    by the unified persistence path (though ``OptionsSheet.commit`` still
+    appends to it for backwards compatibility with users who rely on it).
+    '''
+
+    name = 'options'
+    phase = StatePhase.OPTIONS
+    kind = 'options'
+
+    def describe(self) -> dict:
+        return {
+            'name': self.name,
+            'phase': self.phase,
+            'phase_name': StatePhase.phase_name(self.phase),
+            'kind': self.kind,
+            'store_path': str(vd.optionsStore.path) if vd.optionsStore.path else None,
+            'store_records': len(vd.optionsStore.all()),
+            'legacy_config': vd.options.config,
+        }
+
+    def restore(self) -> None:
+        '''Reload the options JSONL store, then apply every record to the
+        live options object.  On first run (store empty, legacy config has
+        content), attempt a one-way migration from .visidatarc.
+        '''
+        store = vd.optionsStore
+        store.restore()  # reload JSONL
+
+        if not store.all():
+            self._migrate_from_visidatarc()
+
+        self.applyToLive()
+
+    def persist(self) -> None:
+        '''Snapshot all current non-default option overrides into the store
+        and write to disk.
+        '''
+        store = vd.optionsStore
+        # collect overrides from vd.options._opts
+        try:
+            for optname, scopedict in vd.options._opts.items():
+                for scope, opt in scopedict.items():
+                    if scope in ('default',):
+                        continue
+                    default_opt = scopedict.get('default')
+                    default_val = default_opt.value if default_opt else None
+                    if opt.value == default_val:
+                        continue
+                    rec_id = f'opt_{scope}_{optname}'
+                    store.add({
+                        '_id': rec_id,
+                        '_scope': scope,
+                        'optname': optname,
+                        'value': opt.value,
+                        'scope': scope,
+                    })
+        except Exception as e:
+            vd.debug(f'options.persist: {e}')
+        store.save()
+
+    def get_state(self):
+        return vd.optionsStore.get_state()
+
+    def set_state(self, state) -> None:
+        vd.optionsStore.set_state(state)
+        self.applyToLive()
+
+    # -- helpers ----------------------------------------------------------
+
+    def applyToLive(self) -> None:
         store = vd.optionsStore
         for rec in store.all():
             optname = rec.get('optname')
@@ -381,22 +577,205 @@ def applyPersistedOptions(vd):
                         vs.options.set(optname, value, vs, cmdlog=False)
             except Exception as e:
                 vd.debug(f'failed to apply persisted option {optname}: {e}')
-    except Exception as e:
-        vd.debug(f'failed to apply persisted options: {e}')
 
+    def _migrate_from_visidatarc(self) -> None:
+        '''Best-effort one-way import of ``options.name=value`` lines from
+        the user's .visidatarc into the new JSONL store.
+        '''
+        try:
+            cfg_path = Path(vd.options.config)
+            if not cfg_path.exists():
+                return
+            store = vd.optionsStore
+            imported = 0
+            with cfg_path.open(encoding='utf-8') as fp:
+                for line in fp:
+                    line = line.strip()
+                    # match: options.<name>=<python literal>
+                    if line.startswith('options.') and '=' in line:
+                        rest = line[len('options.'):]
+                        eq = rest.index('=')
+                        optname = rest[:eq].strip()
+                        valstr = rest[eq+1:].strip()
+                        try:
+                            import ast
+                            value = ast.literal_eval(valstr)
+                        except Exception:
+                            value = valstr
+                        rec_id = f'opt_global_{optname}'
+                        store.add({
+                            '_id': rec_id,
+                            '_scope': 'global',
+                            'optname': optname,
+                            'value': value,
+                            'scope': 'global',
+                        })
+                        imported += 1
+            if imported:
+                store.save()
+                vd.status(f'imported {imported} options from {cfg_path}')
+        except Exception as e:
+            vd.debug(f'visidatarc migration: {e}')
+
+
+@VisiData.lazy_property
+def optionsState(vd):
+    desc = OptionsState()
+    desc.register()
+    return desc
+
+
+# ---------------------------------------------------------------------------
+# CmdlogState -- manages command log persistence
+# ---------------------------------------------------------------------------
+
+class CmdlogState(StateDescriptor):
+    '''StateDescriptor for the command log.
+
+    Primary persistence: ``cmdlogStore`` (JSON Lines of cmdlog rows under
+    the data dir).  The legacy ``.vd`` (TSV), ``.vdj`` (JSONL), and ``.vdx``
+    (simple text) formats are kept as *import/export* formats only -- they
+    are read by ``open_vd`` / ``open_vdj`` / ``open_vdx`` and written by
+    ``save_vd`` / ``save_vdj`` / ``save_vdx``, but the unified session
+    persistence always goes through ``cmdlogStore``.
+    '''
+
+    name = 'cmdlog'
+    phase = StatePhase.LAYOUT
+    kind = 'cmdlog'
+
+    def describe(self) -> dict:
+        return {
+            'name': self.name,
+            'phase': self.phase,
+            'phase_name': StatePhase.phase_name(self.phase),
+            'kind': self.kind,
+            'store_path': str(vd.cmdlogStore.path) if vd.cmdlogStore.path else None,
+            'store_records': len(vd.cmdlogStore.all()),
+            'live_rows': len(vd.cmdlog.rows),
+        }
+
+    def restore(self) -> None:
+        '''Reload cmdlog rows from ``cmdlogStore`` into the live cmdlog sheet.'''
+        store = vd.cmdlogStore
+        store.restore()
+        # Load records into the live vd.cmdlog, but only if it is empty so
+        # we don't clobber commands already typed during startup.
+        if not vd.cmdlog.rows:
+            for rec in store.all():
+                try:
+                    row = vd.cmdlog.newRow(**{k: rec.get(k) for k in
+                        ['sheet', 'col', 'row', 'longname', 'input',
+                         'keystrokes', 'comment', 'undofuncs'] if k in rec})
+                    vd.cmdlog.addRow(row)
+                except Exception as e:
+                    vd.debug(f'cmdlog.restore row: {e}')
+
+    def persist(self) -> None:
+        '''Snapshot the live cmdlog rows into the JSONL store and save.'''
+        store = vd.cmdlogStore
+        for i, r in enumerate(vd.cmdlog.rows):
+            rec = {
+                '_id': f'cmdlog_{i}',
+                '_scope': r.sheet or 'global',
+                'sheet': r.sheet,
+                'col': r.col,
+                'row': r.row,
+                'longname': r.longname,
+                'input': r.input,
+                'keystrokes': r.keystrokes,
+                'comment': r.comment,
+            }
+            store.add(rec)
+        store.save()
+
+    def get_state(self):
+        return vd.cmdlogStore.get_state()
+
+    def set_state(self, state) -> None:
+        vd.cmdlogStore.set_state(state)
+        self.restore()
+
+
+@VisiData.lazy_property
+def cmdlogStore(vd):
+    '''Backing StateStore for the command log.'''
+    store = StateStore(name='cmdlog', phase=StatePhase.LAYOUT)
+    store.register()
+    return store
+
+
+@VisiData.lazy_property
+def cmdlogState(vd):
+    desc = CmdlogState()
+    desc.register()
+    return desc
+
+
+# ---------------------------------------------------------------------------
+# Standard stores (wired through the descriptor registry)
+# ---------------------------------------------------------------------------
+
+@VisiData.lazy_property
+def optionsStore(vd):
+    store = StateStore(name='options', phase=StatePhase.OPTIONS)
+    store.register()
+    return store
+
+
+@VisiData.lazy_property
+def profilesStore(vd):
+    store = StateStore(name='profiles', phase=StatePhase.PROFILES)
+    store.register()
+    return store
+
+
+@VisiData.lazy_property
+def cacheManifest(vd):
+    store = StateStore(name='cache_manifest', phase=StatePhase.CACHE)
+    store.register()
+    return store
+
+
+@VisiData.lazy_property
+def graphStateStore(vd):
+    store = StateStore(name='graph_state', phase=StatePhase.GRAPH)
+    store.register()
+    return store
+
+
+# ---------------------------------------------------------------------------
+# Startup hook
+# ---------------------------------------------------------------------------
 
 @VisiData.before
 @asyncthread
 def run(vd, *args, **kwargs):
-    '''Restore all registered state stores early in startup, then apply persisted options.'''
-    vd.restoreState()
-    vd.applyPersistedOptions()
+    '''Restore every registered StateDescriptor on startup, in phase order.'''
+    # Accessing these lazy_properties ensures they are registered.
+    vd.optionsState
+    vd.cmdlogState
+    vd.optionsStore
+    vd.profilesStore
+    vd.cacheManifest
+    vd.graphStateStore
+    vd.restoreAllState()
 
 
+# ---------------------------------------------------------------------------
+# Export the public API on the VisiData singleton and module globals
+# ---------------------------------------------------------------------------
+
+VisiData.StateDescriptor = StateDescriptor
 VisiData.StateStore = StateStore
 VisiData.StatePhase = StatePhase
+VisiData.OptionsState = OptionsState
+VisiData.CmdlogState = CmdlogState
 
 vd.addGlobals(
+    StateDescriptor=StateDescriptor,
     StateStore=StateStore,
     StatePhase=StatePhase,
+    OptionsState=OptionsState,
+    CmdlogState=CmdlogState,
 )
