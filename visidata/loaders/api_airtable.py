@@ -2,7 +2,7 @@ import re
 import os
 import json
 
-from visidata import vd, date, asyncthread, VisiData, Progress, Sheet, Column, ItemColumn, deduceType, TypedWrapper, setitem, AttrDict
+from visidata import vd, date, asyncthread, VisiData, Progress, Sheet, Column, ItemColumn, deduceType, TypedWrapper, setitem, AttrDict, CacheEntry
 
 
 vd.option('airtable_auth_token', '', 'Airtable API key from https://airtable.com/account')
@@ -21,24 +21,45 @@ def _airtable_cache_key(base, table, view):
     return f'airtable://{base}/{table}?view={view or "default"}'
 
 
-def _airtable_refresh(url):
+def _airtable_refresh_entry(entry: CacheEntry):
+    '''Refresh an Airtable cache entry using *only* the stored CacheEntry metadata.'''
     import pyairtable
-    from urllib.parse import urlparse, parse_qs
-    parsed = urlparse(url)
-    parts = parsed.path.strip('/').split('/')
-    base = parts[0] if len(parts) > 0 else ''
-    table = parts[1] if len(parts) > 1 else ''
-    view = parse_qs(parsed.query).get('view', ['default'])[0]
+    cfg = entry.source_config or {}
+    params = entry.request_params or {}
+    base = cfg.get('base') or params.get('base') or ''
+    table = cfg.get('table') or params.get('table') or ''
+    view = cfg.get('view') or params.get('view')
+    if view == 'default':
+        view = None
+
     token = os.environ.get('AIRTABLE_AUTH_TOKEN') or vd.options.airtable_auth_token
+    if not token:
+        vd.requireOptions('airtable_auth_token', help='https://support.airtable.com/docs/creating-and-using-api-keys-and-access-tokens')
+
     api = pyairtable.Api(token)
     records = []
-    for page in api.table(base, table).iterate(view=view if view != 'default' else None):
+    for page in api.table(base, table).iterate(view=view):
         records.extend(page)
-    return json.dumps(records).encode('utf-8')
+
+    data = json.dumps(records).encode('utf-8')
+    cached_path = vd.cache_manager._cache_path_for(entry.cache_key)
+    with cached_path.open_bytes(mode='w') as fpout:
+        fpout.write(data)
+
+    return vd.cache_manager.put(
+        entry.cache_key, cached_path,
+        source_type='airtable',
+        content_type='application/json',
+        cache_policy=entry.cache_policy,
+        source_config=entry.source_config,
+        request_params=entry.request_params,
+        response_format={'filetype': 'json', 'encoding': 'utf-8'},
+        auth_hint='env:AIRTABLE_AUTH_TOKEN / option:airtable_auth_token',
+        descr=entry.descr or f'Airtable {base}/{table}' + (f' view={view}' if view else ''),
+    )
 
 
-vd.cache_manager.register_source_handler('airtable', lambda url: vd.cache_open_api(
-    url, source_type='airtable', fetcher=lambda: _airtable_refresh(url)))
+vd.cache_manager.register_source_handler('airtable', _airtable_refresh_entry)
 
 
 @VisiData.api
@@ -76,6 +97,7 @@ class AirtableSheet(Sheet):
     def iterload(self):
         self.fields = set()
         cache_key = _airtable_cache_key(self.airtable_base, self.airtable_table, self.airtable_view)
+        descr = f'Airtable {self.airtable_base}/{self.airtable_table}' + (f' view={self.airtable_view}' if self.airtable_view else '')
 
         if vd.options.airtable_use_cache and vd.options.cache_enabled:
             def _fetch():
@@ -86,9 +108,15 @@ class AirtableSheet(Sheet):
                 return json.dumps(records).encode('utf-8')
             cached_path = vd.cache_open_api(
                 cache_key, source_type='airtable', fetcher=_fetch,
-                extra={'base': self.airtable_base, 'table': self.airtable_table, 'view': self.airtable_view})
+                source_config={'base': self.airtable_base, 'table': self.airtable_table,
+                                'view': self.airtable_view or 'default'},
+                request_params={'view': self.airtable_view},
+                response_format={'filetype': 'json', 'encoding': 'utf-8'},
+                auth_hint='env:AIRTABLE_AUTH_TOKEN / option:airtable_auth_token',
+                descr=descr,
+            )
             if getattr(cached_path, '_cache_hit', False):
-                vd.status(f'using cached airtable:{self.airtable_base}/{self.airtable_table}')
+                vd.status(f'using cached {descr}')
             with cached_path.open_bytes(mode='rb') as fp:
                 records = json.loads(fp.read().decode('utf-8'))
             for row in records:

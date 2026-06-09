@@ -6,7 +6,7 @@ A list of messages from [:underline]{sheet.sourcename}[/].
 - `a` to send a message to [:underline]{sheet.cursorRow.room.display_name}[/].
 '''
 
-from visidata import vd, VisiData, Sheet, Column, ItemColumn, date, asyncthread, AttrDict, vlen, Path
+from visidata import vd, VisiData, Sheet, Column, ItemColumn, date, asyncthread, AttrDict, vlen, Path, CacheEntry
 
 
 vd.option('matrix_token', '', 'matrix API token')
@@ -22,20 +22,43 @@ def _matrix_cache_key(kind, **params):
     return f'matrix://{kind}?params={hash(json.dumps(params, sort_keys=True))}'
 
 
-def _matrix_refresh(url):
+def _matrix_refresh_entry(entry: CacheEntry):
+    '''Refresh a Matrix cache entry using *only* the stored CacheEntry metadata.'''
     import json
     from urllib.parse import urlparse
-    parsed = urlparse(url)
-    kind = parsed.netloc
+    cfg = entry.source_config or {}
+    kind = cfg.get('kind') or urlparse(entry.cache_key).netloc
+    homeserver = cfg.get('homeserver') or ''
+
+    if not vd.matrix_client:
+        from matrix_client.client import MatrixClient
+        vd.matrix_client = MatrixClient(homeserver)
+        vd.matrix_client.token = vd.options.matrix_token
+
     results = []
     if kind == 'rooms' and vd.matrix_client:
         results = [{'room_id': r.room_id, 'display_name': r.display_name}
                    for r in vd.matrix_client.get_rooms().values()]
-    return json.dumps(results).encode('utf-8')
+
+    data = json.dumps(results).encode('utf-8')
+    cached_path = vd.cache_manager._cache_path_for(entry.cache_key)
+    with cached_path.open_bytes(mode='w') as fpout:
+        fpout.write(data)
+
+    return vd.cache_manager.put(
+        entry.cache_key, cached_path,
+        source_type='matrix',
+        content_type='application/json',
+        cache_policy=entry.cache_policy,
+        source_config=entry.source_config or {'kind': kind, 'homeserver': homeserver},
+        request_params=entry.request_params or {},
+        response_format={'filetype': 'json', 'encoding': 'utf-8'},
+        auth_hint='option:matrix_user_id / option:matrix_token',
+        descr=entry.descr or f'Matrix {kind} ({homeserver or "default"})',
+    )
 
 
-vd.cache_manager.register_source_handler('matrix', lambda url: vd.cache_open_api(
-    url, source_type='matrix', fetcher=lambda: _matrix_refresh(url)))
+vd.cache_manager.register_source_handler('matrix', _matrix_refresh_entry)
 
 
 @VisiData.api

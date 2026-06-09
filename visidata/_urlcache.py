@@ -20,11 +20,56 @@ _CACHE_STATUS_MISSING = 'missing'
 _CACHE_STATUS_STALE = 'stale'
 _CACHE_STATUS_ERROR = 'error'
 
+_SECRET_KEY_PATTERNS = (
+    'authorization', 'cookie', 'x-api-key', 'x-auth-token',
+    'token', 'secret', 'password', 'passwd', 'api_key', 'apikey',
+    'auth', 'client_secret', 'private_key',
+)
+
+
+def _is_secret_key(k: str) -> bool:
+    kl = k.lower().replace('-', '_').replace(' ', '_')
+    return any(p in kl for p in _SECRET_KEY_PATTERNS)
+
+
+def sanitize_headers(headers: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    '''Return a copy of headers with sensitive values replaced by [REDACTED].'''
+    if not headers:
+        return {}
+    out = {}
+    for k, v in headers.items():
+        if _is_secret_key(k):
+            out[k] = '[REDACTED]'
+        else:
+            out[k] = v
+    return out
+
+
+def mask_secrets(obj: Any) -> Any:
+    '''Recursively mask values whose keys look like credentials.'''
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if _is_secret_key(str(k)):
+                out[k] = '[REDACTED]'
+            else:
+                out[k] = mask_secrets(v)
+        return out
+    if isinstance(obj, list):
+        return [mask_secrets(x) for x in obj]
+    if isinstance(obj, tuple):
+        return tuple(mask_secrets(x) for x in obj)
+    return obj
+
 
 @dataclass
 class CacheEntry:
-    '''Metadata for a single cached remote resource.'''
-    url: str
+    '''Metadata for a single cached remote resource.
+
+    Fields are designed so that a refresh can be performed purely from the
+    stored entry -- without relying on any runtime loader state.
+    '''
+    cache_key: str
     local_path: str
     source_type: str = 'http'
     size: int = 0
@@ -37,7 +82,19 @@ class CacheEntry:
     last_accessed: float = field(default_factory=time.time)
     status: str = _CACHE_STATUS_OK
     status_msg: str = ''
+
+    source_config: Dict[str, Any] = field(default_factory=dict)
+    request_params: Dict[str, Any] = field(default_factory=dict)
+    response_format: Dict[str, Any] = field(default_factory=dict)
+    auth_hint: str = ''
+    descr: str = ''
+
     extra: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def url(self) -> str:
+        '''Backward-compatible alias for cache_key.'''
+        return self.cache_key
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -45,7 +102,10 @@ class CacheEntry:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> 'CacheEntry':
         valid_fields = cls.__dataclass_fields__
-        return cls(**{k: v for k, v in d.items() if k in valid_fields})
+        kwargs = {k: v for k, v in d.items() if k in valid_fields}
+        if 'cache_key' not in kwargs and 'url' in d:
+            kwargs['cache_key'] = d['url']
+        return cls(**kwargs)
 
     def is_expired(self) -> bool:
         if self.status == _CACHE_STATUS_MISSING:
@@ -62,6 +122,12 @@ class CacheEntry:
     def touch(self) -> None:
         self.last_accessed = time.time()
 
+    def summary(self) -> str:
+        '''Return a short human-readable summary.'''
+        if self.descr:
+            return self.descr
+        return f'{self.source_type}:{self.cache_key[:60]}'
+
 
 class CacheManager:
     '''Unified manager for remote resource caching.
@@ -69,6 +135,11 @@ class CacheManager:
     Maintains a persistent index of all cached resources with full metadata.
     All cache operations (refresh, remove, open, verify) MUST go through this
     manager -- individual loaders MUST NOT maintain their own cache state.
+
+    Refresh handlers receive the full CacheEntry, so they can reconstruct the
+    original request using only stored metadata (source_config, request_params,
+    auth_hint).  Secrets are never stored -- instead auth_hint tells the
+    handler which option / env var to read at refresh time.
     '''
 
     def __init__(self, cache_dir: Path):
@@ -76,7 +147,7 @@ class CacheManager:
         self.index_path = self.cache_dir / '_cache_index.json'
         self._entries: Dict[str, CacheEntry] = {}
         self._loaded = False
-        self._source_handlers: Dict[str, Callable] = {}
+        self._source_handlers: Dict[str, Callable[[CacheEntry], Path]] = {}
 
     def _ensure_dir(self) -> None:
         os.makedirs(self.cache_dir, exist_ok=True)
@@ -89,7 +160,7 @@ class CacheManager:
             try:
                 with open(self.index_path, 'r', encoding='utf-8') as fp:
                     data = json.load(fp)
-                self._entries = {url: CacheEntry.from_dict(d) for url, d in data.items()}
+                self._entries = {k: CacheEntry.from_dict(d) for k, d in data.items()}
             except Exception as e:
                 vd.warning(f'corrupt cache index, resetting: {e}')
                 self._entries = {}
@@ -97,24 +168,24 @@ class CacheManager:
 
     def _save(self) -> None:
         self._ensure_dir()
-        data = {url: entry.to_dict() for url, entry in self._entries.items()}
+        data = {entry.cache_key: entry.to_dict() for entry in self._entries.values()}
         tmp = self.index_path.with_suffix('.json.tmp')
         with open(tmp, 'w', encoding='utf-8') as fp:
             json.dump(data, fp, indent=2, default=str)
         os.replace(tmp, self.index_path)
 
-    def _cache_path_for(self, url: str) -> Path:
-        parsed = urllib.parse.urlparse(url)
-        safe_name = urllib.parse.quote(url, safe='')
+    def _cache_path_for(self, cache_key: str) -> Path:
+        parsed = urllib.parse.urlparse(cache_key)
+        safe_name = urllib.parse.quote(cache_key, safe='')
         if len(safe_name) > 180:
-            safe_name = hashlib.sha256(url.encode('utf-8')).hexdigest()
+            safe_name = hashlib.sha256(cache_key.encode('utf-8')).hexdigest()
             ext = os.path.splitext(parsed.path)[1]
             if ext:
                 safe_name += ext
         return self.cache_dir / safe_name
 
-    def _detect_source_type(self, url: str) -> str:
-        scheme = urllib.parse.urlparse(url).scheme.lower()
+    def _detect_source_type(self, cache_key: str) -> str:
+        scheme = urllib.parse.urlparse(cache_key).scheme.lower()
         if scheme in ('http', 'https'):
             return 'http'
         if scheme in ('s3',):
@@ -123,12 +194,13 @@ class CacheManager:
             return scheme
         return 'other'
 
-    def register_source_handler(self, source_type: str, refresher: Callable) -> None:
-        '''Register a callable refresher(url: str) -> Path for a given source_type.
+    def register_source_handler(self, source_type: str, refresher: Callable[[CacheEntry], Path]) -> None:
+        '''Register a callable refresher(entry: CacheEntry) -> Path.
 
-        The refresher must download (or re-download) the resource and return
-        the Path to the local cached file.  The manager will handle all metadata
-        bookkeeping.
+        The refresher receives the *full* stored CacheEntry and must be able to
+        rebuild the original request from ``entry.source_config``,
+        ``entry.request_params``, and the credential locations given in
+        ``entry.auth_hint``.  It must NOT rely on any runtime loader state.
         '''
         self._source_handlers[source_type] = refresher
 
@@ -161,22 +233,22 @@ class CacheManager:
             entry.status_msg = str(e)
             return False
 
-    def get(self, url: str) -> Optional[CacheEntry]:
-        '''Look up an entry by URL.  Syncs metadata from disk and touches access time.'''
+    def get(self, cache_key: str) -> Optional[CacheEntry]:
+        '''Look up an entry by cache_key.  Syncs metadata from disk and touches access time.'''
         self._load()
-        entry = self._entries.get(url)
+        entry = self._entries.get(cache_key)
         if not entry:
             return None
         self.sync_entry(entry)
         if entry.status == _CACHE_STATUS_MISSING:
-            del self._entries[url]
+            del self._entries[cache_key]
             self._save()
             return None
         entry.touch()
         self._save()
         return entry
 
-    def put(self, url: str, local_path: Path, *,
+    def put(self, cache_key: str, local_path: Path, *,
             source_type: str = '',
             etag: str = '',
             last_modified: str = '',
@@ -184,31 +256,45 @@ class CacheManager:
             cache_policy: str = '',
             status: str = _CACHE_STATUS_OK,
             status_msg: str = '',
+            source_config: Optional[Dict[str, Any]] = None,
+            request_params: Optional[Dict[str, Any]] = None,
+            response_format: Optional[Dict[str, Any]] = None,
+            auth_hint: str = '',
+            descr: str = '',
             extra: Optional[Dict[str, Any]] = None) -> CacheEntry:
-        '''Store (or update) a cache entry.  Syncs size/mtime from the actual file.'''
+        '''Store (or update) a cache entry.
+
+        ``source_config``, ``request_params``, and ``extra`` are automatically
+        run through :func:`mask_secrets` so credentials are never persisted.
+        '''
         self._load()
         local = Path(local_path)
         entry = CacheEntry(
-            url=url,
+            cache_key=cache_key,
             local_path=str(local),
-            source_type=source_type or self._detect_source_type(url),
+            source_type=source_type or self._detect_source_type(cache_key),
             etag=etag,
             last_modified=last_modified,
             content_type=content_type,
             cache_policy=cache_policy or f'days:{vd.options.cache_default_days}',
             status=status,
             status_msg=status_msg,
-            extra=extra or {},
+            source_config=mask_secrets(source_config or {}),
+            request_params=mask_secrets(request_params or {}),
+            response_format=response_format or {},
+            auth_hint=auth_hint,
+            descr=descr,
+            extra=mask_secrets(extra or {}),
         )
         self.sync_entry(entry)
-        self._entries[url] = entry
+        self._entries[cache_key] = entry
         self._save()
         return entry
 
-    def remove(self, url: str) -> bool:
+    def remove(self, cache_key: str) -> bool:
         '''Remove a cache entry and its local file.  Returns True if something was removed.'''
         self._load()
-        entry = self._entries.pop(url, None)
+        entry = self._entries.pop(cache_key, None)
         if entry:
             local = Path(entry.local_path)
             if local.exists():
@@ -240,12 +326,12 @@ class CacheManager:
         self._load()
         if verify:
             removed = []
-            for url, entry in self._entries.items():
+            for key, entry in self._entries.items():
                 self.sync_entry(entry)
                 if entry.status == _CACHE_STATUS_MISSING:
-                    removed.append(url)
-            for url in removed:
-                del self._entries[url]
+                    removed.append(key)
+            for key in removed:
+                del self._entries[key]
             if removed:
                 self._save()
         return list(self._entries.values())
@@ -259,62 +345,67 @@ class CacheManager:
         counts: Dict[str, int] = {_CACHE_STATUS_OK: 0, _CACHE_STATUS_MISSING: 0,
                                   _CACHE_STATUS_STALE: 0, _CACHE_STATUS_ERROR: 0}
         removed = []
-        for url, entry in self._entries.items():
+        for key, entry in self._entries.items():
             self.sync_entry(entry)
             counts[entry.status] = counts.get(entry.status, 0) + 1
             if entry.status == _CACHE_STATUS_MISSING:
-                removed.append(url)
-        for url in removed:
-            del self._entries[url]
+                removed.append(key)
+        for key in removed:
+            del self._entries[key]
         if removed:
             self._save()
         return counts
 
-    def is_valid(self, url: str) -> bool:
-        entry = self.get(url)
+    def is_valid(self, cache_key: str) -> bool:
+        entry = self.get(cache_key)
         if not entry:
             return False
         return entry.status == _CACHE_STATUS_OK
 
-    def refresh_policy(self, url: str, policy: str) -> Optional[CacheEntry]:
+    def refresh_policy(self, cache_key: str, policy: str) -> Optional[CacheEntry]:
         self._load()
-        entry = self._entries.get(url)
+        entry = self._entries.get(cache_key)
         if entry:
             entry.cache_policy = policy
             self.sync_entry(entry)
             self._save()
         return entry
 
-    def open_local(self, url: str) -> Path:
+    def open_local(self, cache_key: str) -> Path:
         '''Return a validated Path to the locally cached file.
 
         Fails if the file is missing or the cache entry cannot be found.
-        This is the ONLY supported way to do "offline open".
+        This is the ONLY supported way to do "offline open" -- it works purely
+        from the persisted index and does not require any loader to be loaded.
         '''
-        entry = self.get(url)
+        entry = self.get(cache_key)
         if not entry:
-            vd.fail(f'no cache entry for {url}')
+            vd.fail(f'no cache entry for {cache_key}')
         local = Path(entry.local_path)
         if not local.exists():
-            self.remove(url)
+            self.remove(cache_key)
             vd.fail(f'cache file missing: {entry.local_path}')
         entry.touch()
         self._save()
         return local
 
-    def refresh(self, url: str, force: bool = False) -> Optional[CacheEntry]:
+    def refresh(self, cache_key: str, force: bool = False) -> Optional[CacheEntry]:
         '''Refresh (re-download) a single cache entry.
 
-        Dispatches to the registered source handler based on entry.source_type.
+        Dispatches to the registered source handler, passing the *full*
+        CacheEntry so the request can be rebuilt from stored metadata alone.
         If force=True the entry is removed first; otherwise the handler decides.
         Returns the updated CacheEntry or None on failure.
         '''
         self._load()
-        entry = self._entries.get(url)
-        source_type = entry.source_type if entry else self._detect_source_type(url)
+        entry = self._entries.get(cache_key)
+        if not entry:
+            vd.warning(f'no cache entry found for {cache_key}')
+            return None
+        source_type = entry.source_type
 
         if force:
-            self.remove(url)
+            self.remove(cache_key)
 
         handler = self._source_handlers.get(source_type)
         if not handler:
@@ -322,16 +413,17 @@ class CacheManager:
             return None
 
         try:
-            handler(url)
+            handler(entry)
         except Exception as e:
             vd.exceptionCaught(e)
-            if entry:
-                entry.status = _CACHE_STATUS_ERROR
-                entry.status_msg = str(e)
+            reloaded = self._entries.get(cache_key)
+            if reloaded:
+                reloaded.status = _CACHE_STATUS_ERROR
+                reloaded.status_msg = str(e)
                 self._save()
             return None
 
-        return self.get(url)
+        return self.get(cache_key)
 
 
 @VisiData.cached_property
@@ -398,19 +490,22 @@ def enable_requests_cache(vd):
         vd.warning('install requests_cache for less intrusive scraping')
 
 
-def _do_cache_open(vd, url, source_type, *, fetcher, cache_policy='', etag='', last_modified='', content_type='', extra=None):
+def _do_cache_open(vd, cache_key, source_type, *, fetcher, cache_policy='',
+                   etag='', last_modified='', content_type='',
+                   source_config=None, request_params=None,
+                   response_format=None, auth_hint='', descr='', extra=None):
     '''Core helper for all cache_open_* entry points.
 
-    fetcher() -> bytes  -- performs the actual download and returns raw bytes.
-    This helper handles: cache lookup, offline mode, cache_enabled gate,
-    writing to disk, storing metadata via CacheManager.put().
-    Returns a Path to the cached local file.
+    fetcher(entry, conditional) -> (bytes, meta_dict)  -- performs the actual
+    download and returns raw bytes plus a metadata dict recognised by this
+    helper: not_modified, etag, last_modified, content_type, cache_policy,
+    response_headers, extra.
     '''
-    entry = vd.cache_manager.get(url)
+    entry = vd.cache_manager.get(cache_key)
 
     if vd.options.cache_offline:
-        local = vd.cache_manager.open_local(url)
-        vd.status(f'offline: using cached {url}')
+        local = vd.cache_manager.open_local(cache_key)
+        vd.status(f'offline: using cached {cache_key}')
         local._cache_hit = True
         local._from_cache = True
         if entry and (entry.etag or entry.last_modified):
@@ -418,26 +513,26 @@ def _do_cache_open(vd, url, source_type, *, fetcher, cache_policy='', etag='', l
         return local
 
     if not vd.options.cache_enabled:
-        p = vd.cache_manager._cache_path_for(url)
-        data = fetcher(entry=None, conditional=False)
+        p = vd.cache_manager._cache_path_for(cache_key)
+        data, _ = fetcher(entry=None, conditional=False)
         with p.open_bytes(mode='w') as fpout:
             fpout.write(data)
         return p
 
-    p = Path(entry.local_path) if entry else vd.cache_manager._cache_path_for(url)
+    p = Path(entry.local_path) if entry else vd.cache_manager._cache_path_for(cache_key)
 
     try:
         data, meta = fetcher(entry=entry, conditional=bool(entry))
     except Exception as e:
         if entry:
-            vd.status(f'using cached {url} ({e})')
+            vd.status(f'using cached {cache_key} ({e})')
             p._cache_hit = True
             p._from_cache = True
             return p
         raise
 
     if meta.get('not_modified', False) and entry:
-        vd.debug(f'cache hit (304) for {url}')
+        vd.debug(f'cache hit (304) for {cache_key}')
         entry.touch()
         vd.cache_manager._save()
         p._cache_hit = True
@@ -452,12 +547,17 @@ def _do_cache_open(vd, url, source_type, *, fetcher, cache_policy='', etag='', l
     )
 
     vd.cache_manager.put(
-        url, p,
+        cache_key, p,
         source_type=source_type,
         etag=meta.get('etag', etag) or '',
         last_modified=meta.get('last_modified', last_modified) or '',
         content_type=meta.get('content_type', content_type) or '',
         cache_policy=policy,
+        source_config=source_config or meta.get('source_config'),
+        request_params=request_params or meta.get('request_params'),
+        response_format=response_format or meta.get('response_format'),
+        auth_hint=auth_hint or meta.get('auth_hint', ''),
+        descr=descr or meta.get('descr', ''),
         extra=extra or meta.get('extra') or {},
     )
 
@@ -469,18 +569,21 @@ def _do_cache_open(vd, url, source_type, *, fetcher, cache_policy='', etag='', l
 
 
 @VisiData.api
-def cache_open_http(vd, url: str, *, headers=None, cache_policy: str = '') -> Path:
+def cache_open_http(vd, cache_key: str, *, headers=None, cache_policy: str = '',
+                    ssl_verify: Optional[bool] = None) -> Path:
     '''Fetch URL via HTTP, cache locally, return Path to cached file.
 
-    Uses conditional requests via ETag/Last-Modified when available.
-    ALL HTTP caching goes through this function -- the HTTP loader must not
-    maintain any separate cache state.
+    All HTTP caching goes through this function.  The stored entry preserves
+    sanitized headers and SSL config so a later refresh can reconstruct the
+    request without loader state.
     '''
     from urllib.request import Request, urlopen
-    from urllib.error import HTTPError
+
+    if ssl_verify is None:
+        ssl_verify = vd.options.http_ssl_verify
 
     def _http_fetcher(entry=None, conditional=False):
-        req = Request(url)
+        req = Request(cache_key)
         for k, v in (headers or {}).items():
             req.add_header(k, v)
         if conditional and entry:
@@ -489,8 +592,15 @@ def cache_open_http(vd, url: str, *, headers=None, cache_policy: str = '') -> Pa
             if entry.last_modified:
                 req.add_header('If-Modified-Since', entry.last_modified)
 
-        resp = urlopen(req)
-        meta = {}
+        ctx = None
+        if not ssl_verify:
+            import ssl
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+
+        resp = urlopen(req, context=ctx)
+        meta: Dict[str, Any] = {}
         if resp.status == 304:
             meta['not_modified'] = True
             return b'', meta
@@ -499,75 +609,135 @@ def cache_open_http(vd, url: str, *, headers=None, cache_policy: str = '') -> Pa
         meta['last_modified'] = resp.headers.get('Last-Modified', '') or ''
         meta['content_type'] = resp.headers.get('Content-Type', '') or ''
         meta['response_headers'] = {h: v for h, v in resp.headers.items()}
+        meta['source_config'] = {'ssl_verify': bool(ssl_verify)}
+        meta['request_params'] = {'headers': sanitize_headers(headers or {})}
+        if any(_is_secret_key(k) for k in (headers or {})):
+            meta['auth_hint'] = 'headers: see http_req_headers / custom Authorization'
+        meta['descr'] = f'HTTP {cache_key[:80]}'
         return data, meta
 
-    return _do_cache_open(vd, url, 'http', fetcher=_http_fetcher, cache_policy=cache_policy)
+    return _do_cache_open(vd, cache_key, 'http', fetcher=_http_fetcher, cache_policy=cache_policy)
+
+
+def _refresh_http_entry(entry: CacheEntry) -> Path:
+    '''Refresh an HTTP cache entry using only stored metadata.'''
+    headers = entry.request_params.get('headers', {})
+    ssl_verify = entry.source_config.get('ssl_verify', True)
+    return vd.cache_open_http(entry.cache_key, headers=headers,
+                              cache_policy=entry.cache_policy,
+                              ssl_verify=ssl_verify)
 
 
 @VisiData.api
-def cache_open_s3(vd, url: str, *, version_id=None, cache_policy: str = '') -> Path:
-    '''Fetch S3 object, cache locally, return Path to cached file.'''
+def cache_open_s3(vd, cache_key: str, *, version_id=None, cache_policy: str = '') -> Path:
+    '''Fetch S3 object, cache locally, return Path to cached file.
+
+    Stored entry includes endpoint_url, anon flag and version_id so refresh
+    works independently of loader state.
+    '''
     s3fs_core = vd.importExternal('s3fs.core', 's3fs')
+
+    endpoint = vd.options.s3_endpoint or None
+    anon = vd.options.s3_anon
 
     def _s3_fetcher(entry=None, conditional=False):
         s3fs = s3fs_core.S3FileSystem(
-            client_kwargs={'endpoint_url': vd.options.s3_endpoint or None},
-            anon=vd.options.s3_anon,
+            client_kwargs={'endpoint_url': endpoint},
+            anon=anon,
         )
-        info = s3fs.info(url, version_id=version_id)
+        ver = version_id or (entry.extra.get('version_id') if entry else None)
+        info = s3fs.info(cache_key, version_id=ver)
         remote_mtime = info.get('LastModified', 0)
         if hasattr(remote_mtime, 'timestamp'):
             remote_mtime = remote_mtime.timestamp()
-        meta = {
+        meta: Dict[str, Any] = {
             'last_modified': str(remote_mtime),
             'content_type': info.get('ContentType', ''),
             'etag': info.get('ETag', ''),
-            'extra': {'version_id': version_id, 'etag': info.get('ETag', '')},
+            'source_config': {'endpoint_url': endpoint, 'anon': bool(anon),
+                              'version_aware': vd.options.s3_version_aware},
+            'request_params': {'version_id': ver},
+            'extra': {'version_id': ver, 'etag': info.get('ETag', '')},
             'cache_policy': cache_policy or 'last-modified',
+            'descr': f'S3 {cache_key}',
         }
         if conditional and entry and entry.mtime and entry.mtime >= remote_mtime:
             meta['not_modified'] = True
             return b'', meta
-        with s3fs.open(url, mode='rb', version_id=version_id) as src:
+        with s3fs.open(cache_key, mode='rb', version_id=ver) as src:
             data = src.read()
         return data, meta
 
-    return _do_cache_open(vd, url, 's3', fetcher=_s3_fetcher, cache_policy=cache_policy)
+    return _do_cache_open(vd, cache_key, 's3', fetcher=_s3_fetcher, cache_policy=cache_policy)
+
+
+def _refresh_s3_entry(entry: CacheEntry) -> Path:
+    '''Refresh an S3 cache entry using only stored metadata.'''
+    cfg = entry.source_config or {}
+    params = entry.request_params or {}
+    if 'endpoint_url' in cfg:
+        saved_endpoint = cfg.get('endpoint_url')
+        orig = vd.options.s3_endpoint
+        vd.options.s3_endpoint = saved_endpoint or ''
+        orig_anon = vd.options.s3_anon
+        vd.options.s3_anon = cfg.get('anon', True)
+        try:
+            return vd.cache_open_s3(entry.cache_key,
+                                    version_id=params.get('version_id'),
+                                    cache_policy=entry.cache_policy)
+        finally:
+            vd.options.s3_endpoint = orig
+            vd.options.s3_anon = orig_anon
+    return vd.cache_open_s3(entry.cache_key,
+                            version_id=params.get('version_id'),
+                            cache_policy=entry.cache_policy)
 
 
 @VisiData.api
-def cache_open_api(vd, url: str, *, source_type: str, fetcher,
+def cache_open_api(vd, cache_key: str, *, source_type: str, fetcher,
                    cache_policy: str = '', content_type: str = 'application/json',
+                   source_config: Optional[Dict[str, Any]] = None,
+                   request_params: Optional[Dict[str, Any]] = None,
+                   response_format: Optional[Dict[str, Any]] = None,
+                   auth_hint: str = '', descr: str = '',
                    extra: Optional[Dict[str, Any]] = None) -> Path:
     '''Generic API response caching helper.
 
     Parameters
     ----------
-    url : str
-        Logical identifier for this API call (may include query params for uniqueness).
+    cache_key : str
+        Stable unique identifier for this API call.
     source_type : str
-        Source identifier, e.g. 'airtable', 'reddit', 'zulip', 'matrix'.
+        Source identifier used to route refresh calls (e.g. 'airtable').
     fetcher : callable
         Signature ``fetcher() -> bytes``.  Performs the actual API call and
-        returns the raw response bytes (typically JSON).
-    cache_policy : str
-        One of the standard cache policies.  Defaults to ``days:{cache_default_days}``.
-    content_type : str
-        Stored in the cache entry for later inspection.
-    extra : dict
-        Any additional metadata to store alongside the entry.
+        returns the raw response bytes.
+    source_config : dict
+        Endpoint / account-level config needed to rebuild the request
+        (base id, server url, etc).  Values are masked for secrets.
+    request_params : dict
+        Per-request parameters (view, filters, pagination range, etc).
+        Values are masked for secrets.
+    response_format : dict
+        Hints about the stored response (filetype, encoding, compression).
+    auth_hint : str
+        Where to find credentials at refresh time, e.g.
+        ``"env:AIRTABLE_AUTH_TOKEN / option:airtable_auth_token"``.
+        The actual token is NEVER stored in the cache index.
+    descr : str
+        Short human-readable label shown in the Cache Sheet.
     '''
-    entry = vd.cache_manager.get(url)
+    entry = vd.cache_manager.get(cache_key)
 
     if vd.options.cache_offline:
-        local = vd.cache_manager.open_local(url)
-        vd.status(f'offline: using cached {url}')
+        local = vd.cache_manager.open_local(cache_key)
+        vd.status(f'offline: using cached {cache_key}')
         local._cache_hit = True
         local._from_cache = True
         return local
 
     if not vd.options.cache_enabled:
-        p = vd.cache_manager._cache_path_for(url)
+        p = vd.cache_manager._cache_path_for(cache_key)
         data = fetcher()
         with p.open_bytes(mode='w') as fpout:
             fpout.write(data)
@@ -576,27 +746,33 @@ def cache_open_api(vd, url: str, *, source_type: str, fetcher,
     use_cached = entry and not entry.is_expired()
     if use_cached:
         p = Path(entry.local_path)
-        vd.debug(f'cache hit for {url}')
+        vd.debug(f'cache hit for {cache_key}')
         p._cache_hit = True
         p._from_cache = True
         return p
 
-    p = vd.cache_manager._cache_path_for(url)
+    p = vd.cache_manager._cache_path_for(cache_key)
     data = fetcher()
     with p.open_bytes(mode='w') as fpout:
         fpout.write(data)
 
-    return vd.cache_manager.put(
-        url, p,
+    vd.cache_manager.put(
+        cache_key, p,
         source_type=source_type,
         content_type=content_type,
         cache_policy=cache_policy or f'days:{vd.options.cache_default_days}',
-        extra=extra or {},
-    ).local_path and p or p
+        source_config=source_config,
+        request_params=request_params,
+        response_format=response_format,
+        auth_hint=auth_hint,
+        descr=descr,
+        extra=extra,
+    )
+    return p
 
 
-vd.cache_manager.register_source_handler('http', lambda url: vd.cache_open_http(url))
-vd.cache_manager.register_source_handler('s3', lambda url: vd.cache_open_s3(url))
+vd.cache_manager.register_source_handler('http', _refresh_http_entry)
+vd.cache_manager.register_source_handler('s3', _refresh_s3_entry)
 
 
 BaseSheet.addCommand(
@@ -629,4 +805,5 @@ vd.addMenuItems('''
 ''')
 
 
-vd.addGlobals({'urlcache': urlcache, 'CacheEntry': CacheEntry, 'CacheManager': CacheManager})
+vd.addGlobals({'urlcache': urlcache, 'CacheEntry': CacheEntry, 'CacheManager': CacheManager,
+               'sanitize_headers': sanitize_headers, 'mask_secrets': mask_secrets})

@@ -18,21 +18,44 @@ Open the Cache Sheet with `File > Cache > Open cache sheet` or the `open-cache` 
 Each row represents one cached remote resource. The following columns are available:
 
 - **status** -- current cache status: `ok` (valid), `stale` (expired per policy), `missing` (local file gone), `error` (last refresh failed)
+- **descr** -- human-readable short description of the cached resource (e.g. "Airtable appXXX/tblXXX view=viwXXX")
 - **source_type** -- origin protocol (http, s3, airtable, reddit, zulip, matrix, etc.)
-- **url** -- the original remote URL or logical cache key
+- **cache_key** -- stable unique key: original URL for HTTP/S3, or a logical key like `airtable://appXXX/tblXXX?view=viwXXX` for APIs
 - **local_path** -- path to the cached file on disk
 - **size** -- size of the cached file
 - **mtime** -- modification time of the cached file
 - **last_accessed** -- when this cache entry was last used
 - **cache_policy** -- the invalidation policy for this entry
-- **status_msg** -- additional status detail (hidden by default)
-- **etag** -- HTTP ETag header (hidden by default)
-- **last_modified** -- HTTP Last-Modified or S3 modification time (hidden by default)
-- **content_type** -- MIME type of the resource (hidden by default)
-- **created_at** -- when the entry was first cached (hidden by default)
+- **auth_hint** -- where to find credentials at refresh time (e.g. "env:AIRTABLE_AUTH_TOKEN / option:airtable_auth_token"). **No credentials are stored in the index.**
+- **source_config** -- (hidden) structured source-level config: endpoint_url, base_id, server, etc. (all values masked for secrets)
+- **request_params** -- (hidden) per-request parameters: view, version_id, sanitized headers, etc. (all values masked for secrets)
+- **response_format** -- (hidden) hints about the cached data: filetype, encoding, compression
+- **status_msg** -- (hidden) additional status detail
+- **etag** -- (hidden) HTTP ETag header
+- **last_modified** -- (hidden) HTTP Last-Modified or S3 modification time
+- **content_type** -- (hidden) MIME type of the resource
+- **extra** -- (hidden) arbitrary additional metadata (values masked for secrets)
 
 On every load the Cache Sheet re-validates each entry against the real filesystem.
 Entries whose local files have disappeared are automatically dropped from the index.
+
+### How Refresh Works Without Loader State
+
+Each registered `source_type` has a dedicated refresh handler.  When `Ctrl+R` (or `z Enter`) is pressed in the Cache Sheet, the handler receives the full stored `CacheEntry` and rebuilds the request using:
+
+1. `entry.source_config` -- endpoint, base id, server url, etc.
+2. `entry.request_params` -- per-request options like view, version_id, sanitized headers
+3. `entry.auth_hint` -- tells the handler *where* to read credentials from (env var, option name).  **Actual secrets are never stored in the cache index.**
+
+This means you can close VisiData, restart it, open the Cache Sheet, and press `Ctrl+R` on any cached entry and it will refresh correctly -- even if you never explicitly opened the corresponding loader in this session.
+
+### Security / Secret Handling
+
+The cache index (`_cache_index.json`) never stores credentials.  Three layers of protection:
+
+1. **`sanitize_headers()`** -- strips values of `Authorization`, `Cookie`, `X-Api-Key`, `X-Auth-Token`, `Token`, `Secret`, `Password`, `ApiKey` and similar headers before storing.
+2. **`mask_secrets()`** -- recursively masks dictionary/list values whose keys look like credentials (e.g. `api_key`, `client_secret`, `password`).
+3. **`auth_hint`** -- stores only a *pointer* to credentials (env var name / option name), never the secret itself.  At refresh time the handler re-reads the actual value from the environment or options.
 
 ### Cache Commands
 

@@ -1,7 +1,7 @@
 import time
 
 from visidata import vd, VisiData, BaseSheet, Sheet, TextSheet, PyobjSheet
-from visidata import ItemColumn, Column, vlen, date, asyncsingle, AttrDict
+from visidata import ItemColumn, Column, vlen, date, asyncsingle, AttrDict, CacheEntry
 
 vd.option('zulip_batch_size', -100, 'number of messages to fetch per call (<0 to fetch before anchor)')
 vd.option('zulip_anchor', 1000000000, 'message id to start fetching from')
@@ -16,11 +16,23 @@ def _zulip_cache_key(kind, **params):
     return f'zulip://{kind}?params={hash(json.dumps(params, sort_keys=True))}'
 
 
-def _zulip_refresh(url):
+def _zulip_refresh_entry(entry: CacheEntry):
+    '''Refresh a Zulip cache entry using *only* the stored CacheEntry metadata.'''
     import json
-    from urllib.parse import urlparse, parse_qs
-    parsed = urlparse(url)
-    kind = parsed.netloc
+    from urllib.parse import urlparse
+    cfg = entry.source_config or {}
+    params = entry.request_params or {}
+    kind = cfg.get('kind') or urlparse(entry.cache_key).netloc
+    site = cfg.get('site') or ''
+
+    if not getattr(vd, 'z_client', None) or cfg.get('site') != site:
+        vd.importExternal('zulip')
+        import zulip
+        vd.z_client = zulip.Client(site=site or (vd.z_client and vd.z_client.base_url or ''),
+            api_key=vd.options.zulip_api_key,
+            email=vd.options.zulip_email)
+        vd.z_client = vd.z_client[0] if isinstance(vd.z_client, tuple) else vd.z_client
+
     results = []
     if kind == 'streams':
         r = vd.z_client.get_streams(include_public=True, include_subscribed=True)
@@ -34,11 +46,26 @@ def _zulip_refresh(url):
         r = vd.z_client.get_members()
         if r.get('result') == 'success':
             results = r.get('members', [])
-    return json.dumps(results).encode('utf-8')
+
+    data = json.dumps(results).encode('utf-8')
+    cached_path = vd.cache_manager._cache_path_for(entry.cache_key)
+    with cached_path.open_bytes(mode='w') as fpout:
+        fpout.write(data)
+
+    return vd.cache_manager.put(
+        entry.cache_key, cached_path,
+        source_type='zulip',
+        content_type='application/json',
+        cache_policy=entry.cache_policy,
+        source_config=entry.source_config or {'kind': kind, 'site': site},
+        request_params=entry.request_params or params,
+        response_format={'filetype': 'json', 'encoding': 'utf-8'},
+        auth_hint='option:zulip_email / option:zulip_api_key',
+        descr=entry.descr or f'Zulip {kind} ({site or "default"})[:60]',
+    )
 
 
-vd.cache_manager.register_source_handler('zulip', lambda url: vd.cache_open_api(
-    url, source_type='zulip', fetcher=lambda: _zulip_refresh(url)))
+vd.cache_manager.register_source_handler('zulip', _zulip_refresh_entry)
 
 
 @VisiData.api

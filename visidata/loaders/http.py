@@ -49,7 +49,8 @@ def openurl_http(vd, path, filetype=None):
     use_cache = vd.options.http_use_cache and vd.options.cache_enabled
 
     if use_cache:
-        cached_path = vd.cache_open_http(path.given, headers=vd.options.getall('http_req_'))
+        cached_path = vd.cache_open_http(path.given, headers=vd.options.getall('http_req_'),
+                                        ssl_verify=vd.options.http_ssl_verify)
         entry = vd.cache_manager.get(path.given)
         if entry:
             if getattr(cached_path, '_cache_hit', False):
@@ -109,7 +110,8 @@ def openurl_http(vd, path, filetype=None):
 
             vd.status(f'fetching next page from {src}')
             if use_cache:
-                cur_path = vd.cache_open_http(src, headers=vd.options.getall('http_req_'))
+                cur_path = vd.cache_open_http(src, headers=vd.options.getall('http_req_'),
+                                              ssl_verify=vd.options.http_ssl_verify)
             else:
                 from urllib.request import Request, urlopen
                 req = Request(src, **vd.options.getall('http_req_'))
