@@ -2,30 +2,22 @@
 # Sheet Diagnostics Framework — Three-Layer Architecture
 
 Layer 1: Rule Registry      (DiagnosticRule + subclasses)
-Layer 2: Diagnostic Runner  (DiagnosticRunner — executes, caches, invalidates)
-Layer 3: Display Panel      (DiagnosticsSheet — pure view)
+Layer 2: Diagnostic Runner  (DiagnosticRunner — owns lifecycle, cache keys, invalidation)
+Layer 3: Display Panel      (DiagnosticsSheet — pure view, never triggers execution)
 
-## Registering a Rule
+## Lifecycle
 
-Aggregator-backed rules (reuse vd.aggregators verbatim):
+The runner owns the authoritative lifecycle for every source sheet:
 
-    from visidata.features.diagnostics import ColumnDiagnosticRule, vd
-
-    vd.diagnostic(ColumnDiagnosticRule.aggregator('distinct', type=vlen))
-
-Custom rules — ``compute`` receives the target and rows and must lean on
-``col.getValueRows`` / ``col.getValues`` / ``wrapply`` / ``TypedExceptionWrapper``:
-
-    class MyRule(ColumnDiagnosticRule):
-        name = 'nulls'
-        type = vlen
-
-        def compute(self, col, rows):
-            isNull = col.sheet.isNullFunc()
-            bad = [r for r in rows if isNull(col.getValue(r))]
-            return DiagnosticResult(rule=self, target=col, value=len(bad), rows=bad)
-
-    vd.diagnostic(MyRule())
+1. Each sheet is identified by a *cache key*: ``(sheet_id, visible_col_ids,
+   key_col_ids, row_ids)``.
+2. ``runner.ensure(sheet, extra_aggrs)`` compares the current cache key to
+   the stored one; if they differ it drops the old results and re-runs rules.
+3. All mutation hooks (``reload``, ``Column.type``, ``rows.setter``,
+   ``Column.hidden``, ``Column.keycol``, ``setKeys``) *only* invalidate the
+   runner cache — they never touch a DiagnosticsSheet.
+4. A DiagnosticsSheet.loader simply calls ``ensure`` on each of its source
+   sheets and then reads from the cache — it never runs rules itself.
 """
 
 import collections
@@ -36,7 +28,7 @@ from visidata import (
     vd, VisiData, Column, ColumnAttr, vlen, RowColorizer,
     Progress, wrapply, BaseSheet, TableSheet,
     ColumnsSheet, IndexSheet, TypedExceptionWrapper, anytype,
-    TypedWrapper, ExplodingMock,
+    TypedWrapper, ExplodingMock, Sheet,
 )
 
 
@@ -49,15 +41,7 @@ vd.option('describe_aggrs', 'mean stdev', 'numeric aggregators to calculate on D
 
 
 class DiagnosticResult:
-    """Single diagnostic finding.
-
-    Attributes:
-        rule:      the DiagnosticRule that produced this result.
-        target:    the Column or Sheet that was diagnosed.
-        value:     the scalar metric shown in the cell.
-        rows:      optional list of offending source rows (used by openCell).
-        message:   optional human-readable detail.
-    """
+    """Single diagnostic finding."""
     __slots__ = ('rule', 'target', 'value', 'rows', 'message')
 
     def __init__(self, rule, target, value=None, rows=None, message=''):
@@ -74,15 +58,10 @@ class DiagnosticResult:
 class DiagnosticRule:
     """Base class for diagnostic rules.
 
-    Either override ``compute`` or use the ``aggregator`` classmethod to build
-    a rule that reuses an entry from ``vd.aggregators``.
-
-    Attributes:
-        name:     unique kebab-case identifier.
-        label:    short human-readable label.
-        type:     expected type of ``DiagnosticResult.value``.
-        helpstr:  longer description.
-        scope:    'column' or 'sheet'.
+    Either override ``compute`` or use the ``aggregator`` classmethod to wrap
+    an entry from ``vd.aggregators``.  Implementations must lean on
+    ``Column.getValueRows`` / ``Column.getValues`` / ``wrapply`` so they share
+    VisiData's null / TypedExceptionWrapper contract.
     """
     name = ''
     label = ''
@@ -94,18 +73,10 @@ class DiagnosticRule:
         return True
 
     def compute(self, target, rows):
-        """Return a single DiagnosticResult or an iterable of them.
-
-        Implementations must reuse Column.getValueRows/getValues (so the
-        null / TypedExceptionWrapper contract is shared with the rest of
-        VisiData) rather than rolling their own iteration.
-        """
         raise NotImplementedError
 
-    # ------------------------------------------------------------------
     @classmethod
     def aggregator(cls, aggrname, type=anytype, label='', helpstr='', scope='column'):
-        """Build a rule that simply delegates to ``vd.aggregators[aggrname]``."""
         aggr = vd.aggregators.get(aggrname)
         _label = label or (aggr.helpstr if aggr else aggrname)
         _helpstr = helpstr or (aggr.helpstr if aggr else '')
@@ -138,7 +109,6 @@ class DiagnosticRule:
 
 
 class ColumnDiagnosticRule(DiagnosticRule):
-    """Rule that runs once per visible column on the source sheet."""
     scope = 'column'
 
     def applies(self, col):
@@ -146,19 +116,17 @@ class ColumnDiagnosticRule(DiagnosticRule):
 
 
 class SheetDiagnosticRule(DiagnosticRule):
-    """Rule that runs once per source sheet."""
     scope = 'sheet'
 
     def applies(self, sheet):
         return isinstance(sheet, TableSheet)
 
 
-vd.diagnosticRules = collections.OrderedDict()  # [rulename] -> DiagnosticRule
+vd.diagnosticRules = collections.OrderedDict()
 
 
 @VisiData.api
 def diagnostic(vd, rule):
-    """Register a DiagnosticRule *rule* so DiagnosticRunner will execute it."""
     if not rule.name:
         raise ValueError('diagnostic rules must have a .name')
     vd.diagnosticRules[rule.name] = rule
@@ -174,53 +142,95 @@ def diagnostic_rules(vd, scope=None):
 
 
 # =============================================================================
-# Layer 2 — Diagnostic Runner  (executes, caches, invalidates)
+# Layer 2 — Diagnostic Runner  (owns lifecycle: cache keys, invalidation, execution)
 # =============================================================================
 
 
 class DiagnosticRunner:
-    """Executes registered diagnostic rules, caches results, handles invalidation.
+    """Executes rules, caches results, and tracks staleness via cache keys.
 
-    One runner owns the authoritative cache for the whole application; it is
-    shared by every DiagnosticsSheet view.  When a source sheet reloads or a
-    column type changes, *only* the runner is invalidated — views simply
-    reflect the (now-stale) cache until they next render.
+    The runner is the single authority for *when* diagnostics run.  Hooks on
+    the source sheet / columns only ever call ``invalidate``; the runner
+    decides on its own when to re-execute (via ``ensure``).
     """
 
     def __init__(self):
-        self._cache = {}  # { id(sheet): { target_id: { rulename: DiagnosticResult } } }
-        self._target_map = {}  # { id(sheet): { target_id: target } }  — avoids keeping targets alive via cache only
+        self._cache = {}          # { sheet_id: { target_id: { rulename: DiagnosticResult } } }
+        self._target_map = {}     # { sheet_id: { target_id: target } }  — keeps refs alive
+        self._cache_keys = {}     # { sheet_id: cache_key_tuple }
+        self._extra_aggrs = {}    # { sheet_id: tuple_of_aggrnames }
 
-    # -- cache management ---------------------------------------------------
+    # -- cache key ----------------------------------------------------------
+
+    @staticmethod
+    def _make_cache_key(sheet):
+        """Return a tuple summarising the diagnostic inputs for *sheet*.
+
+        Components:
+        - sheet object identity
+        - visible column ids (order matters — display order affects panel)
+        - key column ids
+        - row identity (``id(row)`` for each row; changes when rows are
+          replaced, sorted, or filtered)
+        """
+        try:
+            visible_ids = tuple(id(c) for c in getattr(sheet, 'visibleCols', []))
+        except Exception:
+            visible_ids = ()
+        try:
+            key_ids = tuple(id(c) for c in getattr(sheet, 'keyCols', []))
+        except Exception:
+            key_ids = ()
+        try:
+            row_ids = tuple(id(r) for r in sheet.rows)
+        except Exception:
+            row_ids = ()
+        return (id(sheet), visible_ids, key_ids, row_ids)
+
+    # -- lifecycle ----------------------------------------------------------
 
     def invalidate(self, sheet):
-        """Drop every cached result that depends on *sheet*."""
+        """Drop cached results and recorded cache key for *sheet*.
+
+        Called by mutation hooks; never triggers execution.
+        """
         key = id(sheet)
         self._cache.pop(key, None)
         self._target_map.pop(key, None)
+        self._cache_keys.pop(key, None)
+        self._extra_aggrs.pop(key, None)
 
-    def is_cached(self, sheet):
-        return id(sheet) in self._cache
+    def is_stale(self, sheet, extra_aggrs=()):
+        """Return True if *sheet*'s cache key has changed or extra_aggrs differ."""
+        cur = self._make_cache_key(sheet)
+        stored = self._cache_keys.get(id(sheet))
+        if stored is None or cur != stored:
+            return True
+        if tuple(extra_aggrs) != self._extra_aggrs.get(id(sheet), ()):
+            return True
+        return False
 
-    # -- execution ----------------------------------------------------------
+    def ensure(self, sheet, extra_aggrs=()):
+        """Re-run rules if *sheet* is stale; otherwise no-op.
 
-    def run(self, sheet, extra_aggrs=()):
-        """Run every applicable rule over *sheet* and store the results.
-
-        *extra_aggrs* is an iterable of aggregator names that should also be
-        computed (mirrors ``options.describe_aggrs``).
+        This is the only public entry point that may trigger execution.
         """
-        key = id(sheet)
-        per_sheet = self._cache.setdefault(key, {})
-        target_index = self._target_map.setdefault(key, {})
+        if self.is_stale(sheet, extra_aggrs):
+            self.invalidate(sheet)
+            self._run(sheet, extra_aggrs)
 
-        # sheet-scoped rules
+    # -- execution (private; call ensure() from outside) -------------------
+
+    def _run(self, sheet, extra_aggrs=()):
+        sid = id(sheet)
+        per_sheet = self._cache.setdefault(sid, {})
+        target_index = self._target_map.setdefault(sid, {})
+
         for rule in vd.diagnostic_rules(scope='sheet'):
             if not rule.applies(sheet):
                 continue
             self._store(per_sheet, target_index, sheet, rule, rule.compute(sheet, sheet.rows))
 
-        # column-scoped rules
         visible = [c for c in sheet.visibleCols if not c.hidden]
         for srccol in Progress(visible, 'diagnosing'):
             for rule in vd.diagnostic_rules(scope='column'):
@@ -232,7 +242,6 @@ class DiagnosticRunner:
                     if vd.options.debug:
                         vd.exceptionCaught(e)
 
-            # dynamically-requested aggregators (describe_aggrs)
             if vd.isNumeric(srccol):
                 for aggrname in extra_aggrs:
                     if aggrname in vd.diagnosticRules:
@@ -245,10 +254,12 @@ class DiagnosticRunner:
                     self._store(per_sheet, target_index, srccol, sentinel,
                                 DiagnosticResult(rule=sentinel, target=srccol, value=val))
 
+        self._cache_keys[sid] = self._make_cache_key(sheet)
+        self._extra_aggrs[sid] = tuple(extra_aggrs)
+
     # -- query API ----------------------------------------------------------
 
     def get(self, target, rulename):
-        """Return the DiagnosticResult for (*target*, *rulename*) or None."""
         sheet = getattr(target, 'sheet', target)
         per_sheet = self._cache.get(id(sheet))
         if not per_sheet:
@@ -256,7 +267,6 @@ class DiagnosticRunner:
         return per_sheet.get(id(target), {}).get(rulename)
 
     def all_rules_for(self, target):
-        """Return {rulename: DiagnosticResult} for *target* or {}."""
         sheet = getattr(target, 'sheet', target)
         per_sheet = self._cache.get(id(sheet))
         if not per_sheet:
@@ -286,7 +296,12 @@ class DiagnosticRunner:
 vd.diagnosticRunner = DiagnosticRunner()
 
 
-# -- invalidation hooks  (only touch the runner — never the views) -----------
+# -- invalidation hooks  (ONLY touch the runner — NEVER the views) ------------
+
+
+@TableSheet.after
+def reload(sheet):
+    vd.diagnosticRunner.invalidate(sheet)
 
 
 _orig_set_type = Column.type.fset
@@ -304,8 +319,81 @@ def _patched_type_setter(col, t):
 Column.type = Column.type.setter(_patched_type_setter)
 
 
+_orig_set_rows = BaseSheet.rows.fset
+
+
+def _patched_rows_setter(sheet, rows):
+    _orig_set_rows(sheet, rows)
+    if not isinstance(sheet, ExplodingMock):
+        vd.diagnosticRunner.invalidate(sheet)
+
+
+BaseSheet.rows = BaseSheet.rows.setter(_patched_rows_setter)
+
+
+try:
+    if hasattr(Column, 'setWidth'):
+        _orig_setWidth = Column.setWidth
+
+        def _patched_setWidth(col, w):
+            old_hidden = col.hidden if col.width is not None else False
+            _orig_setWidth(col, w)
+            new_hidden = col.hidden
+            if old_hidden != new_hidden:
+                sheet = getattr(col, 'sheet', None)
+                if sheet is not None and not isinstance(sheet, ExplodingMock):
+                    vd.diagnosticRunner.invalidate(sheet)
+
+        Column.setWidth = _patched_setWidth
+except Exception:
+    pass
+
+
+try:
+    _orig_set_width = Column.width.fset
+
+    def _patched_width_setter(col, w):
+        old_hidden = col.hidden if col.width is not None else False
+        _orig_set_width(col, w)
+        new_hidden = col.hidden
+        if old_hidden != new_hidden:
+            sheet = getattr(col, 'sheet', None)
+            if sheet is not None and not isinstance(sheet, ExplodingMock):
+                vd.diagnosticRunner.invalidate(sheet)
+
+    Column.width = Column.width.setter(_patched_width_setter)
+except Exception:
+    pass
+
+
+@Column.after
+def hide(col, *args, **kwargs):
+    sheet = getattr(col, 'sheet', None)
+    if sheet is not None and not isinstance(sheet, ExplodingMock):
+        vd.diagnosticRunner.invalidate(sheet)
+
+
+try:
+    _orig_col_setattr = Column.__setattr__
+
+    def _patched_col_setattr(col, name, value):
+        if name == 'keycol':
+            old_keycol = getattr(col, 'keycol', 0)
+            _orig_col_setattr(col, name, value)
+            if int(old_keycol or 0) != int(value or 0):
+                sheet = getattr(col, 'sheet', None)
+                if sheet is not None and not isinstance(sheet, ExplodingMock):
+                    vd.diagnosticRunner.invalidate(sheet)
+        else:
+            _orig_col_setattr(col, name, value)
+
+    Column.__setattr__ = _patched_col_setattr
+except Exception:
+    pass
+
+
 @TableSheet.after
-def reload(sheet):
+def setKeys(sheet, cols):
     vd.diagnosticRunner.invalidate(sheet)
 
 
@@ -315,10 +403,9 @@ def reload(sheet):
 
 
 class DiagnosticColumn(Column):
-    """A column on DiagnosticsSheet that renders a single rule's output.
+    """Column on DiagnosticsSheet — reads only from ``vd.diagnosticRunner``.
 
-    Reads the metric straight from ``vd.diagnosticRunner``; owns no cache and
-    triggers no computation on its own.  Sets are automatically coerced to
+    Owns no cache and triggers no computation.  Automatically coerces sets to
     their length so aggregators like ``distinct`` display as counts.
     """
     def __init__(self, name, **kwargs):
@@ -339,11 +426,11 @@ class DiagnosticColumn(Column):
 
 
 class DiagnosticsSheet(ColumnsSheet):
-    """Display panel for diagnostic results.
+    """Display panel — pure view, owns no execution logic.
 
-    Rows = source columns; columns = diagnostic rules.
-    The sheet itself owns zero cache or execution logic — everything comes
-    from ``vd.diagnosticRunner``.
+    ``loader`` asks the runner to ``ensure`` each source sheet is up-to-date
+    and then renders whatever is in the cache.  It never calls ``runner.run``
+    directly.
     """
     guide = '''
         # Diagnostics Sheet
@@ -374,9 +461,9 @@ class DiagnosticsSheet(ColumnsSheet):
 
         extra_aggrs = tuple(vd.options.describe_aggrs.split())
 
+        # Ask the runner to bring each source sheet up-to-date if stale
         for srcsheet in self._sourceSheets():
-            if not vd.diagnosticRunner.is_cached(srcsheet):
-                vd.diagnosticRunner.run(srcsheet, extra_aggrs=extra_aggrs)
+            vd.diagnosticRunner.ensure(srcsheet, extra_aggrs=extra_aggrs)
 
         for rule in vd.diagnostic_rules(scope='column'):
             self.addColumn(DiagnosticColumn(rule.name, type=rule.type))
@@ -401,7 +488,7 @@ class DiagnosticsSheet(ColumnsSheet):
             return None
         return vd.diagnosticRunner.get(row, col.expr)
 
-    # -- user-facing actions  (jump / filter / export inherited from Sheet) --
+    # -- user-facing actions ------------------------------------------------
 
     def openCell(self, col, row):
         """Open a copy of the source sheet filtered to the offending rows."""

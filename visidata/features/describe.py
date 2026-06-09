@@ -88,8 +88,7 @@ class DescribeSheet(DiagnosticsSheet):
             self.addColumn(DescribeColumn(aggrname, type=float))
 
         for srcsheet in self._sourceSheets():
-            if not vd.diagnosticRunner.is_cached(srcsheet):
-                vd.diagnosticRunner.run(srcsheet, extra_aggrs=extra_aggrs)
+            vd.diagnosticRunner.ensure(srcsheet, extra_aggrs=extra_aggrs)
 
         for srccol in self.rows:
             self.reloadColumn(srccol)
