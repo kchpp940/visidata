@@ -3,4 +3,5 @@
 # Pre-push hook: run all tests before pushing
 
 set -e
-make test-all
+VD_DEV_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+PYTHONPATH="$VD_DEV_DIR:$PYTHONPATH" python3 -m visidata.dev_cli test all

@@ -1,9 +1,11 @@
+VD_DEV ?= $(shell command -v vd-dev 2>/dev/null || echo "python3 -m visidata.dev_cli")
+
 .PHONY: help \
        install install-dev install-test install-all \
        test test-all test-vgit test-vdsql \
        build man zsh-completion docker \
        setup-hooks setup-vscode lint \
-       diff-test clean
+       diff-test clean check
 
 help:
 	@echo "Install:"
@@ -14,6 +16,9 @@ help:
 	@echo ""
 	@echo "Test:"
 	@echo "  make test              run all tests (same as test-all)"
+	@echo "  make test-all          run all tests"
+	@echo "  make test-golden       run golden/cmdlog tests"
+	@echo "  make test-unit         run Python unit tests (pytest)"
 	@echo ""
 	@echo "Build:"
 	@echo "  make man               generate man pages (requires soelim, preconv, aha)"
@@ -26,62 +31,64 @@ help:
 	@echo ""
 	@echo "Utility:"
 	@echo "  make lint              run ruff linter"
+	@echo "  make check             comprehensive check (lint + test)"
 	@echo "  make diff-test         show diffs from last test run"
 	@echo "  make clean             remove generated files"
 
 install:
-	pip3 install .
+	$(VD_DEV) install prod
 
 install-dev:
-	pip3 install -r dev/requirements-dev.txt
-	pip3 install -e .
+	$(VD_DEV) install dev
 
 install-test:
-	pip3 install ".[test]"
+	$(VD_DEV) install test
 
 install-all:
-	pip3 install ".[all]"
+	$(VD_DEV) install all
 
 test: test-all
 
 test-all:
-	dev/test-all.sh
+	$(VD_DEV) test all
+
+test-golden:
+	$(VD_DEV) test golden
+
+test-unit:
+	$(VD_DEV) test unit
 
 test-vgit:
-	vd --config tests/.visidatarc -p visidata/apps/vgit/tests/*.vdx --batch
+	$(VD_DEV) test vgit
 
 test-vdsql:
-	cd visidata/apps/vdsql && ./test.sh
+	$(VD_DEV) test vdsql
 
 build: man zsh-completion
 
 man:
-	dev/mkman.sh
+	$(VD_DEV) build man
 
 zsh-completion:
-	python3 dev/zsh-completion.py _visidata
+	$(VD_DEV) build zsh
 
 docker:
-	dev/build-container
-
-# Setup
+	$(VD_DEV) build docker
 
 setup-hooks:
-	git config core.hooksPath dev/hooks
+	$(VD_DEV) setup hooks
 
 setup-vscode:
-	mkdir -p .vscode
-	cp .devcontainer/launch.json .vscode/launch.json
-	cp .devcontainer/settings.json .vscode/settings.json
-
-# Utility
+	$(VD_DEV) setup vscode
 
 lint:
-	ruff check .
+	$(VD_DEV) lint
 
 diff-test:
-	dev/diff-test.sh
+	$(VD_DEV) diff-test
 
 clean:
-	rm -f visidata/man/vd.1 visidata/man/visidata.1 visidata/man/vd.txt
-	rm -f docs/man.md
+	$(VD_DEV) clean
+
+check:
+	$(VD_DEV) check

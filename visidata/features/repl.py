@@ -1,9 +1,7 @@
 """
-embedded Python REPL using ptpython
+Launch an embedded ptipython REPL from within VisiData.
+Contributed by @ajkerrigan #2290 #2736
 """
-
-__dependencies__ = ['ptpython']
-__commands__ = ['open-repl']
 
 from pathlib import Path
 

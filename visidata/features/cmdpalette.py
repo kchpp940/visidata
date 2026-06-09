@@ -1,5 +1,3 @@
-__description__ = "interactive command palette with fuzzy search and suggestions"
-__commands__ = ["exec-longname", "exec-longname-simple"]
 import collections
 import math
 from functools import partial
@@ -237,10 +235,6 @@ def inputLongname(sheet):
             r += f'[:keystrokes]{trigger_key}[/]'
         else:
             r += ' '
-
-        feat = vd.getFeatureForCommand(row.longname) if hasattr(vd, 'getFeatureForCommand') else None
-        if feat:
-            r += f' [[:onclick open-features]{feat.name:<16}[/]] '
 
         r += f' {formatted_name}'
         if row.description:

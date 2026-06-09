@@ -126,7 +126,6 @@ import visidata.theme
 import visidata.apps
 import visidata.fuzzymatch
 import visidata.hint
-import visidata.feature_registry
 '''
 
 for line in core_imports.splitlines():
@@ -136,9 +135,8 @@ for line in core_imports.splitlines():
 
 vd.importSubmodules('visidata.loaders')
 
-
 def importFeatures():
-    vd.featureRegistry.load_all('visidata.features')
+    vd.importSubmodules('visidata.features')
     vd.importSubmodules('visidata.themes')
 
     import visidata.deprecated

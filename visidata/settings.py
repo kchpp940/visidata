@@ -365,15 +365,7 @@ def addCommand(cls, keystrokes, longname, execstr, helpstr='', replay=True, **kw
     - *helpstr*: help string shown in the **Commands Sheet**.
     '''
     cmd = Command(longname, execstr, helpstr=helpstr, module=vd.importingModule, replay=replay, **kwargs)
-
-    if hasattr(vd, 'featureRegistry') and vd.featureRegistry and vd.featureRegistry._cmd_tracking_enabled:
-        existing = vd.commands._get(longname, obj=cls)
-        if existing and existing.module and existing.module != vd.importingModule and existing.module in vd.featureRegistry._features:
-            raise ValueError(f'command `{longname}` already registered by feature `{existing.module}`')
-
     vd.commands.set(longname, cmd, cls)
-    if hasattr(vd, 'featureRegistry') and vd.featureRegistry:
-        vd.featureRegistry.track_command(cls.__name__, longname)
     if keystrokes:
         vd.bindkey(keystrokes, longname, cls)
     return longname

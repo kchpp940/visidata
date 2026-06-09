@@ -1,11 +1,10 @@
-"""Persistent column configuration by column name across sessions.
-
-Allows presetting column width and type per column name.
+'''#1488
 Usage (in .visidatarc):
+
 
     DirSheet.knownCols.directory.width = 0
     Sheet.knownCols.date.type = date
-"""
+'''
 
 __description__ = "persistent column configuration (width, type) by column name across sessions (#1488)"
 

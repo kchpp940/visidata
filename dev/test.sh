@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
-# Wrapper for tests/test-vdx.sh (cmdlog golden tests)
+# Wrapper for vd-dev test golden
 # Usage: test.sh [-d] [-j N] [testname ...]
-exec tests/test-vdx.sh "$@"
+VD_DEV_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+exec env PYTHONPATH="$VD_DEV_DIR:$PYTHONPATH" python3 -m visidata.dev_cli test golden "$@"

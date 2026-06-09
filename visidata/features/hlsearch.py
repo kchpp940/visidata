@@ -1,12 +1,3 @@
-'''
-highlight search results with regex patterns
-'''
-
-__commands__ = [
-    'highlight-sheet', 'highlight-col', 'highlight-clear',
-    'search-keys', 'search-col', 'searchr-col', 'search-cols', 'searchr-cols',
-]
-
 from visidata import Sheet, TableSheet, Column
 from visidata import vd, dispwidth
 import re

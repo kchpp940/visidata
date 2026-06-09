@@ -423,7 +423,7 @@ for d in vd.jointypes:
 
     vd.addMenuItems(f'''Data > Join > Selected Sheets > {jointype} > join-selected-{jointype}''')
     vd.addMenuItems(f'''Data > Join > Top Two Sheets > {jointype} > join-sheets-top2-{jointype}''')
-    vd.addMenuItems(f'''Data > Join > All Sheets > {jointype} > join-sheets-all-{jointype}''')
+    vd.addMenuItems(f'''Data > Join > All Sheets > {jointype} > join-selected-{jointype}''')
 
 IndexSheet.guide += '''
     - `&` to join the selected sheets together

@@ -2,15 +2,34 @@
 
 ## Running all tests
 
-`dev/test-all.sh` is the top-level test runner. It discovers and runs all `tests/test-*.sh` scripts, prefixes each script's output with its name, and reports pass/fail.
+`vd-dev test all` (or `make test`) is the top-level test runner. It discovers and runs all `tests/test-*.sh` scripts, prefixes each script's output with its name, and reports pass/fail.
 
 ```bash
-dev/test-all.sh                        # run all test scripts
-dev/test-all.sh tests/test-vdx.sh      # run a specific test script
-dev/test-all.sh tests/test-smoke.sh tests/test-macros.sh  # run several
+vd-dev test all                           # run all test scripts
+vd-dev test all tests/test-vdx.sh         # run a specific test script
+vd-dev test all tests/test-smoke.sh tests/test-macros.sh  # run several
 ```
 
 Each `tests/test-*.sh` script is self-contained and can also be run directly.
+
+### Test commands quick reference
+
+| Command | What it does |
+|---------|-------------|
+| `vd-dev test all` | Run all test scripts |
+| `vd-dev test golden` | Run golden/cmdlog tests (replay `.vd*` files) |
+| `vd-dev test golden -d` | Debug mode: abort on first error, show diffs |
+| `vd-dev test golden -j 4` | Run golden tests with 4 parallel processes |
+| `vd-dev test golden issue655` | Run one specific golden test |
+| `vd-dev test unit` | Run Python unit tests (pytest) |
+| `vd-dev test unit -sv` | Run unit tests verbosely |
+| `vd-dev test individual` | Run each golden test in its own process (isolated) |
+| `vd-dev test smoke` | Quick startup smoke test |
+| `vd-dev test perf` | Performance tests |
+| `vd-dev test vgit` | vgit app tests |
+| `vd-dev test vdsql` | vdsql app tests |
+| `vd-dev lint` | Run ruff linter |
+| `vd-dev check` | Comprehensive check (lint + all tests) |
 
 ### Environment variables
 
@@ -61,16 +80,16 @@ Located in `tests/`. These are the primary test suite.
 
 **Running tests:**
 
-Use `dev/test.sh` directly (not `bash dev/test.sh`) so that permission prompts can be approved in bulk.
+Use `vd-dev test golden` (or `dev/test.sh`) directly (not `bash dev/test.sh`) so that permission prompts can be approved in bulk.
 
 ```bash
-dev/test.sh              # run all tests (batched, fast)
-dev/test.sh issue655     # run one test
-dev/test.sh foo bar baz  # run multiple tests
-dev/test.sh -d           # debug mode: abort on first error, show diffs
+vd-dev test golden              # run all tests (batched, fast)
+vd-dev test golden issue655     # run one test
+vd-dev test golden foo bar baz  # run multiple tests
+vd-dev test golden -d           # debug mode: abort on first error, show diffs
 
-dev/run-tests-individually.sh                # run each test in its own process (slower, isolated)
-dev/run-tests-individually.sh tests/foo.vdx  # run specific tests individually
+vd-dev test individual                    # run each test in its own process (slower, isolated)
+vd-dev test individual tests/foo.vdx      # run specific tests individually
 ```
 
 By default, `test.sh` splits tests into `nproc` parallel batches for speed (~5s). Use `-j N` to control parallelism. Use `run-tests-individually.sh` to run each test in its own process — slower but provides full isolation, useful for debugging cross-test contamination.
@@ -156,12 +175,12 @@ replay-exit                             # end of batch
 
 ## 2. Python tests (pytest)
 
-Located in `visidata/tests/`. Run with `pytest`.
+Located in `visidata/tests/`. Run with `vd-dev test unit` (or `pytest`).
 
 ```bash
-pytest visidata/tests/                    # run all
-pytest visidata/tests/test_commands.py    # test all commands execute without error
-pytest visidata/tests/test_features.py    # run test_ functions discovered from visidata modules
+vd-dev test unit                          # run all
+vd-dev test unit visidata/tests/test_commands.py    # test all commands execute without error
+vd-dev test unit visidata/tests/test_features.py    # run test_ functions discovered from visidata modules
 ```
 
 **Key files:**
@@ -207,11 +226,11 @@ For golden tests: create a `.vdx` file, generate golden output, and verify with 
 
 # vdsql Tests
 
-vdsql has its own test suite in `visidata/apps/vdsql/tests/`, run via `visidata/apps/vdsql/test.sh`. These are golden tests using the same pattern (replay `.vdj` files, compare output against `tests/golden/`). CI runs them separately via `.github/workflows/vdsql.yml`.
+vdsql has its own test suite in `visidata/apps/vdsql/tests/`, run via `vd-dev test vdsql`. These are golden tests using the same pattern (replay `.vdj` files, compare output against `tests/golden/`). CI runs them separately via `.github/workflows/vdsql.yml`.
 
 ```bash
-cd visidata/apps/vdsql && bash test.sh           # run all vdsql tests
-cd visidata/apps/vdsql && bash test.sh unselect   # run a single test
+vd-dev test vdsql                  # run all vdsql tests
+vd-dev test vdsql unselect         # run a single test
 ```
 
 # Test Configuration

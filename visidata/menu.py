@@ -122,17 +122,7 @@ def addMenu(vd, *args):
                 obj.menus.append(c)
             obj = c
         assert not obj.menus, 'cannot override submenu with longname'
-        if hasattr(vd, 'featureRegistry') and vd.featureRegistry and vd.featureRegistry._cmd_tracking_enabled:
-            leaf = item.longname if item.longname else item.title
-            fullpath = ' > '.join(menupath + [leaf])
-            existing_owner = vd.featureRegistry.find_menu_owner(fullpath)
-            if existing_owner and existing_owner != vd.importingModule:
-                raise ValueError(f'menu path `{fullpath}` already registered by feature `{existing_owner}`')
-            vd.featureRegistry.track_menu(fullpath)
         obj.longname = item.longname
-        if hasattr(vd, 'featureRegistry') and vd.featureRegistry and not vd.featureRegistry._cmd_tracking_enabled:
-            leaf = item.longname if item.longname else item.title
-            vd.featureRegistry.track_menu(' > '.join(menupath + [leaf]))
 
 
 def _intMenuPath(obj, menupath):

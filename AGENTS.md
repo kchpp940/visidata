@@ -16,12 +16,19 @@
 - `docs/` and `dev/`: user and developer documentation.
 
 ## Build, Test, and Development Commands
-- `python3 -m pip install .`: install local package.
-- `python3 -m pip install ".[test]"`: install optional test dependencies.
-- `vd --version`: startup sanity check.
-- `pytest -sv visidata/tests/`: run unit tests.
-- `dev/test.sh -j 4`: run functional cmdlog tests and compare `tests/golden/`.
-- `vd . --batch`: quick load smoke test.
+- `vd-dev install dev`: editable install with dev dependencies
+- `vd-dev install test`: install with test dependencies
+- `vd-dev install all`: install with all optional dependencies
+- `vd --version`: startup sanity check
+- `vd-dev test unit`: run unit tests (pytest)
+- `vd-dev test golden`: run functional cmdlog tests
+- `vd-dev test all`: run all test suites
+- `vd-dev lint`: run ruff linter
+- `vd-dev check`: comprehensive check (lint + all tests)
+- `vd-dev build`: build man pages and zsh completions
+- `vd . --batch`: quick load smoke test
+
+Or equivalently via `make`: `make install-dev`, `make test`, `make lint`, `make check`, etc.
 
 ## Coding and Command Conventions
 - Follow `dev/STYLE.md` for naming, quoting, decorators, and sheet/column patterns.
@@ -32,7 +39,7 @@
 ## Testing Guidelines
 - Update `tests/*.vd*` for workflow-visible behavior changes.
 - Update `visidata/tests/` for isolated Python logic.
-- Before PR: run `pytest -sv visidata/tests/` and `dev/test.sh -j 4`.
+- Before PR: run `vd-dev check` (or equivalently `vd-dev lint` and `vd-dev test all`).
 
 ## Commit & Pull Request Guidelines
 - Base PRs on `develop` (not `stable`).

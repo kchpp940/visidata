@@ -1,6 +1,4 @@
-__description__ = "repeat the last command with optional N times or for all selected rows"
 __commands__ = ["repeat-last", "repeat-input", "repeat-input-n", "repeat-input-selected"]
-__menus__ = ["Edit > Repeat > last command > repeat-input", "Edit > Repeat > last command N times > repeat-input-n", "Edit > Repeat > last command for all selected rows > repeat-input-selected"]
 from visidata import vd, BaseSheet, VisiData, asyncthread, Progress
 
 

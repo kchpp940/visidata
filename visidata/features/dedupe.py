@@ -1,4 +1,5 @@
-"""Detect and remove duplicate rows.
+"""
+# Usage
 
 Duplicates are determined by the sheet's key columns.
 

@@ -1,4 +1,5 @@
-"""Normalize column names to valid Python identifiers.
+"""
+# Usage
 
 This plugin normalizes column names in any given sheet, so that the names are:
 

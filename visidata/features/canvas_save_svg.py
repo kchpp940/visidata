@@ -1,9 +1,9 @@
 '''
-save canvas as SVG using matplotlib
+Add svg saver to Canvas.
+
+Requires matplotlib.pyplot
 '''
 
-__dependencies__ = ['matplotlib']
-__commands__ = []
 
 import collections
 
