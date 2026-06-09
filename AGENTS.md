@@ -19,6 +19,7 @@
 - `vd-dev install dev`: editable install with dev dependencies
 - `vd-dev install test`: install with test dependencies
 - `vd-dev install all`: install with all optional dependencies
+- `vd-dev install <mode> --check`: verify installation matches mode (without installing)
 - `vd --version`: startup sanity check
 - `vd-dev test unit`: run unit tests (pytest)
 - `vd-dev test golden`: run functional cmdlog tests
@@ -26,9 +27,14 @@
 - `vd-dev lint`: run ruff linter
 - `vd-dev check`: comprehensive check (lint + all tests)
 - `vd-dev build`: build man pages and zsh completions
+- `vd-dev preflight check`: release readiness checks (version, files, install)
+- `vd-dev preflight smoke`: fast import + version smoke test
+- `vd-dev package build`: build sdist + wheel into dist/
+- `vd-dev package verify`: verify built packages can be installed and imported
+- `vd-dev package clean`: remove dist/ and build/
 - `vd . --batch`: quick load smoke test
 
-Or equivalently via `make`: `make install-dev`, `make test`, `make lint`, `make check`, etc.
+Or equivalently via `make`: `make install-dev`, `make test`, `make lint`, `make check`, `make preflight`, `make package`, etc.
 
 ## Coding and Command Conventions
 - Follow `dev/STYLE.md` for naming, quoting, decorators, and sheet/column patterns.

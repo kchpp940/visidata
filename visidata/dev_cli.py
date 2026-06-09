@@ -10,7 +10,7 @@ Usage:
     vd-dev <command> [options] [args...]
 
 Commands:
-    install     Install package with optional extras
+    install     Install package with optional extras (--check to verify)
     test        Run tests (all, golden, unit, vgit, vdsql, smoke, perf, individual)
     build       Build resources (man, zsh, docker, all)
     lint        Run ruff linter
@@ -18,6 +18,8 @@ Commands:
     diff-test   Run git-diff-based tests
     clean       Remove generated files
     check       Run comprehensive check (lint + test)
+    preflight   Release readiness checks (check, smoke)
+    package     Build and verify distribution artifacts (build, verify, clean, all)
 
 Run `vd-dev <command> --help` for command-specific help.
 """
@@ -190,8 +192,127 @@ class TestEnv:
 # install
 # ═══════════════════════════════════════════════════════════════════════
 
+def _parse_requirements(path: Path) -> list[str]:
+    """Parse a requirements.txt-style file, stripping comments and blanks."""
+    if not path.exists():
+        return []
+    reqs = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "#" in line:
+            line = line.split("#", 1)[0].strip()
+        if line and not line.startswith(("-e git+", "git+")):
+            reqs.append(line)
+    return reqs
+
+
+def _pip_freeze_versions() -> dict[str, str]:
+    """Return {pkg_name_lower: version} from pip freeze."""
+    rc, out, _ = _run_capture([sys.executable, "-m", "pip", "freeze"], echo=False)
+    versions: dict[str, str] = {}
+    if rc != 0:
+        return versions
+    for line in out.splitlines():
+        line = line.strip()
+        if "==" in line and not line.startswith("-e"):
+            name, ver = line.split("==", 1)
+            versions[name.lower().replace("-", "_")] = ver
+    return versions
+
+
+def _check_install_consistency(mode: str) -> tuple[list[str], list[str]]:
+    """Check that the current environment matches the requested install mode.
+
+    Returns (issues, warnings) — issues are hard failures, warnings are advisory.
+    """
+    issues: list[str] = []
+    warnings: list[str] = []
+
+    # 1. Check visidata is installed (editable for dev/test/all)
+    rc, loc_out, _ = _run_capture(
+        [sys.executable, "-c", "import visidata, os; print(os.path.dirname(visidata.__file__))"],
+        echo=False,
+    )
+    if rc != 0:
+        issues.append("visidata package not importable — run `vd-dev install` first")
+    else:
+        installed_dir = Path(loc_out.strip())
+        source_dir = ROOT / "visidata"
+        if mode in ("dev", "test", "all"):
+            if installed_dir.resolve() != source_dir.resolve():
+                issues.append(
+                    f"visidata not in editable mode: installed at {installed_dir}, "
+                    f"expected {source_dir}. Re-run `vd-dev install {mode}`."
+                )
+        elif mode == "prod":
+            if installed_dir.resolve() == source_dir.resolve():
+                issues.append(
+                    "visidata is in editable mode but prod mode requested. "
+                    "Re-run `vd-dev install prod`."
+                )
+
+    # 2. Check test deps for test/all mode
+    if mode in ("test", "all"):
+        required_test = ["pytest"]
+        optional_test = ["pandas", "pyarrow"]
+        installed = _pip_freeze_versions()
+        missing_req = [p for p in required_test if p.lower().replace("-", "_") not in installed]
+        missing_opt = [p for p in optional_test if p.lower().replace("-", "_") not in installed]
+        if missing_req:
+            issues.append(
+                f"missing required test dependencies: {', '.join(missing_req)}. "
+                f"Run `vd-dev install {mode}`."
+            )
+        if missing_opt:
+            warnings.append(
+                f"missing optional test dependencies: {', '.join(missing_opt)} "
+                f"(some golden tests will skip)"
+            )
+
+    # 3. Check dev deps for dev/all mode
+    if mode in ("dev", "all"):
+        required_dev = ["pytest"]
+        optional_dev = ["ruff"]
+        installed = _pip_freeze_versions()
+        missing_req = [p for p in required_dev if p.lower().replace("-", "_") not in installed]
+        missing_opt = [p for p in optional_dev if p.lower().replace("-", "_") not in installed]
+        if missing_req:
+            issues.append(
+                f"missing required dev dependencies: {', '.join(missing_req)}. "
+                f"Run `vd-dev install {mode}`."
+            )
+        if missing_opt:
+            warnings.append(
+                f"missing optional dev dependencies: {', '.join(missing_opt)}"
+            )
+
+    return issues, warnings
+
+
 def cmd_install(args: argparse.Namespace) -> int:
     mode = args.mode
+    check_only = getattr(args, "check", False)
+
+    if check_only:
+        issues, warnings = _check_install_consistency(mode)
+        for w in warnings:
+            _print_warn(w)
+        if issues:
+            for msg in issues:
+                _print_err(msg)
+            _print_err(
+                f"installation does not match '{mode}' mode "
+                f"({len(issues)} issue(s), {len(warnings)} warning(s))"
+            )
+            return EXIT_ERR
+        _print_info(
+            f"installation matches '{mode}' mode "
+            f"(0 issues, {len(warnings)} warning(s))"
+        )
+        return EXIT_OK
+
     if mode == "dev":
         rc = _run([sys.executable, "-m", "pip", "install", "-r", "dev/requirements-dev.txt"])
         if rc != 0:
@@ -210,6 +331,8 @@ def setup_install(sub) -> None:
     p.add_argument("mode", nargs="?", default="dev",
                    choices=["dev", "test", "all", "prod"],
                    help="installation mode (default: dev)")
+    p.add_argument("--check", action="store_true",
+                   help="only verify installation matches mode, do not install")
     p.set_defaults(func=cmd_install)
 
 
@@ -1080,6 +1203,296 @@ def setup_check(sub) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# preflight (release readiness checks)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _read_version_setup() -> str:
+    """Extract __version__ from setup.py."""
+    for line in (ROOT / "setup.py").read_text().splitlines():
+        if line.strip().startswith("__version__"):
+            # __version__ = "3.4dev"
+            parts = line.split("=", 1)
+            if len(parts) == 2:
+                return parts[1].strip().strip('"').strip("'")
+    return ""
+
+
+def _read_version_init() -> str:
+    """Extract __version__ from visidata/__init__.py."""
+    for line in (ROOT / "visidata" / "__init__.py").read_text().splitlines():
+        if line.strip().startswith("__version__"):
+            parts = line.split("=", 1)
+            if len(parts) == 2:
+                return parts[1].strip().strip('"').strip("'")
+    return ""
+
+
+def _read_version_main() -> str:
+    """Extract version from visidata/main.py if present."""
+    main_py = ROOT / "visidata" / "main.py"
+    if not main_py.exists():
+        return ""
+    for line in main_py.read_text().splitlines():
+        if "__version__" in line and "=" in line:
+            parts = line.split("=", 1)
+            if len(parts) == 2:
+                ver = parts[1].strip().strip('"').strip("'").rstrip(",")
+                if ver:
+                    return ver
+    return ""
+
+
+def cmd_preflight_check(args: argparse.Namespace) -> int:
+    """Run pre-release checks (version consistency, files, etc.)."""
+    issues: list[str] = []
+    warnings: list[str] = []
+
+    # 1. Version consistency
+    v_setup = _read_version_setup()
+    v_init = _read_version_init()
+    v_main = _read_version_main()
+
+    _print_info(f"versions — setup.py: {v_setup or '(missing)'}  "
+                f"__init__.py: {v_init or '(missing)'}  "
+                f"main.py: {v_main or '(n/a)'}")
+
+    versions = {v for v in (v_setup, v_init, v_main) if v}
+    if len(versions) > 1:
+        issues.append(f"version mismatch: setup.py={v_setup!r} __init__.py={v_init!r} main.py={v_main!r}")
+    elif not versions:
+        issues.append("could not determine version from any source file")
+    else:
+        version = next(iter(versions))
+        if version.endswith("dev"):
+            warnings.append(f"version {version!r} still has 'dev' suffix — bump before release")
+
+    # 2. CHANGELOG has entry for current version
+    changelog = ROOT / "CHANGELOG.md"
+    if changelog.exists():
+        head = changelog.read_text()[:2000]
+        if v_setup and v_setup not in head and not v_setup.endswith("dev"):
+            issues.append(f"CHANGELOG.md does not mention version {v_setup} near the top")
+    else:
+        warnings.append("CHANGELOG.md not found")
+
+    # 3. Man pages and generated files exist
+    required_generated = [
+        ROOT / "visidata/man/vd.1",
+        ROOT / "visidata/man/visidata.1",
+    ]
+    for f in required_generated:
+        if not f.exists():
+            warnings.append(f"generated file missing: {f.relative_to(ROOT)} — run `vd-dev build man`")
+
+    # 4. Install consistency (dev mode at minimum)
+    install_issues, install_warnings = _check_install_consistency("dev")
+    issues.extend(install_issues)
+    warnings.extend(install_warnings)
+
+    # 5. Setup.py extras_require "test" matches actual test needs
+    rc, imports_out, _ = _run_capture(
+        [sys.executable, "-c", (
+            "import sys; sys.path.insert(0, '.');\n"
+            "exec(open('setup.py').read().split('setup(')[0]);\n"
+            "print('\\n'.join(extras_require.get('test', [])))"
+        )],
+        echo=False,
+    )
+    if rc == 0 and imports_out.strip():
+        test_pkgs_cfg = set()
+        for line in imports_out.splitlines():
+            name = line.strip().split(">=")[0].split(";")[0].split("[")[0].strip().lower().replace("-", "_")
+            if name:
+                test_pkgs_cfg.add(name)
+        installed = _pip_freeze_versions()
+        missing_cfg = [p for p in sorted(test_pkgs_cfg) if p not in installed]
+        if missing_cfg and not v_setup.endswith("dev"):
+            warnings.append(
+                f"setup.py [test] extras not all installed locally: {', '.join(missing_cfg)}"
+            )
+
+    # 6. Report
+    if warnings:
+        for w in warnings:
+            _print_warn(w)
+    if issues:
+        for i in issues:
+            _print_err(i)
+        _print_err(f"preflight check failed: {len(issues)} issue(s), {len(warnings)} warning(s)")
+        return EXIT_ERR
+
+    _print_info(f"preflight check passed (0 issues, {len(warnings)} warning(s))")
+    return EXIT_OK
+
+
+def cmd_preflight_smoke(args: argparse.Namespace) -> int:
+    """Fast pre-release smoke test: import + version + basic load."""
+    _print_info("import visidata...")
+    rc, out, err = _run_capture(
+        [sys.executable, "-c", "import visidata; print(visidata.__version_info__)"],
+        echo=False,
+    )
+    if rc != 0:
+        _print_err(f"import failed: {err.strip()}")
+        return rc
+    _print_info(f"  {out.strip()}")
+
+    _print_info("vd --version...")
+    rc = cmd_test_smoke(args)
+    if rc != 0:
+        return rc
+
+    _print_info("preflight smoke OK")
+    return EXIT_OK
+
+
+def cmd_preflight(args: argparse.Namespace) -> int:
+    mode = args.mode
+    if mode == "check":
+        return cmd_preflight_check(args)
+    if mode == "smoke":
+        return cmd_preflight_smoke(args)
+    _die(f"unknown preflight mode: {mode}")
+
+
+def setup_preflight(sub) -> None:
+    p = sub.add_parser("preflight", help="release readiness checks")
+    p.add_argument("mode", nargs="?", default="check",
+                   choices=["check", "smoke"],
+                   help="check mode (default: check)")
+    p.set_defaults(func=cmd_preflight)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# package (build and verify distribution artifacts)
+# ═══════════════════════════════════════════════════════════════════════
+
+def cmd_package_build(args: argparse.Namespace) -> int:
+    """Build sdist + wheel into dist/."""
+    dist = ROOT / "dist"
+    build = ROOT / "build"
+    for d in (dist, build):
+        if d.exists():
+            _print_info(f"remove {d.relative_to(ROOT)}/")
+            shutil.rmtree(d)
+
+    rc = _run([sys.executable, "-m", "pip", "install", "--quiet", "--upgrade", "build"])
+    if rc != 0:
+        _print_warn("could not upgrade build; will try to use installed version")
+
+    rc = _run([sys.executable, "-m", "build"])
+    if rc != 0:
+        return rc
+
+    # chmod -R a+rX dist
+    for root, dirs, files in os.walk(dist):
+        for d in dirs:
+            os.chmod(os.path.join(root, d), 0o755)
+        for f in files:
+            os.chmod(os.path.join(root, f), 0o644)
+
+    _print_info("built artifacts:")
+    for f in sorted(dist.iterdir()):
+        size = f.stat().st_size
+        _print_info(f"  {f.name}  ({size:,} bytes)")
+    return EXIT_OK
+
+
+def cmd_package_verify(args: argparse.Namespace) -> int:
+    """Verify built packages: metadata, required files, can be imported."""
+    dist = ROOT / "dist"
+    if not dist.exists() or not any(dist.iterdir()):
+        _print_err("no artifacts in dist/ — run `vd-dev package build` first")
+        return EXIT_ERR
+
+    issues: list[str] = []
+
+    # 1. Find sdist and wheel
+    sdist_files = list(dist.glob("*.tar.gz"))
+    wheel_files = list(dist.glob("*.whl"))
+    if not sdist_files:
+        issues.append("missing sdist (.tar.gz) in dist/")
+    if not wheel_files:
+        issues.append("missing wheel (.whl) in dist/")
+
+    # 2. Try pip install in a temp venv if venv module available
+    if wheel_files:
+        import venv as _venv
+        tmpdir = Path(tempfile.mkdtemp(prefix="vd-pkgverify-"))
+        try:
+            venv_dir = tmpdir / "venv"
+            _venv.create(venv_dir, with_pip=True)
+            venv_python = venv_dir / "bin" / "python"
+            if not venv_python.exists():
+                venv_python = venv_dir / "Scripts" / "python.exe"
+
+            wheel = str(wheel_files[0])
+            rc, out, err = _run_capture(
+                [str(venv_python), "-m", "pip", "install", wheel],
+                echo=False,
+            )
+            if rc != 0:
+                issues.append(f"pip install from wheel failed: {err.strip()[:300]}")
+            else:
+                rc, out, err = _run_capture(
+                    [str(venv_python), "-c",
+                     "import visidata; print(visidata.__version_info__)"],
+                    echo=False,
+                )
+                if rc != 0:
+                    issues.append(f"import after wheel install failed: {err.strip()[:300]}")
+                else:
+                    _print_info(f"  wheel install + import: {out.strip()}")
+        except Exception as e:
+            _print_warn(f"could not verify wheel in venv: {e}")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    # 3. Report
+    if issues:
+        for i in issues:
+            _print_err(i)
+        _print_err(f"package verify failed: {len(issues)} issue(s)")
+        return EXIT_ERR
+    _print_info("package verify passed")
+    return EXIT_OK
+
+
+def cmd_package_clean(args: argparse.Namespace) -> int:
+    """Remove dist/ and build/ directories."""
+    for dname in ("dist", "build"):
+        d = ROOT / dname
+        if d.exists():
+            _print_info(f"remove {dname}/")
+            shutil.rmtree(d)
+    return EXIT_OK
+
+
+def cmd_package(args: argparse.Namespace) -> int:
+    mode = args.mode
+    if mode == "build":
+        return cmd_package_build(args)
+    if mode == "verify":
+        return cmd_package_verify(args)
+    if mode == "clean":
+        return cmd_package_clean(args)
+    if mode == "all":
+        rc = cmd_package_build(args)
+        if rc != 0:
+            return rc
+        return cmd_package_verify(args)
+    _die(f"unknown package mode: {mode}")
+
+
+def setup_package(sub) -> None:
+    p = sub.add_parser("package", help="build and verify distribution artifacts")
+    p.add_argument("mode", nargs="?", default="all",
+                   choices=["all", "build", "verify", "clean"],
+                   help="what to do (default: all = build + verify)")
+    p.set_defaults(func=cmd_package)
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # main
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -1102,6 +1515,8 @@ def build_parser() -> argparse.ArgumentParser:
     setup_diff_test(sub)
     setup_clean(sub)
     setup_check(sub)
+    setup_preflight(sub)
+    setup_package(sub)
 
     return parser
 

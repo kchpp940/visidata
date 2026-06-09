@@ -32,6 +32,7 @@ All development actions are unified under the `vd-dev` CLI (installed with the p
 
 | Command | Description |
 |---------|-------------|
+| `vd-dev install [dev|test|all|prod] [--check]` | Install package; `--check` verifies mode without installing |
 | `vd-dev test golden` | Run test suite (batched, fast; `-d` for debug; see `TESTING.md`) |
 | `vd-dev test individual` | Run each test in its own process (isolated, slower; see `TESTING.md`) |
 | `vd-dev test all` | Run all test suites |
@@ -39,6 +40,12 @@ All development actions are unified under the `vd-dev` CLI (installed with the p
 | `vd-dev build zsh` | Generate zsh completions |
 | `vd-dev lint` | Run ruff linter |
 | `vd-dev check` | Comprehensive check (lint + all tests) |
+| `vd-dev preflight check` | Release readiness checks (version, files, install) |
+| `vd-dev preflight smoke` | Fast import + version smoke test |
+| `vd-dev package build` | Build sdist + wheel into dist/ |
+| `vd-dev package verify` | Verify built packages can be installed and imported |
+| `vd-dev package all` | Build + verify (default) |
+| `vd-dev package clean` | Remove dist/ and build/ |
 | `vd-dev setup hooks` | Configure git hooks |
 | `vd-dev setup vscode` | Configure VS Code settings |
 | `vd-dev diff-test` | Diff-based test runner |

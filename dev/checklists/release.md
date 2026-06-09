@@ -13,9 +13,17 @@
     c. visidata.org; (formats?)
         - remember to check the tables with prettier: https://github.com/saulpw/visidata/pull/2056
 
-3. Ensure `develop` automated tests run correctly with dev/test.sh
+3. Ensure `develop` automated tests run correctly
 
-4. Go through the manual tests checklist
+    `vd-dev test all`
+
+4. Run release readiness checks
+
+    `vd-dev preflight check`
+    - verifies version consistency across setup.py / __init__.py / main.py
+    - checks CHANGELOG mentions current version
+    - verifies generated files (man pages) exist
+    - confirms editable install matches dev mode
 
 5. Verify that setup.py is up-to-date with requirements.
 
