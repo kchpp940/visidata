@@ -1,4 +1,5 @@
 import time
+import json
 
 from visidata import vd, VisiData, BaseSheet, Sheet, TextSheet, PyobjSheet
 from visidata import ItemColumn, Column, vlen, date, asyncsingle, AttrDict
@@ -67,6 +68,20 @@ def parseColumns(vd, fieldlist):
         yield ItemColumn(cname, **kwargs)
 
 
+def _zulip_source_params(func_name, args, kwargs):
+    '''Return cache-key params for a Zulip API call.'''
+    site = None
+    client = getattr(vd, 'z_client', None)
+    if client:
+        site = getattr(client, 'base_url', None) or getattr(client, 'site', None)
+    return {
+        'site': site,
+        'func': func_name,
+        'args': list(args),
+        'kwargs': dict(kwargs),
+    }
+
+
 class ZulipAPISheet(Sheet):
     zulip_func = None
     zulip_result_key = ''
@@ -80,9 +95,26 @@ class ZulipAPISheet(Sheet):
             self.addColumn(c)
 
         zulip_func = self.zulip_func
-        if isinstance(zulip_func, str): # allow later binding for startup perf
+        if isinstance(zulip_func, str):
             zulip_func = getattr(vd.z_client, zulip_func)
-        r = zulip_func(*self.zulip_args, **self.zulip_kwargs)
+
+        func_name = self.zulip_func if isinstance(self.zulip_func, str) else zulip_func.__name__
+        source_params = _zulip_source_params(func_name, self.zulip_args, self.zulip_kwargs)
+
+        def _fetch():
+            r = zulip_func(*self.zulip_args, **self.zulip_kwargs)
+            return json.dumps(r, ensure_ascii=False)
+
+        cp = vd.remote_fetch(
+            'zulip', source_params, _fetch,
+            days=0,
+            status_online=f'fetching {func_name} from zulip',
+            error_msg=f'cannot fetch zulip `{func_name}`',
+        )
+
+        with cp.open(encoding='utf-8') as fp:
+            r = json.load(fp)
+
         if r['result'] != 'success':
             vd.push(PyobjSheet(self.zulip_result_key+'_error', source=r))
             return
@@ -98,7 +130,7 @@ class ZulipStreamsSheet(ZulipAPISheet):
 - `Enter` to open recent messages from the stream
 - `z Enter` to open list of topics from the stream
 '''
-    rowtype = 'streams'  # rowdef: dict of stream from server
+    rowtype = 'streams'
     fields = '-#stream_id name @date_created description -rendered_description -invite_only -is_web_public -stream_post_policy -history_public_to_subscribers -#first_message_id -#message_retention_days -is_announcement_only'
 
     def openRow(self, r):
@@ -112,7 +144,7 @@ class ZulipStreamsSheet(ZulipAPISheet):
 
 
 class ZulipTopicsSheet(ZulipAPISheet):
-    rowtype = 'topics'  # rowdef: dict of topic from server
+    rowtype = 'topics'
     fields='name #max_id'
     def openRow(self, r):
         return ZulipMessagesSheet(f'{r.name}:{r.subject}', filters=dict(stream=r.name, topic=r.subject))
@@ -122,7 +154,7 @@ class ZulipMembersSheet(ZulipAPISheet):
     guide = '''# Zulip Members
 - `Enter` to open list of messages from this member
 '''
-    rowtype = 'members'  # rowdef: dict of member from server
+    rowtype = 'members'
     fields = '''-#user_id full_name email timezone @date_joined -#avatar_version -is_admin -is_owner -is_guest -is_bot -#role -is_active -avatar_url -bot_type -#bot_owner_id'''
     def openRow(self, r):
         return ZulipMessagesSheet(r.display_recipient, filters=dict(stream=r.display_recipient))
@@ -135,8 +167,7 @@ Loads continuously starting with most recent, until all messages have been read.
 - `Ctrl+C` to cancel loading.
 - `Enter` to open message in word-wrapped text sheet
 '''
-    rowtype = 'messages'  # rowdef: dict of message from server
-#    fields = ''
+    rowtype = 'messages'
     columns = [
         ItemColumn('timestamp', type=date, fmtstr='%Y-%m-%d %H:%M'),
         ItemColumn('sender', 'sender_full_name'),
@@ -151,7 +182,7 @@ Loads continuously starting with most recent, until all messages have been read.
     ]
     filters={}
 
-    @asyncsingle # kill previous thread
+    @asyncsingle
     def reload(self):
         self.rows = []
         narrow = list(self.filters.items())
@@ -164,7 +195,22 @@ Loads continuously starting with most recent, until all messages have been read.
             narrow = narrow)
 
         while True:
-            r = vd.z_client.call_endpoint(url='messages', method='GET', request=req)
+            source_params = _zulip_source_params('get_messages', [], dict(req))
+
+            def _fetch(req=req):
+                r = vd.z_client.call_endpoint(url='messages', method='GET', request=req)
+                return json.dumps(r, ensure_ascii=False)
+
+            cp = vd.remote_fetch(
+                'zulip_messages', source_params, _fetch,
+                days=0,
+                status_online='fetching messages from zulip',
+                error_msg='cannot fetch zulip messages',
+            )
+
+            with cp.open(encoding='utf-8') as fp:
+                r = json.load(fp)
+
             if r['result'] == 'success':
                 if not r['messages']: break
                 for i, msg in enumerate(r['messages']):
@@ -175,12 +221,9 @@ Loads continuously starting with most recent, until all messages have been read.
                     break
                 time.sleep(s)
 
-#        vd.status('finished loading, waiting for new messages')
-#        vd.z_client.call_on_each_event(self.received_event, ['message'], narrow=narrow)
-
     def get_channel_name(self, r):
         recp = r['display_recipient']
-        if isinstance(recp, list):  # private message
+        if isinstance(recp, list):
             return '[%s]' % recp[0]['full_name']
         else:
             return '%s:%s' % (recp, r['subject'])

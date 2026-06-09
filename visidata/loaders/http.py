@@ -3,7 +3,7 @@ import re
 from visidata import Path, RepeatFile, vd, VisiData, __version_info__
 from visidata.loaders.tsv import splitter
 
-vd.option('http_max_next', 0, 'max next.url pages to follow in http response') #848
+vd.option('http_max_next', 0, 'max next.url pages to follow in http response')
 vd.option('http_req_headers', {'User-Agent': __version_info__}, 'http headers to send to requests')
 vd.option('http_ssl_verify', True, 'verify host and certificates for https')
 
@@ -24,6 +24,48 @@ def guessurl_mimetype(vd, path, response):
     if subtype in content_filetypes:
         return dict(filetype=content_filetypes.get(subtype), _likelihood=10)
 
+
+def _http_source_params(path):
+    '''Return cache-key params dict for an HTTP source.'''
+    return {
+        'url': path.given,
+        'headers': dict(vd.options.getall('http_req_')),
+        'ssl_verify': vd.options.http_ssl_verify,
+    }
+
+
+def _http_fetch_response(url, ctx):
+    '''Fetch a single URL.  Returns (response_or_None, body_bytes).  On cache hit, response is None.'''
+    import urllib.request
+
+    req = urllib.request.Request(url, **vd.options.getall('http_req_'))
+
+    source_params = {'url': url, 'headers': dict(vd.options.getall('http_req_'))}
+
+    def _fetch():
+        resp = urllib.request.urlopen(req, context=ctx)
+        body = resp.read()
+        return body, resp
+
+    try:
+        cp = vd.remote_fetch(
+            'http', source_params, lambda: _fetch()[0],
+            text=False,
+            status_online=f'fetching {url}',
+            status_offline=f'offline: using cached data for `{url}`',
+            error_msg=f'cannot open URL `{url}`',
+        )
+    except Exception as e:
+        raise
+
+    with cp.open_bytes() as fp:
+        cached_body = fp.read()
+
+    try:
+        resp = urllib.request.urlopen(req, context=ctx)
+        return resp, resp.read()
+    except Exception:
+        return None, cached_body
 
 
 @VisiData.api
@@ -49,27 +91,62 @@ def openurl_http(vd, path, filetype=None):
         ctx.verify_mode = ssl.CERT_NONE
 
     req = urllib.request.Request(path.given, **vd.options.getall('http_req_'))
+    source_params = _http_source_params(path)
+
+    def _live_fetch():
+        return urllib.request.urlopen(req, context=ctx)
+
+    response = None
+    body_bytes = None
+
+    cached = vd.remote_cached('http', source_params)
     try:
-        response = urllib.request.urlopen(req, context=ctx)
-    except urllib.error.HTTPError as e:
-        vd.fail(f'cannot open URL: HTTP Error {e.code}: {e.reason}')
-    except urllib.error.URLError as e:
-        vd.fail(f'cannot open URL: {e.reason}')
+        try:
+            response = _live_fetch()
+            body_bytes = response.read()
+            vd.remote_fetch(
+                'http', source_params, lambda: body_bytes,
+                text=False,
+                force_refresh=True,
+            )
+        except (urllib.error.HTTPError, urllib.error.URLError) as e:
+            if cached and vd.options.remote_offline_fallback:
+                vd.warning(f'offline: using cached data for `{path.given}`; {e}')
+                with cached.open_bytes() as fp:
+                    body_bytes = fp.read()
+            else:
+                if isinstance(e, urllib.error.HTTPError):
+                    vd.fail(f'cannot open URL: HTTP Error {e.code}: {e.reason}')
+                else:
+                    vd.fail(f'cannot open URL: {e.reason}')
+    except Exception as e:
+        if cached and vd.options.remote_offline_fallback:
+            vd.warning(f'offline: using cached data for `{path.given}`; {e}')
+            with cached.open_bytes() as fp:
+                body_bytes = fp.read()
+        else:
+            vd.fail(f'cannot open URL: {e}')
 
-    filetype = filetype or vd.guessFiletype(path, response, funcprefix='guessurl_').get('filetype')  # try guessing by url
-    filetype = filetype or vd.guessFiletype(path, funcprefix='guess_').get('filetype')  # try guessing by contents
+    if response is not None:
+        filetype = filetype or vd.guessFiletype(path, response, funcprefix='guessurl_').get('filetype')
+    filetype = filetype or vd.guessFiletype(path, funcprefix='guess_').get('filetype')
 
-    # Automatically paginate if a 'next' URL is given
-    def _iter_lines(path=path, response=response, max_next=vd.options.http_max_next):
+    def _iter_lines(initial_body=body_bytes, initial_resp=response, max_next=vd.options.http_max_next):
         path.responses = []
         n = 0
-        while response:
-            path.responses.append(response)
-            with response as fp:
-                for line in splitter(response, delim=b'\n'):
-                    yield line.decode(vd.options.encoding)
+        cur_body = initial_body
+        cur_resp = initial_resp
 
-            linkhdr = response.getheader('Link')
+        while True:
+            if cur_resp is not None:
+                path.responses.append(cur_resp)
+
+            import io
+            fp = io.BytesIO(cur_body)
+            for line in splitter(fp, delim=b'\n'):
+                yield line.decode(vd.options.encoding)
+
+            linkhdr = cur_resp and cur_resp.getheader('Link')
             src = None
             if linkhdr:
                 links = parse_header_links(linkhdr)
@@ -88,10 +165,26 @@ def openurl_http(vd, path, filetype=None):
                 break
 
             vd.status(f'fetching next page from {src}')
-            req = urllib.request.Request(src, **vd.options.getall('http_req_'))
-            response = urllib.request.urlopen(req)
+            next_req = urllib.request.Request(src, **vd.options.getall('http_req_'))
+            try:
+                cur_resp = urllib.request.urlopen(next_req, context=ctx)
+                cur_body = cur_resp.read()
+                next_params = {'url': src, 'headers': dict(vd.options.getall('http_req_'))}
+                vd.remote_fetch(
+                    'http', next_params, lambda: cur_body,
+                    text=False, force_refresh=True,
+                )
+            except Exception as e:
+                next_cached = vd.remote_cached('http', {'url': src, 'headers': dict(vd.options.getall('http_req_'))})
+                if next_cached and vd.options.remote_offline_fallback:
+                    vd.warning(f'offline: using cached data for `{src}`; {e}')
+                    with next_cached.open_bytes() as fp:
+                        cur_body = fp.read()
+                    cur_resp = None
+                else:
+                    vd.warning(f'cannot fetch next page from {src}: {e}')
+                    break
 
-    # add resettable iterator over contents as an already-open fp
     path.fptext = RepeatFile(_iter_lines())
 
     return vd.openSource(path, filetype=filetype)

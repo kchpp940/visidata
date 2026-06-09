@@ -9,6 +9,7 @@
 - [:keystrokes]ga[/] to append more subreddits matching input by name or description
 '''
 
+import json
 import visidata
 from visidata import vd, VisiData, Sheet, AttrColumn, asyncthread, anytype, date
 
@@ -16,6 +17,15 @@ from visidata import vd, VisiData, Sheet, AttrColumn, asyncthread, anytype, date
 vd.option('reddit_client_id', '', 'client_id for reddit API')
 vd.option('reddit_client_secret', '', 'client_secret for reddit API')
 vd.option('reddit_user_agent', visidata.__version_info__, 'user_agent for reddit API')
+
+
+def _reddit_source_params(operation, params):
+    '''Return cache-key params for a Reddit API operation.'''
+    return {
+        'operation': operation,
+        'params': params,
+        'client_id': vd.options.reddit_client_id,
+    }
 
 
 @VisiData.api
@@ -131,8 +141,7 @@ def hiddenCols(hidden_attrs):
 
 class SubredditSheet(Sheet):
     guide = __doc__
-    # source is a text list of subreddits
-    rowtype = 'subreddits'  # rowdef: praw.Subreddit
+    rowtype = 'subreddits'
     nKeys=1
     search=False
     columns = [
@@ -149,7 +158,8 @@ class SubredditSheet(Sheet):
         for name in self.source:
             name = name.strip()
             if self.search:
-                yield from vd.reddit.subreddits.search(name)
+                for r in vd.reddit.subreddits.search(name):
+                    yield r
             else:
                 try:
                     r = vd.reddit.subreddit(name)
@@ -167,8 +177,7 @@ class SubredditSheet(Sheet):
 
 
 class RedditorsSheet(Sheet):
-    # source is a text list of usernames
-    rowtype = 'redditors'  # rowdef: praw.Subreddit
+    rowtype = 'redditors'
     nKeys=1
     columns = [
         AttrColumn('name', width=15),
@@ -199,8 +208,7 @@ class RedditSubmissions(Sheet):
   [:keys]Enter[/] to open sheet with comments for the current post
   [:keys]ga[/] to add posts in this subreddit matching input'''
 
-    # source=ListingGenerator
-    rowtype='reddit posts' # rowdef: praw.Submission
+    rowtype='reddit posts'
     nKeys=2
     columns = [
         AttrColumn('subreddit'),
@@ -217,7 +225,7 @@ class RedditSubmissions(Sheet):
     ] + list(hiddenCols(post_hidden_attrs))
 
     def iterload(self):
-        kind = 'new' # 'top'
+        kind = 'new'
         f = getattr(self.source, kind, None)
         if f:
             yield from f(limit=10000)
@@ -227,8 +235,7 @@ class RedditSubmissions(Sheet):
 
 
 class RedditComments(Sheet):
-    # source=list of comments
-    rowtype='comments' # rowdef: praw.Comment
+    rowtype='comments'
     nKeys=2
     columns=[
         AttrColumn('subreddit', width=0),
