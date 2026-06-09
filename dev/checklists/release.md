@@ -22,15 +22,31 @@ make preflight
 
 | Fixer | What it does |
 |---|---|
-| `--fix-version` | Syncs version numbers across all files from the **canonical source** `visidata/__init__.py` → updates `setup.py`, `visidata/main.py`, `README.md` |
+| `--fix-version` | Syncs version numbers from the **canonical source** `visidata/__init__.py`. Display version (e.g. `3.4dev`) goes to `visidata/main.py` and `README.md`; PEP 440 mapped version (e.g. `3.4.dev0`) goes to `setup.py`. See "Version Mapping" below. |
 | `--fix-date`    | Updates the `.Dd` date line in `visidata/man/vd.inc` to today |
-| `--fix-docs`    | Rebuilds manpages (`vd.1`, `visidata.1`, `vd.txt`, `docs/man.md`) via `dev/mkman.sh` (requires `soelim`, `preconv` from groff; optionally `man`, `aha`) |
+| `--fix-docs`    | Rebuilds manpages (`vd.1`, `visidata.1`, `vd.txt`, `docs/man.md`) via `dev/mkman.sh` (requires `soelim`, `preconv` from groff; optionally `man`, `aha`). Missing tools produce a **WARN** (non-fatal) so version/date fixes still apply; the docs check will flag missing artifacts explicitly. |
+
+**Version Mapping Rules** (display version ↔ PEP 440 package version):
+
+| Display (for UI, README, manpage) | PEP 440 (for setup.py, wheel/sdist metadata) |
+|---|---|
+| `3.4dev`  | `3.4.dev0` |
+| `3.4`     | `3.4`       (identical) |
+| `3.4.1`   | `3.4.1`     (identical) |
+
+Only `visidata/__init__.py` is the canonical source of truth. Never edit `setup.py`'s `__version__` by hand; run `--fix-version` instead.
+
+**Fixer status semantics**:
+- `[OK]`   — no changes needed, already correct
+- `[DONE]` — file(s) updated successfully
+- `[WARN]` — skipped (e.g. missing tools); non-fatal so other fixers still run. The matching checker (e.g. `docs`, `metadata`) will flag the underlying problem as `[FAIL]` at the check stage.
+- `[FAIL]` — hard error (e.g. canonical version file missing); aborts the fix phase.
 
 **Checkers** (always run after fixes):
 
 | Check | What it validates |
 |---|---|
-| `version`   | `setup.py`, `visidata/__init__.py`, `visidata/main.py`, `README.md` all carry the same version |
+| `version`   | Display-version files agree, PEP 440 files agree, and the two sides map correctly |
 | `imports`   | All submodules under `features/`, `loaders/`, `themes/` have valid Python syntax and are declared in `setup.py packages` |
 | `cli`       | `console_scripts` entry points resolve to real callables; `bin/vd` and `visidata/__main__.py` reference `visidata.main:vd_cli` |
 | `docs`      | Manpage artifacts (`vd.1`, `visidata.1`, `vd.txt`, `docs/man.md`) exist on disk |

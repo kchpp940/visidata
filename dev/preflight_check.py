@@ -38,10 +38,21 @@ MAN_DIR = VD / "man"
 
 
 # ---------------------------------------------------------------------------
-# Canonical version source: visidata/__init__.py
+# Version mapping: display version vs PEP 440 package version
+#
+# Display version (canonical source: visidata/__init__.py):  e.g. "3.4dev"
+#   - used in: visidata/__init__.py, visidata/main.py, README.md, manpage
+#
+# PEP 440 package version (for wheel/sdist metadata):          e.g. "3.4.dev0"
+#   - used in: setup.py
+#
+# Mapping rules:
+#   display "X.Ydev"    <->  PEP 440 "X.Y.dev0"
+#   display "X.Y"       <->  PEP 440 "X.Y"        (no dev suffix, same string)
+#   display "X.Y.Z"     <->  PEP 440 "X.Y.Z"      (same)
 # ---------------------------------------------------------------------------
 
-VERSION_SOURCES: Dict[str, Tuple[Path, str]] = {
+DISPLAY_VERSION_SOURCES: Dict[str, Tuple[Path, str]] = {
     "visidata/__init__.py": (
         VD / "__init__.py",
         r"__version__\s*=\s*['\"]([^'\"]+)['\"]"
@@ -50,31 +61,68 @@ VERSION_SOURCES: Dict[str, Tuple[Path, str]] = {
         VD / "main.py",
         r"__version__\s*=\s*['\"]([^'\"]+)['\"]"
     ),
-    "setup.py": (
-        ROOT / "setup.py",
-        r'__version__\s*=\s*["\']([^"\']+)["\']'
-    ),
     "README.md": (
         ROOT / "README.md",
         r"# VisiData v([\w.]+)"
     ),
 }
 
+PEP440_VERSION_SOURCES: Dict[str, Tuple[Path, str]] = {
+    "setup.py": (
+        ROOT / "setup.py",
+        r'__version__\s*=\s*["\']([^"\']+)["\']'
+    ),
+}
+
 CANONICAL_VERSION_KEY = "visidata/__init__.py"
 
 
+def display_to_pep440(display_ver: str) -> str:
+    """Convert a display version like '3.4dev' to PEP 440 '3.4.dev0'."""
+    if display_ver.endswith("dev"):
+        return display_ver[:-3] + ".dev0"
+    return display_ver
+
+
+def pep440_to_display(pep440_ver: str) -> str:
+    """Convert a PEP 440 version like '3.4.dev0' to display '3.4dev'."""
+    if pep440_ver.endswith(".dev0"):
+        return pep440_ver[:-5] + "dev"
+    return pep440_ver
+
+
+def _versions_equivalent(v1: str, v2: str) -> bool:
+    """Return True if two version strings are equivalent under display/PEP440 mapping."""
+    # Normalize both to display form for comparison
+    def to_display(v: str) -> str:
+        if v.endswith(".dev0"):
+            return v[:-5] + "dev"
+        return v
+    return to_display(v1) == to_display(v2)
+
+
 class FixResult:
-    def __init__(self, name: str, ok: bool, message: str = "",
+    OK = "ok"
+    DONE = "done"
+    WARN = "warn"
+    FAIL = "fail"
+
+    def __init__(self, name: str, status: str, message: str = "",
                  changed: List[str] = None, skipped: List[str] = None):
         self.name = name
-        self.ok = ok
+        self.status = status
         self.message = message
         self.changed = changed or []
         self.skipped = skipped or []
 
+    @property
+    def ok(self) -> bool:
+        """Treat WARN as non-fatal so preflight-fix can continue with other fixers."""
+        return self.status in (self.OK, self.DONE, self.WARN)
+
     def __str__(self) -> str:
-        status = "OK" if self.ok else "FAIL" if not self.changed else "DONE"
-        lines = [f"[{status}] {self.name}"]
+        label = self.status.upper()
+        lines = [f"[{label}] {self.name}"]
         if self.message:
             lines.append(f"       {self.message}")
         for c in self.changed:
@@ -110,68 +158,85 @@ def _read_version_from_file(filepath: Path, pattern: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def _normalize_version(v: str) -> str:
-    """Normalize version string for comparison (strip dev/pre-release tags)."""
-    return v.replace(".dev0", "dev").replace(".dev", "dev").replace("-", "")
-
-
 # ===========================================================================
 # Fixers
 # ===========================================================================
 
 def fix_version_numbers() -> FixResult:
-    """Sync version numbers across all source files from canonical source (visidata/__init__.py)."""
+    """Sync version numbers: display versions from canonical source, PEP 440 for setup.py.
+
+    Canonical source: visidata/__init__.py (display version like "3.4dev")
+      -> visidata/main.py, README.md get the same display version
+      -> setup.py gets PEP 440 mapped version like "3.4.dev0"
+    """
     changed: List[str] = []
     skipped: List[str] = []
 
-    canon_path, canon_pattern = VERSION_SOURCES[CANONICAL_VERSION_KEY]
-    canon_version = _read_version_from_file(canon_path, canon_pattern)
-    if not canon_version:
-        return FixResult("fix-version", False,
+    canon_path, canon_pattern = DISPLAY_VERSION_SOURCES[CANONICAL_VERSION_KEY]
+    canon_display = _read_version_from_file(canon_path, canon_pattern)
+    if not canon_display:
+        return FixResult("fix-version", FixResult.FAIL,
                         f"Could not read canonical version from {CANONICAL_VERSION_KEY}")
 
-    for name, (path, pattern) in VERSION_SOURCES.items():
+    canon_pep440 = display_to_pep440(canon_display)
+
+    # Sync display-version files
+    for name, (path, pattern) in DISPLAY_VERSION_SOURCES.items():
         if name == CANONICAL_VERSION_KEY:
             continue
         if not path.exists():
             skipped.append(f"{name}: {path} does not exist")
             continue
         current = _read_version_from_file(path, pattern)
-        if current and (name == "setup.py" or _normalize_version(current) == _normalize_version(canon_version)):
-            if current == canon_version:
-                skipped.append(f"{name}: already at {canon_version}")
-                continue
+        if current == canon_display:
+            skipped.append(f"{name}: already at display version {canon_display}")
+            continue
         content = path.read_text(encoding="utf-8")
-        if name == "setup.py":
-            new_content = re.sub(
-                r'(__version__\s*=\s*["\'][^"\']+["\'])',
-                f'__version__ = "{canon_version}"',
-                content
-            )
-        elif name == "README.md":
+        if name == "README.md":
             new_content = re.sub(
                 r"# VisiData v[\w.]+",
-                f"# VisiData v{canon_version}",
+                f"# VisiData v{canon_display}",
                 content
             )
         else:
             new_content = re.sub(
                 r"(__version__\s*=\s*['\"])[^'\"]+(['\"])",
-                rf"\g<1>{canon_version}\g<2>",
+                rf"\g<1>{canon_display}\g<2>",
                 content
             )
         if new_content != content:
             path.write_text(new_content, encoding="utf-8")
-            changed.append(f"{name}: updated to {canon_version}")
+            changed.append(f"{name}: display version -> {canon_display}")
         else:
-            skipped.append(f"{name}: already at {canon_version}")
+            skipped.append(f"{name}: already at display version {canon_display}")
+
+    # Sync PEP 440 version files (setup.py)
+    for name, (path, pattern) in PEP440_VERSION_SOURCES.items():
+        if not path.exists():
+            skipped.append(f"{name}: {path} does not exist")
+            continue
+        current = _read_version_from_file(path, pattern)
+        if current == canon_pep440:
+            skipped.append(f"{name}: already at PEP 440 version {canon_pep440}")
+            continue
+        content = path.read_text(encoding="utf-8")
+        new_content = re.sub(
+            r'(__version__\s*=\s*["\'][^"\']+["\'])',
+            f'__version__ = "{canon_pep440}"',
+            content
+        )
+        if new_content != content:
+            path.write_text(new_content, encoding="utf-8")
+            changed.append(f"{name}: PEP 440 version -> {canon_pep440}")
+        else:
+            skipped.append(f"{name}: already at PEP 440 version {canon_pep440}")
 
     if changed:
-        return FixResult("fix-version", True,
-                       f"Synced {len(changed)} file(s) to v{canon_version}",
+        return FixResult("fix-version", FixResult.DONE,
+                       f"Synced {len(changed)} file(s) (display={canon_display}, PEP 440={canon_pep440})",
                        changed=changed, skipped=skipped)
-    return FixResult("fix-version", True,
-                   f"All files already at v{canon_version}",
+    return FixResult("fix-version", FixResult.OK,
+                   f"All files in sync (display={canon_display}, PEP 440={canon_pep440})",
                    skipped=skipped)
 
 
@@ -180,7 +245,7 @@ def fix_manpage_date() -> FixResult:
     changed: List[str] = []
     vd_inc = MAN_DIR / "vd.inc"
     if not vd_inc.exists():
-        return FixResult("fix-date", False, f"{vd_inc} does not exist")
+        return FixResult("fix-date", FixResult.FAIL, f"{vd_inc} does not exist")
 
     today = datetime.date.today().strftime("%B %d, %Y")
     content = vd_inc.read_text(encoding="utf-8")
@@ -195,10 +260,10 @@ def fix_manpage_date() -> FixResult:
 
     if new_content != content:
         vd_inc.write_text(new_content, encoding="utf-8")
-        return FixResult("fix-date", True,
+        return FixResult("fix-date", FixResult.DONE,
                        f"Updated manpage date to {today}",
                        changed=[f"visidata/man/vd.inc: .Dd {today}"])
-    return FixResult("fix-date", True, "Manpage date already current")
+    return FixResult("fix-date", FixResult.OK, "Manpage date already current")
 
 
 def _find_system_tool(name: str) -> Optional[str]:
@@ -207,13 +272,17 @@ def _find_system_tool(name: str) -> Optional[str]:
 
 
 def fix_docs() -> FixResult:
-    """Rebuild manpages via dev/mkman.sh if system tools are available."""
+    """Rebuild manpages via dev/mkman.sh if system tools are available.
+
+    Missing tools produce a WARN (non-fatal) so other fixers can still run;
+    the check phase will fail explicitly if manpage artifacts are absent.
+    """
     changed: List[str] = []
     skipped: List[str] = []
 
     mkman = ROOT / "dev" / "mkman.sh"
     if not mkman.exists():
-        return FixResult("fix-docs", False, f"{mkman} does not exist")
+        return FixResult("fix-docs", FixResult.FAIL, f"{mkman} does not exist")
 
     required_tools = ["soelim", "preconv"]
     optional_tools = ["man", "aha"]
@@ -223,16 +292,18 @@ def fix_docs() -> FixResult:
 
     if missing_req:
         hints = []
+        if missing_opt:
+            hints.append(f"Optional tools also missing: {', '.join(missing_opt)}")
         if "preconv" in missing_req:
             hints.append("Install groff:  brew install groff")
         if "aha" in missing_opt:
             hints.append("Install aha:    brew install aha")
-        if missing_opt:
-            hints.insert(0, f"Optional tools missing: {', '.join(missing_opt)}")
+        hints.append("Manpage generation skipped (non-fatal); docs check will flag missing artifacts.")
+        # WARN = non-fatal: allow preflight-fix to continue so version/date updates still apply
         return FixResult(
-            "fix-docs", False,
-            f"Missing required tools: {', '.join(missing_req)}",
-            skipped=hints or []
+            "fix-docs", FixResult.WARN,
+            f"Skipped: missing required tools {', '.join(missing_req)}",
+            skipped=hints
         )
 
     if missing_opt:
@@ -252,8 +323,8 @@ def fix_docs() -> FixResult:
         )
         if result.returncode != 0:
             err = (result.stderr or result.stdout or "").strip()
-            return FixResult("fix-docs", False,
-                           f"mkman.sh exited {result.returncode}",
+            return FixResult("fix-docs", FixResult.WARN,
+                           f"mkman.sh exited {result.returncode} (non-fatal; docs check will flag)",
                            skipped=err.splitlines()[-5:] if err else [])
         changed.append("Ran dev/mkman.sh successfully")
         for f in ["vd.1", "visidata.1", "vd.txt"]:
@@ -263,11 +334,12 @@ def fix_docs() -> FixResult:
         docs_man = ROOT / "docs" / "man.md"
         if docs_man.exists():
             changed.append(f"Generated docs/man.md ({docs_man.stat().st_size} bytes)")
-        return FixResult("fix-docs", True,
+        return FixResult("fix-docs", FixResult.DONE,
                        "Manpages rebuilt",
                        changed=changed, skipped=skipped)
     except Exception as e:
-        return FixResult("fix-docs", False, str(e))
+        return FixResult("fix-docs", FixResult.WARN, str(e),
+                        skipped=["Manpage build raised exception (non-fatal); docs check will flag missing artifacts"])
 
 
 FIXERS: Dict[str, Callable[[], FixResult]] = {
@@ -282,33 +354,70 @@ FIXERS: Dict[str, Callable[[], FixResult]] = {
 # ===========================================================================
 
 def check_version_consistency() -> CheckResult:
-    """Verify version numbers are consistent across all source files."""
-    versions: Dict[str, str] = {}
+    """Verify version numbers are consistent, respecting display vs PEP 440 mapping.
+
+    All display-version files should share the same string;
+    all PEP 440 files should share the same string;
+    and the two strings should map to each other via display<->PEP440 rules.
+    """
+    display_versions: Dict[str, str] = {}
+    pep440_versions: Dict[str, str] = {}
     missing: List[str] = []
 
-    for name, (path, pattern) in VERSION_SOURCES.items():
+    for name, (path, pattern) in DISPLAY_VERSION_SOURCES.items():
         v = _read_version_from_file(path, pattern)
         if v is None:
             missing.append(f"{name}: could not extract version from {path}")
         else:
-            versions[name] = v
+            display_versions[name] = v
+
+    for name, (path, pattern) in PEP440_VERSION_SOURCES.items():
+        v = _read_version_from_file(path, pattern)
+        if v is None:
+            missing.append(f"{name}: could not extract version from {path}")
+        else:
+            pep440_versions[name] = v
 
     if missing:
         return CheckResult("version", False,
                            "Could not read all version sources", missing)
 
-    normalized = {k: _normalize_version(v) for k, v in versions.items()}
-    unique = set(normalized.values())
+    errors: List[str] = []
+    details: List[str] = []
 
-    if len(unique) == 1:
-        return CheckResult("version", True,
-                           f"All sources agree on version {list(versions.values())[0]}")
+    unique_display = set(display_versions.values())
+    if len(unique_display) != 1:
+        errors.append(f"Display-version files disagree: {unique_display}")
+    else:
+        details.append(f"Display version: {list(unique_display)[0]} (in {', '.join(sorted(display_versions))})")
 
-    details = [f"{k}: {v}" for k, v in sorted(versions.items())]
-    canon = versions.get(CANONICAL_VERSION_KEY, "?")
+    unique_pep440 = set(pep440_versions.values())
+    if len(unique_pep440) != 1:
+        errors.append(f"PEP 440-version files disagree: {unique_pep440}")
+    else:
+        details.append(f"PEP 440 version: {list(unique_pep440)[0]} (in {', '.join(sorted(pep440_versions))})")
+
+    if not errors:
+        display_v = list(unique_display)[0]
+        pep440_v = list(unique_pep440)[0]
+        if not _versions_equivalent(display_v, pep440_v):
+            errors.append(
+                f"Display '{display_v}' does not map to PEP 440 '{pep440_v}' "
+                f"(expected PEP 440 '{display_to_pep440(display_v)}' or display '{pep440_to_display(pep440_v)}')"
+            )
+
+    if errors:
+        all_versions = {**display_versions, **pep440_versions}
+        details = [f"{k}: {v}" for k, v in sorted(all_versions.items())] + details
+        return CheckResult(
+            "version", False,
+            f"Version inconsistency; run --fix-version to sync from canonical {CANONICAL_VERSION_KEY}",
+            errors + details
+        )
+
     return CheckResult(
-        "version", False,
-        f"Version mismatch (canonical source {CANONICAL_VERSION_KEY}={canon}); run --fix-version to sync",
+        "version", True,
+        f"Display={list(unique_display)[0]}  PEP 440={list(unique_pep440)[0]} (mapping verified)",
         details
     )
 
