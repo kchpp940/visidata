@@ -142,9 +142,10 @@ def anySelected(vs, rows):
 class PlotDataset:
     '''Stores plot elements (points, lines, polylines) with stable row identity references.
 
-    Each element is stored as (vertexes, attr, row) tuple, matching the legacy polylines format
-    for backward compatibility.  Provides stable queries that survive sort/filter/zoom because
-    row identity is keyed by source.rowid() rather than position.
+    Each element is stored internally as (vertexes, attr, row) tuple.  External code
+    should use the typed addPoint/addLine/addPolyline/addPolygon API instead of raw
+    append().  Row identity is keyed by source.rowid() so spatial queries remain
+    stable across sort/filter/zoom on the source sheet.
     '''
 
     def __init__(self):
@@ -162,11 +163,28 @@ class PlotDataset:
     def clear(self):
         self._elements.clear()
 
+    def addPoint(self, x, y, attr='', row=None):
+        'Record a single point plot element with stable row identity.'
+        self._elements.append(([(x, y)], attr, row))
+
+    def addLine(self, x1, y1, x2, y2, attr='', row=None):
+        'Record a line segment plot element with stable row identity.'
+        self._elements.append(([(x1, y1), (x2, y2)], attr, row))
+
+    def addPolyline(self, vertexes, attr='', row=None):
+        'Record a polyline (sequence of connected line segments) with stable row identity.'
+        self._elements.append((list(vertexes), attr, row))
+
+    def addPolygon(self, vertexes, attr='', row=None):
+        'Record a closed polygon (line loop) with stable row identity.'
+        self._elements.append((list(vertexes) + [vertexes[0]], attr, row))
+
     def append(self, *args):
-        '''Append a plot element.
+        '''Append a raw plot element tuple.  Backward-compatible shim.
 
         Accepts either a single tuple ``(vertexes, attr, row)`` (list-compatible)
         or three separate arguments ``append(vertexes, attr, row)``.
+        New code should use addPoint/addLine/addPolyline/addPolygon instead.
         '''
         if len(args) == 1 and isinstance(args[0], tuple) and len(args[0]) == 3:
             self._elements.append(args[0])
@@ -219,20 +237,28 @@ class PlotDataset:
 
 
 class CoordinateTransformer:
-    '''Pure data-coordinate to plotter-pixel coordinate conversion.
+    '''Pure data-coordinate to plotter-pixel coordinate conversion with projection strategies.
 
     No knowledge of rows, selection, or rendering.  Given a visible data bounding box
-    and a plotter pixel bounding box, converts between the two spaces.  Optionally
-    maintains an aspect ratio constraint.
+    and a plotter pixel bounding box, converts between the two spaces.  Supports
+    ``invert_y`` strategy for graphs where y increases upward.
+
+    Usage:
+        * ``scaleX/Y`` / ``unscaleX/Y``: single-coordinate conversion
+        * ``projectElement(vertexes)``: batch projection of a plot element's vertexes
+          into plotter pixel space, respecting invert_y and clipping hints
+        * ``renderContext()``: returns (xmin, ymin, xmax, ymax, xfactor, yfactor,
+          plotxmin, plotyref, invert_y) for tight inner loops
     '''
 
-    def __init__(self):
+    def __init__(self, invert_y=False):
         self.plotviewBox = None  # Box in plotter pixel coords
         self.visibleBox = None   # Box in data coords
         self.canvasBox = None    # Box in data coords (full extent)
         self.aspectRatio = 0.0
         self.xzoomlevel = 1.0
         self.yzoomlevel = 1.0
+        self.invert_y = invert_y  # if True, y axis points up (graph style)
 
     @property
     def xScaler(self):
@@ -263,9 +289,11 @@ class CoordinateTransformer:
         return self.plotviewBox.xmin + round((dataX - self.visibleBox.xmin) * self.xScaler)
 
     def scaleY(self, dataY):
-        'Convert data y coordinate to plotter pixel y coordinate.'
+        'Convert data y coordinate to plotter pixel y coordinate, respecting invert_y.'
         if not (self.visibleBox and self.plotviewBox):
             return int(dataY)
+        if self.invert_y:
+            return self.plotviewBox.ymax - round((dataY - self.visibleBox.ymin) * self.yScaler)
         return self.plotviewBox.ymin + round((dataY - self.visibleBox.ymin) * self.yScaler)
 
     def unscaleX(self, plotterX):
@@ -275,9 +303,11 @@ class CoordinateTransformer:
         return (plotterX - self.plotviewBox.xmin) / self.xScaler + self.visibleBox.xmin
 
     def unscaleY(self, plotterY):
-        'Convert plotter pixel y coordinate to data y coordinate.'
+        'Convert plotter pixel y coordinate to data y coordinate, respecting invert_y.'
         if not (self.visibleBox and self.plotviewBox):
             return float(plotterY)
+        if self.invert_y:
+            return (self.plotviewBox.ymax - plotterY) / self.yScaler + self.visibleBox.ymin
         return (plotterY - self.plotviewBox.ymin) / self.yScaler + self.visibleBox.ymin
 
     def canvasW(self, plotterWidth):
@@ -287,6 +317,38 @@ class CoordinateTransformer:
     def canvasH(self, plotterHeight):
         'Convert plotter pixel height to data coordinate height.'
         return plotterHeight / self.yScaler if self.yScaler else 0.0
+
+    def renderContext(self):
+        '''Return pre-computed projection parameters for tight inner render loops.
+
+        Returns tuple ``(xmin, ymin, xmax, ymax, xfactor, yfactor, plotxmin,
+        plotyref, invert_y)`` where ``plotyref`` is either plotviewBox.ymin
+        (normal) or plotviewBox.ymax (inverted).
+        '''
+        bb = self.visibleBox
+        xmin, ymin, xmax, ymax = bb.xmin, bb.ymin, bb.xmax, bb.ymax
+        xfactor, yfactor = self.xScaler, self.yScaler
+        plotxmin = self.plotviewBox.xmin
+        plotyref = self.plotviewBox.ymax if self.invert_y else self.plotviewBox.ymin
+        return (xmin, ymin, xmax, ymax, xfactor, yfactor, plotxmin, plotyref, self.invert_y)
+
+    def projectPoint(self, x, y):
+        '''Project a single (x, y) data point into plotter pixel coordinates.
+
+        Returns ``(px, py)`` tuple.  Caller should check visibility separately.
+        '''
+        return self.scaleX(x), self.scaleY(y)
+
+    def projectElement(self, vertexes):
+        '''Project all vertexes of a plot element into plotter pixel space.
+
+        Returns a list of ``(px, py)`` tuples with the same length as *vertexes*.
+        No clipping is performed; use :meth:`renderContext` for clipped inner loops.
+        '''
+        result = []
+        for x, y in vertexes:
+            result.append((self.scaleX(float(x)), self.scaleY(float(y))))
+        return result
 
 
 class RowIdentityMixin:
@@ -938,20 +1000,20 @@ class Canvas(BrushSelectorMixin, Plotter):
             return None
 
     def point(self, x, y, attr:"str|ColorAttr=''", row=None):
-        'Add a point plot element.  Uses PlotDataset for stable row identity.'
-        self.plotData.append([(x, y)], attr, row)
+        'Add a point plot element.  Delegates to PlotDataset.addPoint.'
+        self.plotData.addPoint(x, y, attr, row)
 
     def line(self, x1, y1, x2, y2, attr:"str|ColorAttr=''", row=None):
-        'Add a line segment plot element.  Uses PlotDataset for stable row identity.'
-        self.plotData.append([(x1, y1), (x2, y2)], attr, row)
+        'Add a line segment plot element.  Delegates to PlotDataset.addLine.'
+        self.plotData.addLine(x1, y1, x2, y2, attr, row)
 
     def polyline(self, vertexes, attr:"str|ColorAttr=''", row=None):
-        'Add a polyline (sequence of connected line segments).  Uses PlotDataset for stable row identity.'
-        self.plotData.append(vertexes, attr, row)
+        'Add a polyline (sequence of connected line segments).  Delegates to PlotDataset.addPolyline.'
+        self.plotData.addPolyline(vertexes, attr, row)
 
     def polygon(self, vertexes, attr:"str|ColorAttr=''", row=None):
-        'Add a closed polygon (line loop).  Uses PlotDataset for stable row identity.'
-        self.plotData.append(vertexes + [vertexes[0]], attr, row)
+        'Add a closed polygon (line loop).  Delegates to PlotDataset.addPolygon.'
+        self.plotData.addPolygon(vertexes, attr, row)
 
     def qcurve(self, vertexes, attr:"str|ColorAttr=''", row=None):
         'Draw quadratic curve from vertexes[0] to vertexes[2] with control point at vertexes[1]'
@@ -1132,52 +1194,50 @@ class Canvas(BrushSelectorMixin, Plotter):
     def render_async(self):
         self.plot_elements()
 
-    def plot_elements(self, invert_y=False):
-        'plots points and lines and text onto the plotter'
+    def plot_elements(self):
+        '''Plot points, lines, and labels onto the plotter.
 
+        All coordinate projection is delegated to self._coord (CoordinateTransformer).
+        This method only iterates PlotDataset elements, clips to the visible data box,
+        and dispatches projected pixel coordinates to plotpixel/plotline/plotlabel.
+        The invert_y strategy (for graphs) is determined by self._coord.invert_y.
+        '''
         self.resetBounds(refresh=False)
 
-        bb = self.visibleBox
-        xmin, ymin, xmax, ymax = bb.xmin, bb.ymin, bb.xmax, bb.ymax
-        xfactor, yfactor = self.xScaler, self.yScaler
-        plotxmin = self.plotviewBox.xmin
-        if invert_y:
-            plotymax = self.plotviewBox.ymax
-        else:
-            plotymin = self.plotviewBox.ymin
+        # All projection parameters come from the transformer; Canvas is strategy-agnostic.
+        xmin, ymin, xmax, ymax, xfactor, yfactor, plotxmin, plotyref, invert_y = self._coord.renderContext()
 
         for vertexes, attr, row in Progress(self.plotData, 'rendering'):
             if len(vertexes) == 1:  # single point
                 x1, y1 = vertexes[0]
                 x1, y1 = float(x1), float(y1)
                 if xmin <= x1 <= xmax and ymin <= y1 <= ymax:
-                    # equivalent to self.scaleX(x1) and self.scaleY(y1), inlined for speed
-                    x = plotxmin+round((x1-xmin)*xfactor)
+                    px = plotxmin + round((x1 - xmin) * xfactor)
                     if invert_y:
-                        y = plotymax-round((y1-ymin)*yfactor)
+                        py = plotyref - round((y1 - ymin) * yfactor)
                     else:
-                        y = plotymin+round((y1-ymin)*yfactor)
-                    self.plotpixel(x, y, attr, row)
+                        py = plotyref + round((y1 - ymin) * yfactor)
+                    self.plotpixel(px, py, attr, row)
                 continue
 
             prev_x, prev_y = vertexes[0]
             for x, y in vertexes[1:]:
                 r = clipline(prev_x, prev_y, x, y, xmin, ymin, xmax, ymax)
                 if r:
-                    x1, y1, x2, y2 = r
-                    x1 = plotxmin+float(x1-xmin)*xfactor
-                    x2 = plotxmin+float(x2-xmin)*xfactor
+                    cx1, cy1, cx2, cy2 = r
+                    px1 = plotxmin + float(cx1 - xmin) * xfactor
+                    px2 = plotxmin + float(cx2 - xmin) * xfactor
                     if invert_y:
-                        y1 = plotymax-float(y1-ymin)*yfactor
-                        y2 = plotymax-float(y2-ymin)*yfactor
+                        py1 = plotyref - float(cy1 - ymin) * yfactor
+                        py2 = plotyref - float(cy2 - ymin) * yfactor
                     else:
-                        y1 = plotymin+float(y1-ymin)*yfactor
-                        y2 = plotymin+float(y2-ymin)*yfactor
-                    self.plotline(x1, y1, x2, y2, attr, row)
+                        py1 = plotyref + float(cy1 - ymin) * yfactor
+                        py2 = plotyref + float(cy2 - ymin) * yfactor
+                    self.plotline(px1, py1, px2, py2, attr, row)
                 prev_x, prev_y = x, y
 
         for x, y, text, attr, row in Progress(self.gridlabels, 'labeling'):
-            self.plotlabel(self.scaleX(x), self.scaleY(y), text, attr, row)
+            self.plotlabel(self._coord.scaleX(x), self._coord.scaleY(y), text, attr, row)
 
     def rowsWithinDataBox(self, xmin, ymin, xmax, ymax):
         'Return rows whose plotted points fall within the given data coordinate bounding box.  Works regardless of zoom, filter, or sort.'

@@ -19,9 +19,15 @@ def numericCols(vd, cols):
 
 
 class InvertedCanvas(Canvas):
+    'Canvas with y-axis inverted (data y increases upward, like a graph).'
+
+    def __init__(self, *names, **kwargs):
+        super().__init__(*names, **kwargs)
+        self._coord.invert_y = True  # y-axis inversion strategy lives in transformer
+
     @asyncthread
     def render_async(self):
-        self.plot_elements(invert_y=True)
+        self.plot_elements()
 
     def fixPoint(self, plotterPoint, canvasPoint):
         'adjust visibleBox.xymin so that canvasPoint is plotted at plotterPoint'
@@ -37,14 +43,6 @@ class InvertedCanvas(Canvas):
         self.fixPoint(Point(self.plotviewBox.xmin, self.plotviewBox.ymin),
                       Point(bbox.xmin, bbox.ymax))
         self.resetBounds()
-
-    def scaleY(self, canvasY) -> int:
-        'returns a plotter y coordinate for a canvas y coordinate, with the y direction inverted'
-        return self.plotviewBox.ymax-round((canvasY-self.visibleBox.ymin)*self.yScaler)
-
-    def unscaleY(self, plotterY_inverted):
-        'performs the inverse of scaleY, returns a canvas y coordinate'
-        return (self.plotviewBox.ymax-plotterY_inverted)/self.yScaler + self.visibleBox.ymin
 
     @property
     def canvasMouse(self):
@@ -177,9 +175,9 @@ class GraphSheet(RowIdentityMixin, InvertedCanvas):
         self.cursorBox.h = ymax-ymin
         return True
 
-    def plot_elements(self, invert_y=True):
+    def plot_elements(self):
         self.plot_reflines()
-        super().plot_elements(invert_y=True)
+        super().plot_elements()
 
     def plot_reflines(self):
         self.reflines_char_x = {}
@@ -421,7 +419,7 @@ def reload(sheet):
     if not vd.cursesEnabled:
         sheet.resetCanvasDimensions(25, 80)
         sheet.resetBounds(refresh=False)
-        sheet.plot_elements(invert_y=True)
+        sheet.plot_elements()
 
 vd.addGlobals({
     'GraphSheet': GraphSheet,
