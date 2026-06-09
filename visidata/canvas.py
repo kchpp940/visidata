@@ -1,7 +1,7 @@
 import math
 import random
 
-from collections import defaultdict, Counter, OrderedDict, namedtuple
+from collections import defaultdict, Counter, OrderedDict
 from visidata import vd, asyncthread, colors, update_attr, clipdraw, dispwidth
 from visidata import BaseSheet, Column, Progress, ColorAttr
 from visidata.bezier import bezier
@@ -137,471 +137,6 @@ def anySelected(vs, rows):
     for r in rows:
         if vs.isSelected(r):
             return True
-
-
-PlotElement = namedtuple('PlotElement', ['kind', 'vertexes', 'attr', 'row'])
-'''Typed plot element stored in PlotDataset.
-
-* ``kind``: one of ``'point'``, ``'line'``, ``'polyline'``, ``'polygon'``
-* ``vertexes``: list of ``(x, y)`` data-coordinate tuples
-* ``attr``: color/plot attribute string
-* ``row``: source row reference (or None)
-'''
-
-RenderElement = namedtuple('RenderElement', ['kind', 'pixels', 'attr', 'row'])
-'''Projected & clipped plot element ready for Canvas to draw.
-
-* ``kind``: ``'point'`` or ``'segment'``
-* ``pixels``: for ``'point'`` a single ``(px, py)`` tuple;
-  for ``'segment'`` a list of ``((px1, py1), (px2, py2))`` line segment tuples.
-* ``attr``: color/plot attribute string
-* ``row``: source row reference (or None)
-'''
-
-
-class PlotDataset:
-    '''Stores typed plot elements with stable row identity references.
-
-    Internal elements are :class:`PlotElement` namedtuples carrying a *kind*
-    (``'point'``, ``'line'``, ``'polyline'``, ``'polygon'``).  Iteration and
-    ``polylines`` compatibility shims return the legacy ``(vertexes, attr, row)``
-    tuple shape so external modules (shp.py, graph_zoom_y.py, …) keep working.
-    Row identity is keyed by ``source.rowid()`` so spatial queries remain
-    stable across sort/filter/zoom on the source sheet.
-    '''
-
-    def __init__(self):
-        self._elements = []  # list of PlotElement
-
-    def __len__(self):
-        return len(self._elements)
-
-    def __iter__(self):
-        '''Yield legacy ``(vertexes, attr, row)`` tuples for backward compatibility.
-
-        Internal consumers should use :meth:`iterElements` to get
-        :class:`PlotElement` namedtuples with the ``kind`` field.
-        '''
-        for elt in self._elements:
-            yield (elt.vertexes, elt.attr, elt.row)
-
-    def iterElements(self):
-        '''Yield :class:`PlotElement` namedtuples with typed ``kind`` field.
-
-        This is the public, supported entry point for Canvas's render loop.
-        External modules should keep using the default iterator (which returns
-        the legacy ``(vertexes, attr, row)`` tuple shape).
-        '''
-        return iter(self._elements)
-
-    def __bool__(self):
-        return bool(self._elements)
-
-    def clear(self):
-        self._elements.clear()
-
-    def addPoint(self, x, y, attr='', row=None):
-        'Record a single point (``kind="point"``) with stable row identity.'
-        self._elements.append(PlotElement('point', [(x, y)], attr, row))
-
-    def addLine(self, x1, y1, x2, y2, attr='', row=None):
-        'Record a line segment (``kind="line"``) with stable row identity.'
-        self._elements.append(PlotElement('line', [(x1, y1), (x2, y2)], attr, row))
-
-    def addPolyline(self, vertexes, attr='', row=None):
-        'Record a polyline (``kind="polyline"``) with stable row identity.'
-        self._elements.append(PlotElement('polyline', list(vertexes), attr, row))
-
-    def addPolygon(self, vertexes, attr='', row=None):
-        'Record a closed polygon loop (``kind="polygon"``) with stable row identity.'
-        self._elements.append(PlotElement('polygon', list(vertexes) + [vertexes[0]], attr, row))
-
-    def append(self, *args):
-        '''Append a raw legacy tuple.  Backward-compatible shim.
-
-        Accepts either a single tuple ``(vertexes, attr, row)`` or three separate
-        arguments.  The element kind is inferred from vertex count.  New code
-        should use :meth:`addPoint`/:meth:`addLine`/:meth:`addPolyline`/:meth:`addPolygon`.
-        '''
-        if len(args) == 1 and isinstance(args[0], tuple) and len(args[0]) == 3:
-            vertexes, attr, row = args[0]
-        elif len(args) == 3:
-            vertexes, attr, row = args
-        else:
-            raise TypeError('append expects (vertexes, attr, row) as a tuple or 3 separate args')
-
-        # Infer kind from vertex count for backward compatibility
-        vlist = list(vertexes)
-        if len(vlist) == 1:
-            kind = 'point'
-        elif len(vlist) == 2:
-            kind = 'line'
-        elif vlist and vlist[0] == vlist[-1] and len(vlist) > 2:
-            kind = 'polygon'
-        else:
-            kind = 'polyline'
-        self._elements.append(PlotElement(kind, vlist, attr, row))
-
-    def bbox(self):
-        'Return ``(xmin, ymin, xmax, ymax)`` of all vertexes, or ``None`` if empty.'
-        xmin = ymin = xmax = ymax = None
-        for elt in self._elements:
-            for x, y in elt.vertexes:
-                if xmin is None or x < xmin: xmin = x
-                if ymin is None or y < ymin: ymin = y
-                if xmax is None or x > xmax: xmax = x
-                if ymax is None or y > ymax: ymax = y
-        if xmin is None:
-            return None
-        return (float(xmin), float(ymin), float(xmax), float(ymax))
-
-    def rowsWithinDataBox(self, xmin, ymin, xmax, ymax, hiddenAttrs=None, source=None):
-        '''Return rows whose plotted points fall within the given data coordinate bounding box.
-
-        Deduplicates by ``source.rowid(row)`` so the result is stable across
-        sort/filter/zoom.  Works regardless of current zoom or visible region.
-        '''
-        if hiddenAttrs is None:
-            hiddenAttrs = set()
-        ret = {}
-        x1, x2 = min(xmin, xmax), max(xmin, xmax)
-        y1, y2 = min(ymin, ymax), max(ymin, ymax)
-        for elt in self._elements:
-            if elt.attr in hiddenAttrs:
-                continue
-            if elt.row is None:
-                continue
-            for vx, vy in elt.vertexes:
-                try:
-                    fx, fy = float(vx), float(vy)
-                except (TypeError, ValueError):
-                    continue
-                if x1 <= fx <= x2 and y1 <= fy <= y2:
-                    if source is not None:
-                        ret[source.rowid(elt.row)] = elt.row
-                    else:
-                        ret[id(elt.row)] = elt.row
-                    break
-        return list(ret.values())
-
-
-class CoordinateTransformer:
-    '''Pure data-coordinate to plotter-pixel coordinate conversion with projection strategies.
-
-    No knowledge of rows, selection, or rendering.  Given a visible data bounding box
-    and a plotter pixel bounding box, converts between the two spaces.  Supports
-    ``invert_y`` strategy for graphs where y increases upward.
-
-    Usage:
-        * ``scaleX/Y`` / ``unscaleX/Y``: single-coordinate conversion
-        * ``projectElement(plot_elem)``: project & clip a typed :class:`PlotElement`
-          into a :class:`RenderElement` ready for :class:`Canvas` to draw
-    '''
-
-    def __init__(self, invert_y=False):
-        self.plotviewBox = None  # Box in plotter pixel coords
-        self.visibleBox = None   # Box in data coords
-        self.canvasBox = None    # Box in data coords (full extent)
-        self.aspectRatio = 0.0
-        self.xzoomlevel = 1.0
-        self.yzoomlevel = 1.0
-        self.invert_y = invert_y  # if True, y axis points up (graph style)
-
-    @property
-    def xScaler(self):
-        'plotter pixels per data unit along x axis.'
-        if not (self.canvasBox and self.plotviewBox):
-            return 1.0
-        xratio = self.plotviewBox.w / (self.canvasBox.w * self.xzoomlevel)
-        if self.aspectRatio:
-            yratio = self.plotviewBox.h / (self.canvasBox.h * self.yzoomlevel)
-            return self.aspectRatio * min(xratio, yratio)
-        return xratio
-
-    @property
-    def yScaler(self):
-        'plotter pixels per data unit along y axis.'
-        if not (self.canvasBox and self.plotviewBox):
-            return 1.0
-        yratio = self.plotviewBox.h / (self.canvasBox.h * self.yzoomlevel)
-        if self.aspectRatio:
-            xratio = self.plotviewBox.w / (self.canvasBox.w * self.xzoomlevel)
-            return min(xratio, yratio)
-        return yratio
-
-    def scaleX(self, dataX):
-        'Convert data x coordinate to plotter pixel x coordinate.'
-        if not (self.visibleBox and self.plotviewBox):
-            return int(dataX)
-        return self.plotviewBox.xmin + round((dataX - self.visibleBox.xmin) * self.xScaler)
-
-    def scaleY(self, dataY):
-        'Convert data y coordinate to plotter pixel y coordinate, respecting invert_y.'
-        if not (self.visibleBox and self.plotviewBox):
-            return int(dataY)
-        if self.invert_y:
-            return self.plotviewBox.ymax - round((dataY - self.visibleBox.ymin) * self.yScaler)
-        return self.plotviewBox.ymin + round((dataY - self.visibleBox.ymin) * self.yScaler)
-
-    def unscaleX(self, plotterX):
-        'Convert plotter pixel x coordinate to data x coordinate.'
-        if not (self.visibleBox and self.plotviewBox):
-            return float(plotterX)
-        return (plotterX - self.plotviewBox.xmin) / self.xScaler + self.visibleBox.xmin
-
-    def unscaleY(self, plotterY):
-        'Convert plotter pixel y coordinate to data y coordinate, respecting invert_y.'
-        if not (self.visibleBox and self.plotviewBox):
-            return float(plotterY)
-        if self.invert_y:
-            return (self.plotviewBox.ymax - plotterY) / self.yScaler + self.visibleBox.ymin
-        return (plotterY - self.plotviewBox.ymin) / self.yScaler + self.visibleBox.ymin
-
-    def canvasW(self, plotterWidth):
-        'Convert plotter pixel width to data coordinate width.'
-        return plotterWidth / self.xScaler if self.xScaler else 0.0
-
-    def canvasH(self, plotterHeight):
-        'Convert plotter pixel height to data coordinate height.'
-        return plotterHeight / self.yScaler if self.yScaler else 0.0
-
-    def projectPoint(self, x, y):
-        '''Project a single (x, y) data point into plotter pixel coordinates.
-
-        Returns ``(px, py)`` tuple.  Caller should check visibility separately.
-        '''
-        return self.scaleX(x), self.scaleY(y)
-
-    def projectElement(self, plot_elem):
-        '''Project and clip a :class:`PlotElement` against the visible data box.
-
-        Returns a :class:`RenderElement` ready for :class:`Canvas` to draw, or
-        ``None`` if the element is entirely outside the visible region.
-
-        The transformer owns the clipping math and the ``invert_y`` strategy is
-        fully encapsulated here; callers never see projection formulas.
-        '''
-        bb = self.visibleBox
-        xmin, ymin, xmax, ymax = bb.xmin, bb.ymin, bb.xmax, bb.ymax
-        xfactor, yfactor = self.xScaler, self.yScaler
-        plotxmin = self.plotviewBox.xmin
-        if self.invert_y:
-            plotyref = self.plotviewBox.ymax
-            sign = -1.0
-        else:
-            plotyref = self.plotviewBox.ymin
-            sign = +1.0
-
-        def _px(x):
-            return plotxmin + (float(x) - xmin) * xfactor
-
-        def _py(y):
-            return plotyref + sign * (float(y) - ymin) * yfactor
-
-        def _round_p(x, y):
-            return (plotxmin + round((float(x) - xmin) * xfactor),
-                    plotyref + round(sign * ((float(y) - ymin) * yfactor)))
-
-        kind = plot_elem.kind
-        attr = plot_elem.attr
-        row = plot_elem.row
-        vxs = plot_elem.vertexes
-
-        if kind == 'point':
-            x1, y1 = vxs[0]
-            x1, y1 = float(x1), float(y1)
-            if not (xmin <= x1 <= xmax and ymin <= y1 <= ymax):
-                return None
-            return RenderElement('point', _round_p(x1, y1), attr, row)
-
-        # line / polyline / polygon — all produce 'segment' render kind
-        segments = []
-        prev_x, prev_y = vxs[0]
-        for x, y in vxs[1:]:
-            r = clipline(prev_x, prev_y, x, y, xmin, ymin, xmax, ymax)
-            if r:
-                cx1, cy1, cx2, cy2 = r
-                segments.append(((_px(cx1), _py(cy1)), (_px(cx2), _py(cy2))))
-            prev_x, prev_y = x, y
-        if not segments:
-            return None
-        return RenderElement('segment', segments, attr, row)
-
-
-class RowIdentityMixin:
-    '''Shared row identity mapping for scatter plots and line charts.
-
-    Maintains a stable row ordering by source rowid so that rows returned by
-    spatial queries (rowsWithin, rowsWithinDataBox) are in a deterministic order
-    even after the source sheet is sorted, filtered, or the canvas is zoomed.
-
-    Usage: inherit from this mixin alongside Canvas/Plotter and call
-    ``self.recordRowIdentity(row, order)`` when adding plot elements.
-    '''
-
-    def initRowIdentity(self):
-        'Initialize the row identity store.  Call from __init__ or reset().'
-        self.row_order = {}
-
-    def recordRowIdentity(self, row, order):
-        '''Record the identity and original insertion order of a source row.
-
-        *row* is the source row object.  *order* is an integer that determines
-        sort order in spatial query results (typically the enumeration index
-        during data loading).
-        '''
-        if self.source is not None and row is not None:
-            self.row_order[self.source.rowid(row)] = order
-
-    def sortRowsBySourceOrder(self, rows):
-        '''Sort *rows* by the order they were originally recorded.
-
-        Stable across sort/filter/zoom because the key is source.rowid().
-        '''
-        return sorted(rows, key=lambda r: self.row_order.get(self.source.rowid(r) if self.source else id(r), 0))
-
-
-class BrushSelectorMixin:
-    '''Brush selection command API, separated from rendering and data storage.
-
-    Requires the host sheet to provide:
-      - source: the source Sheet with select/toggle/unselect methods
-      - rowsWithinDataBox(xmin, ymin, xmax, ymax): returns rows in a data bbox
-      - parseBbox(bboxstr), formatBbox(bbox): parse/format bbox strings
-      - cursorBox, visibleBox: Box objects for the current cursor and view
-      - options: for auto_brush_select
-    '''
-
-    def parseBbox(self, bboxstr):
-        'Parse "xmin xmax ymin ymax" string into tuple of floats.'
-        parts = str(bboxstr).split()
-        if len(parts) != 4:
-            vd.fail('expected "xmin xmax ymin ymax", got "%s"' % bboxstr)
-        return tuple(float(p) for p in parts)
-
-    def formatBbox(self, bbox):
-        'Format BoundingBox or (xmin,xmax,ymin,ymax) as "xmin xmax ymin ymax" string using sheet formatters.'
-        if isinstance(bbox, Box):
-            return '%s %s %s %s' % (self.formatX(bbox.xmin), self.formatX(bbox.xmax),
-                                    self.formatY(bbox.ymin), self.formatY(bbox.ymax))
-        xmin, xmax, ymin, ymax = bbox
-        return '%s %s %s %s' % (self.formatX(xmin), self.formatX(xmax),
-                                self.formatY(ymin), self.formatY(ymax))
-
-    @asyncthread
-    def selectBbox(self, bboxstr, add_undo=True):
-        'Select source rows whose data points fall within "xmin xmax ymin ymax".  Async.'
-        xmin, xmax, ymin, ymax = self.parseBbox(bboxstr)
-        rows = self.rowsWithinDataBox(xmin, ymin, xmax, ymax)
-        self.source.select(rows, add_undo=add_undo)
-
-    @asyncthread
-    def stoggleBbox(self, bboxstr, add_undo=True):
-        'Toggle selection of source rows whose data points fall within "xmin xmax ymin ymax".  Async.'
-        xmin, xmax, ymin, ymax = self.parseBbox(bboxstr)
-        rows = self.rowsWithinDataBox(xmin, ymin, xmax, ymax)
-        self.source.toggle(rows, add_undo=add_undo)
-
-    @asyncthread
-    def unselectBbox(self, bboxstr, add_undo=True):
-        'Unselect source rows whose data points fall within "xmin xmax ymin ymax".  Async.'
-        xmin, xmax, ymin, ymax = self.parseBbox(bboxstr)
-        rows = self.rowsWithinDataBox(xmin, ymin, xmax, ymax)
-        self.source.unselect(rows, add_undo=add_undo)
-
-    def brushSelect(self):
-        'Select source rows within current cursor box, recording bbox for cmdlog replay.'
-        if not self.cursorBox:
-            return
-        bboxstr = self.formatBbox(self.cursorBox)
-        vd.setLastArgs(bboxstr)
-        self.selectBbox(bboxstr)
-
-    def brushToggle(self):
-        'Toggle selection of source rows within current cursor box, recording bbox for cmdlog replay.'
-        if not self.cursorBox:
-            return
-        bboxstr = self.formatBbox(self.cursorBox)
-        vd.setLastArgs(bboxstr)
-        self.stoggleBbox(bboxstr)
-
-    def brushUnselect(self):
-        'Unselect source rows within current cursor box, recording bbox for cmdlog replay.'
-        if not self.cursorBox:
-            return
-        bboxstr = self.formatBbox(self.cursorBox)
-        vd.setLastArgs(bboxstr)
-        self.unselectBbox(bboxstr)
-
-    def brushVisibleSelect(self):
-        'Select source rows within visible canvas, recording bbox for cmdlog replay.'
-        if not self.visibleBox:
-            return
-        bboxstr = self.formatBbox(self.visibleBox)
-        vd.setLastArgs(bboxstr)
-        self.selectBbox(bboxstr)
-
-    def brushVisibleToggle(self):
-        'Toggle selection of source rows within visible canvas, recording bbox for cmdlog replay.'
-        if not self.visibleBox:
-            return
-        bboxstr = self.formatBbox(self.visibleBox)
-        vd.setLastArgs(bboxstr)
-        self.stoggleBbox(bboxstr)
-
-    def brushVisibleUnselect(self):
-        'Unselect source rows within visible canvas, recording bbox for cmdlog replay.'
-        if not self.visibleBox:
-            return
-        bboxstr = self.formatBbox(self.visibleBox)
-        vd.setLastArgs(bboxstr)
-        self.unselectBbox(bboxstr)
-
-    def saveNamedSelection(self, name):
-        'Save current cursor bounding box as a named selection.'
-        if not self.cursorBox:
-            vd.fail('no cursor box to save')
-        bb = self.cursorBox
-        sel = {
-            'name': name,
-            'sheet': self.name,
-            'xmin': float(bb.xmin),
-            'xmax': float(bb.xmax),
-            'ymin': float(bb.ymin),
-            'ymax': float(bb.ymax),
-        }
-        vd.selections.append(sel)
-        vd.status('saved selection "%s" (%d points in region)' % (name,
-            len(self.rowsWithinDataBox(bb.xmin, bb.ymin, bb.xmax, bb.ymax))))
-
-    def loadNamedSelection(self, name):
-        'Load/apply a named selection by selecting its rows on the source sheet.'
-        vd.selections.reload()
-        for sel in vd.selections:
-            if sel.name == name:
-                bboxstr = '%s %s %s %s' % (sel.xmin, sel.xmax, sel.ymin, sel.ymax)
-                vd.setLastArgs(bboxstr)
-                self.selectBbox(bboxstr)
-                vd.status('loaded selection "%s"' % name)
-                return
-        vd.fail('no selection named "%s"' % name)
-
-    def deleteNamedSelection(self, name):
-        'Delete a named selection from the stored list.'
-        vd.selections.reload()
-        for i, sel in enumerate(vd.selections):
-            if sel.name == name:
-                del vd.selections[i]
-                p = vd.selections.path
-                if p and p.exists():
-                    import json
-                    with p.open(mode='w', encoding='utf-8') as fp:
-                        for s in vd.selections:
-                            fp.write(json.dumps(dict(s)) + '\n')
-                vd.status('deleted selection "%s"' % name)
-                return
-        vd.fail('no selection named "%s"' % name)
-
 
 #  - width/height are exactly equal to the number of pixels displayable, and can change at any time.
 #  - needs to refresh from source on resize
@@ -818,7 +353,7 @@ class Plotter(BaseSheet):
 
 
 # - has a cursor, of arbitrary position and width/height (not restricted to current zoom)
-class Canvas(BrushSelectorMixin, Plotter):
+class Canvas(Plotter):
     'zoomable/scrollable virtual canvas with (x,y) coordinates in arbitrary units'
     rowtype = 'plots'
     leftMarginPixels = 10*2
@@ -831,11 +366,16 @@ class Canvas(BrushSelectorMixin, Plotter):
         self.left_margin = self.leftMarginPixels
         super().__init__(*names, **kwargs)
 
+        self.canvasBox = None   # bounding box of entire canvas, in canvas units
+        self.visibleBox = None  # bounding box of visible canvas, in canvas units
         self.cursorBox = None   # bounding box of cursor, in canvas units
+
+        self.aspectRatio = 0.0
+        self.xzoomlevel = 1.0
+        self.yzoomlevel = 1.0
         self.needsRefresh = False
 
-        self._coord = CoordinateTransformer()  # screen/data coordinate conversion
-        self.plotData = PlotDataset()  # chart data model with stable row identity
+        self.polylines = []   # list of ([(canvas_x, canvas_y), ...], fgcolornum, row)
         self.gridlabels = []  # list of (grid_x, grid_y, label, fgcolornum, row)
 
         self.legends = OrderedDict()   # txt: attr  (visible legends only)
@@ -843,73 +383,12 @@ class Canvas(BrushSelectorMixin, Plotter):
         self.reset()
 
     @property
-    def canvasBox(self):
-        return self._coord.canvasBox
-
-    @canvasBox.setter
-    def canvasBox(self, value):
-        self._coord.canvasBox = value
-
-    @property
-    def visibleBox(self):
-        return self._coord.visibleBox
-
-    @visibleBox.setter
-    def visibleBox(self, value):
-        self._coord.visibleBox = value
-
-    @property
-    def plotviewBox(self):
-        return self._coord.plotviewBox
-
-    @plotviewBox.setter
-    def plotviewBox(self, value):
-        self._coord.plotviewBox = value
-
-    @property
-    def aspectRatio(self):
-        return self._coord.aspectRatio
-
-    @aspectRatio.setter
-    def aspectRatio(self, value):
-        self._coord.aspectRatio = value
-
-    @property
-    def xzoomlevel(self):
-        return self._coord.xzoomlevel
-
-    @xzoomlevel.setter
-    def xzoomlevel(self, value):
-        self._coord.xzoomlevel = value
-
-    @property
-    def yzoomlevel(self):
-        return self._coord.yzoomlevel
-
-    @yzoomlevel.setter
-    def yzoomlevel(self, value):
-        self._coord.yzoomlevel = value
-
-    @property
-    def polylines(self):
-        'Backward-compatible alias for plotData.  Supports iteration, len, bool, clear, append.'
-        return self.plotData
-
-    @polylines.setter
-    def polylines(self, value):
-        'Backward-compatible setter: replaces plotData contents with given iterable.'
-        self.plotData = PlotDataset()
-        for item in value:
-            vertexes, attr, row = item
-            self.plotData.append(vertexes, attr, row)
-
-    @property
     def nRows(self):
-        return len(self.plotData)
+        return len(self.polylines)
 
     def reset(self):
         'clear everything in preparation for a fresh reload()'
-        self.plotData.clear()
+        self.polylines.clear()
         self.canvasBox = None
         self.visibleBox = None
         self.cursorBox = None
@@ -974,7 +453,7 @@ class Canvas(BrushSelectorMixin, Plotter):
     @property
     def statusLine(self):
         extra = ''
-        if self.cursorBox and self.plotData and self.source:
+        if self.cursorBox and self.polylines and self.source:
             try:
                 n = len(self.rowsWithinDataBox(self.cursorBox.xmin, self.cursorBox.ymin,
                                                self.cursorBox.xmax, self.cursorBox.ymax))
@@ -1077,20 +556,18 @@ class Canvas(BrushSelectorMixin, Plotter):
             return None
 
     def point(self, x, y, attr:"str|ColorAttr=''", row=None):
-        'Add a point plot element.  Delegates to PlotDataset.addPoint.'
-        self.plotData.addPoint(x, y, attr, row)
+        self.polylines.append(([(x, y)], attr, row))
 
     def line(self, x1, y1, x2, y2, attr:"str|ColorAttr=''", row=None):
-        'Add a line segment plot element.  Delegates to PlotDataset.addLine.'
-        self.plotData.addLine(x1, y1, x2, y2, attr, row)
+        self.polylines.append(([(x1, y1), (x2, y2)], attr, row))
 
     def polyline(self, vertexes, attr:"str|ColorAttr=''", row=None):
-        'Add a polyline (sequence of connected line segments).  Delegates to PlotDataset.addPolyline.'
-        self.plotData.addPolyline(vertexes, attr, row)
+        'adds lines for (x,y) vertexes of a polygon'
+        self.polylines.append((vertexes, attr, row))
 
     def polygon(self, vertexes, attr:"str|ColorAttr=''", row=None):
-        'Add a closed polygon (line loop).  Delegates to PlotDataset.addPolygon.'
-        self.plotData.addPolygon(vertexes, attr, row)
+        'adds lines for (x,y) vertexes of a polygon'
+        self.polylines.append((vertexes + [vertexes[0]], attr, row))
 
     def qcurve(self, vertexes, attr:"str|ColorAttr=''", row=None):
         'Draw quadratic curve from vertexes[0] to vertexes[2] with control point at vertexes[1]'
@@ -1129,11 +606,17 @@ class Canvas(BrushSelectorMixin, Plotter):
     def resetBounds(self, refresh=True):
         'create canvasBox and cursorBox if necessary, and set visibleBox w/h according to zoomlevels.  then redisplay legends.'
         if not self.canvasBox:
-            bbox = self.plotData.bbox()
-            if bbox:
-                xmin, ymin, xmax, ymax = bbox
-            else:
-                xmin = ymin = xmax = ymax = 0.0
+            xmin, ymin, xmax, ymax = None, None, None, None
+            for vertexes, attr, row in self.polylines:
+                for x, y in vertexes:
+                    if xmin is None or x < xmin: xmin = x
+                    if ymin is None or y < ymin: ymin = y
+                    if xmax is None or x > xmax: xmax = x
+                    if ymax is None or y > ymax: ymax = y
+            xmin = xmin or 0
+            xmax = xmax or 0
+            ymin = ymin or 0
+            ymax = ymax or 0
             if xmin == xmax:
                 xmax += 1
                 if xmin == xmax:  #handle large floats that were unchanged by += 1
@@ -1198,11 +681,21 @@ class Canvas(BrushSelectorMixin, Plotter):
 
     @property
     def xScaler(self):
-        return self._coord.xScaler
+        xratio = self.plotviewBox.w/(self.canvasBox.w*self.xzoomlevel)
+        if self.aspectRatio:
+            yratio = self.plotviewBox.h/(self.canvasBox.h*self.yzoomlevel)
+            return self.aspectRatio*min(xratio, yratio)
+        else:
+            return xratio
 
     @property
     def yScaler(self):
-        return self._coord.yScaler
+        yratio = self.plotviewBox.h/(self.canvasBox.h*self.yzoomlevel)
+        if self.aspectRatio:
+            xratio = self.plotviewBox.w/(self.canvasBox.w*self.xzoomlevel)
+            return min(xratio, yratio)
+        else:
+            return yratio
 
     def calcVisibleBoxWidth(self):
         w = self.canvasBox.w * self.xzoomlevel
@@ -1230,29 +723,29 @@ class Canvas(BrushSelectorMixin, Plotter):
         else:
             return h
 
-    def scaleX(self, dataX) -> int:
-        'Convert data x coordinate to plotter pixel x coordinate.  Delegates to CoordinateTransformer.'
-        return self._coord.scaleX(dataX)
+    def scaleX(self, canvasX) -> int:
+        'returns a plotter x coordinate'
+        return self.plotviewBox.xmin+round((canvasX-self.visibleBox.xmin)*self.xScaler)
 
-    def scaleY(self, dataY) -> int:
-        'Convert data y coordinate to plotter pixel y coordinate.  Delegates to CoordinateTransformer.'
-        return self._coord.scaleY(dataY)
+    def scaleY(self, canvasY) -> int:
+        'returns a plotter y coordinate'
+        return self.plotviewBox.ymin+round((canvasY-self.visibleBox.ymin)*self.yScaler)
 
     def unscaleX(self, plotterX):
-        'Convert plotter pixel x coordinate to data x coordinate.  Delegates to CoordinateTransformer.'
-        return self._coord.unscaleX(plotterX)
+        'performs the inverse of scaleX, returns a canvas x coordinate'
+        return (plotterX-self.plotviewBox.xmin)/self.xScaler + self.visibleBox.xmin
 
     def unscaleY(self, plotterY):
-        'Convert plotter pixel y coordinate to data y coordinate.  Delegates to CoordinateTransformer.'
-        return self._coord.unscaleY(plotterY)
+        'performs the inverse of scaleY, returns a canvas y coordinate'
+        return (plotterY-self.plotviewBox.ymin)/self.yScaler + self.visibleBox.ymin
 
-    def canvasW(self, plotterWidth):
-        'Convert plotter pixel width to data coordinate width.  Delegates to CoordinateTransformer.'
-        return self._coord.canvasW(plotterWidth)
+    def canvasW(self, plotter_width):
+        'plotter X units to canvas units'
+        return plotter_width/self.xScaler
 
-    def canvasH(self, plotterHeight):
-        'Convert plotter pixel height to data coordinate height.  Delegates to CoordinateTransformer.'
-        return self._coord.canvasH(plotterHeight)
+    def canvasH(self, plotter_height):
+        'plotter Y units to canvas units'
+        return plotter_height/self.yScaler
 
     def refresh(self):
         'triggers render() on next draw()'
@@ -1271,37 +764,202 @@ class Canvas(BrushSelectorMixin, Plotter):
     def render_async(self):
         self.plot_elements()
 
-    def plot_elements(self):
-        '''Plot points, lines, and labels onto the plotter.
+    def plot_elements(self, invert_y=False):
+        'plots points and lines and text onto the plotter'
 
-        All coordinate projection, clipping, and ``invert_y`` strategy handling
-        is fully delegated to ``self._coord.projectElement``.  Canvas here only
-        iterates :class:`PlotDataset`, receives :class:`RenderElement` tuples, and
-        dispatches them by kind to ``plotpixel`` / ``plotline`` / ``plotlabel``.
-        Canvas never sees projection formulas or legacy tuple shapes.
-        '''
         self.resetBounds(refresh=False)
 
-        # Use the public iterElements() API to get typed PlotElement namedtuples.
-        for plot_elem in Progress(self.plotData.iterElements(), 'rendering'):
-            render_elem = self._coord.projectElement(plot_elem)
-            if render_elem is None:
+        bb = self.visibleBox
+        xmin, ymin, xmax, ymax = bb.xmin, bb.ymin, bb.xmax, bb.ymax
+        xfactor, yfactor = self.xScaler, self.yScaler
+        plotxmin = self.plotviewBox.xmin
+        if invert_y:
+            plotymax = self.plotviewBox.ymax
+        else:
+            plotymin = self.plotviewBox.ymin
+
+        for vertexes, attr, row in Progress(self.polylines, 'rendering'):
+            if len(vertexes) == 1:  # single point
+                x1, y1 = vertexes[0]
+                x1, y1 = float(x1), float(y1)
+                if xmin <= x1 <= xmax and ymin <= y1 <= ymax:
+                    # equivalent to self.scaleX(x1) and self.scaleY(y1), inlined for speed
+                    x = plotxmin+round((x1-xmin)*xfactor)
+                    if invert_y:
+                        y = plotymax-round((y1-ymin)*yfactor)
+                    else:
+                        y = plotymin+round((y1-ymin)*yfactor)
+                    self.plotpixel(x, y, attr, row)
                 continue
-            if render_elem.kind == 'point':
-                px, py = render_elem.pixels
-                self.plotpixel(px, py, render_elem.attr, render_elem.row)
-            elif render_elem.kind == 'segment':
-                for (px1, py1), (px2, py2) in render_elem.pixels:
-                    self.plotline(px1, py1, px2, py2, render_elem.attr, render_elem.row)
+
+            prev_x, prev_y = vertexes[0]
+            for x, y in vertexes[1:]:
+                r = clipline(prev_x, prev_y, x, y, xmin, ymin, xmax, ymax)
+                if r:
+                    x1, y1, x2, y2 = r
+                    x1 = plotxmin+float(x1-xmin)*xfactor
+                    x2 = plotxmin+float(x2-xmin)*xfactor
+                    if invert_y:
+                        y1 = plotymax-float(y1-ymin)*yfactor
+                        y2 = plotymax-float(y2-ymin)*yfactor
+                    else:
+                        y1 = plotymin+float(y1-ymin)*yfactor
+                        y2 = plotymin+float(y2-ymin)*yfactor
+                    self.plotline(x1, y1, x2, y2, attr, row)
+                prev_x, prev_y = x, y
 
         for x, y, text, attr, row in Progress(self.gridlabels, 'labeling'):
-            self.plotlabel(self._coord.scaleX(x), self._coord.scaleY(y), text, attr, row)
+            self.plotlabel(self.scaleX(x), self.scaleY(y), text, attr, row)
 
     def rowsWithinDataBox(self, xmin, ymin, xmax, ymax):
         'Return rows whose plotted points fall within the given data coordinate bounding box.  Works regardless of zoom, filter, or sort.'
-        return self.plotData.rowsWithinDataBox(xmin, ymin, xmax, ymax,
-                                               hiddenAttrs=self.hiddenAttrs,
-                                               source=self.source)
+        ret = {}
+        x1, x2 = min(xmin, xmax), max(xmin, xmax)
+        y1, y2 = min(ymin, ymax), max(ymin, ymax)
+        for vertexes, attr, row in self.polylines:
+            if attr in self.hiddenAttrs:
+                continue
+            if row is None:
+                continue
+            for vx, vy in vertexes:
+                try:
+                    fx, fy = float(vx), float(vy)
+                except (TypeError, ValueError):
+                    continue
+                if x1 <= fx <= x2 and y1 <= fy <= y2:
+                    ret[self.source.rowid(row)] = row
+                    break
+        return list(ret.values())
+
+    def parseBbox(self, bboxstr):
+        'Parse "xmin xmax ymin ymax" string into tuple of floats.'
+        parts = str(bboxstr).split()
+        if len(parts) != 4:
+            vd.fail('expected "xmin xmax ymin ymax", got "%s"' % bboxstr)
+        return tuple(float(p) for p in parts)
+
+    def formatBbox(self, bbox):
+        'Format BoundingBox or (xmin,xmax,ymin,ymax) as "xmin xmax ymin ymax" string using sheet formatters.'
+        if isinstance(bbox, Box):
+            return '%s %s %s %s' % (self.formatX(bbox.xmin), self.formatX(bbox.xmax),
+                                    self.formatY(bbox.ymin), self.formatY(bbox.ymax))
+        xmin, xmax, ymin, ymax = bbox
+        return '%s %s %s %s' % (self.formatX(xmin), self.formatX(xmax),
+                                self.formatY(ymin), self.formatY(ymax))
+
+    @asyncthread
+    def selectBbox(self, bboxstr, add_undo=True):
+        'Select source rows whose data points fall within "xmin xmax ymin ymax".  Async.'
+        xmin, xmax, ymin, ymax = self.parseBbox(bboxstr)
+        rows = self.rowsWithinDataBox(xmin, ymin, xmax, ymax)
+        self.source.select(rows, add_undo=add_undo)
+
+    @asyncthread
+    def stoggleBbox(self, bboxstr, add_undo=True):
+        'Toggle selection of source rows whose data points fall within "xmin xmax ymin ymax".  Async.'
+        xmin, xmax, ymin, ymax = self.parseBbox(bboxstr)
+        rows = self.rowsWithinDataBox(xmin, ymin, xmax, ymax)
+        self.source.toggle(rows, add_undo=add_undo)
+
+    @asyncthread
+    def unselectBbox(self, bboxstr, add_undo=True):
+        'Unselect source rows whose data points fall within "xmin xmax ymin ymax".  Async.'
+        xmin, xmax, ymin, ymax = self.parseBbox(bboxstr)
+        rows = self.rowsWithinDataBox(xmin, ymin, xmax, ymax)
+        self.source.unselect(rows, add_undo=add_undo)
+
+    def brushSelect(self):
+        'Select source rows within current cursor box, recording bbox for cmdlog replay.'
+        if not self.cursorBox:
+            return
+        bboxstr = self.formatBbox(self.cursorBox)
+        vd.setLastArgs(bboxstr)
+        self.selectBbox(bboxstr)
+
+    def brushToggle(self):
+        'Toggle selection of source rows within current cursor box, recording bbox for cmdlog replay.'
+        if not self.cursorBox:
+            return
+        bboxstr = self.formatBbox(self.cursorBox)
+        vd.setLastArgs(bboxstr)
+        self.stoggleBbox(bboxstr)
+
+    def brushUnselect(self):
+        'Unselect source rows within current cursor box, recording bbox for cmdlog replay.'
+        if not self.cursorBox:
+            return
+        bboxstr = self.formatBbox(self.cursorBox)
+        vd.setLastArgs(bboxstr)
+        self.unselectBbox(bboxstr)
+
+    def brushVisibleSelect(self):
+        'Select source rows within visible canvas, recording bbox for cmdlog replay.'
+        if not self.visibleBox:
+            return
+        bboxstr = self.formatBbox(self.visibleBox)
+        vd.setLastArgs(bboxstr)
+        self.selectBbox(bboxstr)
+
+    def brushVisibleToggle(self):
+        'Toggle selection of source rows within visible canvas, recording bbox for cmdlog replay.'
+        if not self.visibleBox:
+            return
+        bboxstr = self.formatBbox(self.visibleBox)
+        vd.setLastArgs(bboxstr)
+        self.stoggleBbox(bboxstr)
+
+    def brushVisibleUnselect(self):
+        'Unselect source rows within visible canvas, recording bbox for cmdlog replay.'
+        if not self.visibleBox:
+            return
+        bboxstr = self.formatBbox(self.visibleBox)
+        vd.setLastArgs(bboxstr)
+        self.unselectBbox(bboxstr)
+
+    def saveNamedSelection(self, name):
+        'Save current cursor bounding box as a named selection.'
+        if not self.cursorBox:
+            vd.fail('no cursor box to save')
+        bb = self.cursorBox
+        sel = {
+            'name': name,
+            'sheet': self.name,
+            'xmin': float(bb.xmin),
+            'xmax': float(bb.xmax),
+            'ymin': float(bb.ymin),
+            'ymax': float(bb.ymax),
+        }
+        vd.selections.append(sel)
+        vd.status('saved selection "%s" (%d points in region)' % (name,
+            len(self.rowsWithinDataBox(bb.xmin, bb.ymin, bb.xmax, bb.ymax))))
+
+    def loadNamedSelection(self, name):
+        'Load/apply a named selection by selecting its rows on the source sheet.'
+        vd.selections.reload()
+        for sel in vd.selections:
+            if sel.name == name:
+                bboxstr = '%s %s %s %s' % (sel.xmin, sel.xmax, sel.ymin, sel.ymax)
+                vd.setLastArgs(bboxstr)
+                self.selectBbox(bboxstr)
+                vd.status('loaded selection "%s"' % name)
+                return
+        vd.fail('no selection named "%s"' % name)
+
+    def deleteNamedSelection(self, name):
+        'Delete a named selection from the stored list.'
+        vd.selections.reload()
+        for i, sel in enumerate(vd.selections):
+            if sel.name == name:
+                del vd.selections[i]
+                p = vd.selections.path
+                if p and p.exists():
+                    import json
+                    with p.open(mode='w', encoding='utf-8') as fp:
+                        for s in vd.selections:
+                            fp.write(json.dumps(dict(s)) + '\n')
+                vd.status('deleted selection "%s"' % name)
+                return
+        vd.fail('no selection named "%s"' % name)
 
     @asyncthread
     def deleteSourceRows(self, rows):
@@ -1389,10 +1047,6 @@ vd.addGlobals({
     'BoundingBox': BoundingBox,
     'Box': Box,
     'Point': Point,
-    'PlotDataset': PlotDataset,
-    'CoordinateTransformer': CoordinateTransformer,
-    'RowIdentityMixin': RowIdentityMixin,
-    'BrushSelectorMixin': BrushSelectorMixin,
     'selections': vd.selections,
 })
 

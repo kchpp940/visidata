@@ -2,10 +2,11 @@ import os
 import tempfile
 import json
 import shutil
+import importlib
 
 import visidata
 from visidata import vd, Sheet, Path, ItemColumn, TableSheet
-from visidata.features import delivery_package
+delivery_package = importlib.import_module('visidata.features.delivery_package')
 
 
 def make_sheet(name, rows, coltypes=None):

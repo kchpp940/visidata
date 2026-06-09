@@ -1,6 +1,6 @@
 import math
 
-from visidata import VisiData, Canvas, Sheet, Progress, BoundingBox, Point, ColumnsSheet, RowIdentityMixin
+from visidata import VisiData, Canvas, Sheet, Progress, BoundingBox, Point, ColumnsSheet
 from visidata import vd, asyncthread, dispwidth, colors, clipstr, ColorAttr, update_attr
 from visidata.type_date import date
 from statistics import median
@@ -19,15 +19,9 @@ def numericCols(vd, cols):
 
 
 class InvertedCanvas(Canvas):
-    'Canvas with y-axis inverted (data y increases upward, like a graph).'
-
-    def __init__(self, *names, **kwargs):
-        super().__init__(*names, **kwargs)
-        self._coord.invert_y = True  # y-axis inversion strategy lives in transformer
-
     @asyncthread
     def render_async(self):
-        self.plot_elements()
+        self.plot_elements(invert_y=True)
 
     def fixPoint(self, plotterPoint, canvasPoint):
         'adjust visibleBox.xymin so that canvasPoint is plotted at plotterPoint'
@@ -43,6 +37,14 @@ class InvertedCanvas(Canvas):
         self.fixPoint(Point(self.plotviewBox.xmin, self.plotviewBox.ymin),
                       Point(bbox.xmin, bbox.ymax))
         self.resetBounds()
+
+    def scaleY(self, canvasY) -> int:
+        'returns a plotter y coordinate for a canvas y coordinate, with the y direction inverted'
+        return self.plotviewBox.ymax-round((canvasY-self.visibleBox.ymin)*self.yScaler)
+
+    def unscaleY(self, plotterY_inverted):
+        'performs the inverse of scaleY, returns a canvas y coordinate'
+        return (self.plotviewBox.ymax-plotterY_inverted)/self.yScaler + self.visibleBox.ymin
 
     @property
     def canvasMouse(self):
@@ -68,15 +70,13 @@ class InvertedCanvas(Canvas):
         # direction from Canvas, the cursor has to be shifted.
         self.cursorBox.ymin -= self.canvasCharHeight
 
-
 # provides axis labels, legend
-class GraphSheet(RowIdentityMixin, InvertedCanvas):
+class GraphSheet(InvertedCanvas):
     rowtype = 'points'
 
     def __init__(self, *names, **kwargs):
         self.ylabel_maxw = 0
         super().__init__(*names, **kwargs)
-        self.initRowIdentity()
 
         self.reflines_x = []
         self.reflines_y = []
@@ -102,7 +102,7 @@ class GraphSheet(RowIdentityMixin, InvertedCanvas):
         nplotted = 0
 
         self.reset()
-        self.initRowIdentity()
+        self.row_order = {}
 
         vd.status('loading data points')
         catcols = [c for c in self.xcols if not vd.isNumeric(c)]
@@ -118,12 +118,13 @@ class GraphSheet(RowIdentityMixin, InvertedCanvas):
 
                     attr = self.plotColor(k)
                     self.point(graph_x, graph_y, attr, row)
-                    self.recordRowIdentity(row, rownum)
+                    self.row_order[self.source.rowid(row)] = rownum
                     nplotted += 1
                 except Exception as e:
                     nerrors += 1
                     if vd.options.debug:
                         vd.exceptionCaught(e)
+
 
         vd.status('loaded %d points (%d errors)' % (nplotted, nerrors))
 
@@ -175,9 +176,9 @@ class GraphSheet(RowIdentityMixin, InvertedCanvas):
         self.cursorBox.h = ymax-ymin
         return True
 
-    def plot_elements(self):
+    def plot_elements(self, invert_y=True):
         self.plot_reflines()
-        super().plot_elements()
+        super().plot_elements(invert_y=True)
 
     def plot_reflines(self):
         self.reflines_char_x = {}
@@ -311,9 +312,9 @@ class GraphSheet(RowIdentityMixin, InvertedCanvas):
         self.plotlabel(0, self.plotviewBox.ymax+4, xname+'»', 'graph_axis')
 
     def rowsWithin(self, plotter_bbox):
-        'return list of deduped rows within plotter_bbox, sorted by original source row order'
+        'return list of deduped rows within plotter_bbox'
         rows = super().rowsWithin(plotter_bbox)
-        return self.sortRowsBySourceOrder(rows)
+        return sorted(rows, key=lambda r: self.row_order[self.source.rowid(r)])
 
     def draw_refline_x(self):
         xcol = vd.numericCols(self.xcols)[0]
@@ -339,7 +340,7 @@ class GraphSheet(RowIdentityMixin, InvertedCanvas):
 
     def erase_refline_x(self):
         if len(self.reflines_x) == 0:
-            vd.fail('no x refline to erase')
+            vd.fail(f'no x refline to erase')
         xtype = vd.numericCols(self.xcols)[0].type
         suggested = format_input_value(self.reflines_x[0], xtype)
 
@@ -353,7 +354,7 @@ class GraphSheet(RowIdentityMixin, InvertedCanvas):
 
     def erase_refline_y(self):
         if len(self.reflines_y) == 0:
-            vd.fail('no y refline to erase')
+            vd.fail(f'no y refline to erase')
         ytype = self.ycols[0].type
         suggested = format_input_value(self.reflines_y[0], ytype) if self.reflines_y else ''
         ystrs = vd.input('remove line(s) at y = ', value=suggested, type='refliney', defaultLast=True).split()
@@ -363,7 +364,6 @@ class GraphSheet(RowIdentityMixin, InvertedCanvas):
             except ValueError:
                 vd.warning(f'value {y} not in reflines_y')
         self.refresh()
-
 
 def format_input_value(val, type):
     '''format a value for entry into vd.input(), so its representation has no spaces and no commas'''
@@ -419,7 +419,7 @@ def reload(sheet):
     if not vd.cursesEnabled:
         sheet.resetCanvasDimensions(25, 80)
         sheet.resetBounds(refresh=False)
-        sheet.plot_elements()
+        sheet.plot_elements(invert_y=True)
 
 vd.addGlobals({
     'GraphSheet': GraphSheet,

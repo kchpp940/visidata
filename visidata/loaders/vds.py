@@ -2,7 +2,8 @@
 
 import json
 
-from visidata import vd, VisiData, JsonSheet, Progress, IndexSheet, SettableColumn, ItemColumn, ExprColumn
+from visidata import vd, VisiData, JsonSheet, Progress, IndexSheet
+from visidata.snapshot import _sheet_snapshot_columns, _restore_columns
 
 
 NL='\n'
@@ -18,20 +19,10 @@ def save_vds(vd, p, *sheets):
 
     with p.open(mode='w', encoding='utf-8') as fp:
         for vs in sheets:
-            # class and attrs for vs
-            d = { 'name': vs.name, }
+            d = {'name': vs.name}
             fp.write('#'+json.dumps(d)+NL)
 
-            # class and attrs for each column in vs
-            for col in vs.columns:
-                d = col.__getstate__()
-                if isinstance(col, SettableColumn):
-                    d['col'] = 'Column'
-                elif isinstance(col, ItemColumn):
-                    d['col'] = 'Column'
-                    d['expr'] = col.name  #2037  override expr
-                else:
-                    d['col'] = type(col).__name__
+            for d in _sheet_snapshot_columns(vs):
                 fp.write('#'+json.dumps(d)+NL)
 
             if not vs.rows:
@@ -69,23 +60,18 @@ class VdsSheet(JsonSheet):
         with self.source.open(encoding='utf-8') as fp:
             fp.seek(self.source_fpos)
 
-            # consume all metadata, create columns
+            col_states = []
             line = fp.readline()
             while line and line.startswith('#{'):
                 d = json.loads(line[1:])
                 if 'col' not in d:
                     raise Exception(d)
-                classname = d.pop('col')
-                if classname == 'Column':
-                    classname = 'ItemColumn'
-                    d['expr'] = d['name']
-
-                c = vd.getGlobals()[classname](d.pop('name'), sheet=self)
-                self.addColumn(c)
-                self.colnames[c.name] = c
-                c.__setstate__(d)  # must happen after addColumn sets .sheet
-
+                col_states.append(d)
                 line = fp.readline()
+
+            _restore_columns(self, col_states)
+            for c in self.columns:
+                self.colnames[c.name] = c
 
             while line and not line.startswith('#{'):
                 d = json.loads(line)
