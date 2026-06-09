@@ -8,6 +8,37 @@ vd.option('zulip_anchor', 1000000000, 'message id to start fetching from')
 vd.option('zulip_delay_s', 0.00001, 'seconds to wait between calls (0 to stop after first)')
 vd.option('zulip_api_key', '', 'API key for Zulip')
 vd.option('zulip_email', '', 'email address for use with Zulip API key')
+vd.option('zulip_use_cache', True, 'cache zulip API responses locally via cache_manager', replay=True)
+
+
+def _zulip_cache_key(kind, **params):
+    import json
+    return f'zulip://{kind}?params={hash(json.dumps(params, sort_keys=True))}'
+
+
+def _zulip_refresh(url):
+    import json
+    from urllib.parse import urlparse, parse_qs
+    parsed = urlparse(url)
+    kind = parsed.netloc
+    results = []
+    if kind == 'streams':
+        r = vd.z_client.get_streams(include_public=True, include_subscribed=True)
+        if r.get('result') == 'success':
+            results = r.get('streams', [])
+    elif kind == 'subscriptions':
+        r = vd.z_client.get_subscriptions()
+        if r.get('result') == 'success':
+            results = r.get('subscriptions', [])
+    elif kind == 'members':
+        r = vd.z_client.get_members()
+        if r.get('result') == 'success':
+            results = r.get('members', [])
+    return json.dumps(results).encode('utf-8')
+
+
+vd.cache_manager.register_source_handler('zulip', lambda url: vd.cache_open_api(
+    url, source_type='zulip', fetcher=lambda: _zulip_refresh(url)))
 
 
 @VisiData.api

@@ -69,15 +69,11 @@ class S3Path(Path):
 
         if 'r' in mode and vd.options.s3_use_cache and vd.options.cache_enabled:
             cached_path = vd.cache_open_s3(self.given, version_id=self.version_id)
-            entry = vd.cache_manager.get(self.given)
-            if entry and getattr(cached_path, '_cache_hit', False):
+            if getattr(cached_path, '_cache_hit', False):
                 vd.status(f'using cached {self.given}')
-
             fp = cached_path.open(mode="rb" if self.compression else mode, **kwargs)
         else:
             fp = self.fs.open(self.given, mode="rb" if self.compression else mode, version_id=self.version_id)
-
-            # Workaround for https://github.com/ajkerrigan/visidata-plugins/issues/12
             if hasattr(fp, "cache") and fp.cache.size != fp.size:
                 vd.debug(
                     f"updating cache size from {fp.cache.size} to {fp.size} to match object size"
@@ -86,17 +82,14 @@ class S3Path(Path):
 
         if self.compression == "gz":
             import gzip
-
             return gzip.open(fp, mode, **kwargs)
 
         if self.compression == "bz2":
             import bz2
-
             return bz2.open(fp, mode, **kwargs)
 
         if self.compression == "xz":
             import lzma
-
             return lzma.open(fp, mode, **kwargs)
 
         return fp

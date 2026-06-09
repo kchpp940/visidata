@@ -16,6 +16,7 @@ from visidata import vd, VisiData, Sheet, AttrColumn, asyncthread, anytype, date
 vd.option('reddit_client_id', '', 'client_id for reddit API')
 vd.option('reddit_client_secret', '', 'client_secret for reddit API')
 vd.option('reddit_user_agent', visidata.__version_info__, 'user_agent for reddit API')
+vd.option('reddit_use_cache', True, 'cache reddit API responses locally via cache_manager', replay=True)
 
 
 @VisiData.api
@@ -40,6 +41,34 @@ vd.new_reddit = vd.open_reddit
 def reddit(vd):
     import praw
     return praw.Reddit(check_for_updates=False, **vd.options.getall('reddit_'))
+
+
+def _reddit_cache_key(kind, names, search=False):
+    return f'reddit://{kind}/{"+".join(names)}?search={"1" if search else "0"}'
+
+
+def _reddit_refresh(url):
+    from urllib.parse import urlparse, parse_qs
+    parsed = urlparse(url)
+    kind = parsed.netloc
+    names = [n for n in parsed.path.strip('/').split('+') if n]
+    search = parse_qs(parsed.query).get('search', ['0'])[0] == '1'
+    results = []
+    if kind == 'subreddits':
+        for name in names:
+            if search:
+                for sr in vd.reddit.subreddits.search(name):
+                    results.append({'display_name': sr.display_name, 'fullname': sr.fullname})
+            else:
+                sr = vd.reddit.subreddit(name)
+                sr.display_name_prefixed
+                results.append({'display_name': sr.display_name, 'fullname': sr.fullname})
+    import json
+    return json.dumps(results).encode('utf-8')
+
+
+vd.cache_manager.register_source_handler('reddit', lambda url: vd.cache_open_api(
+    url, source_type='reddit', fetcher=lambda: _reddit_refresh(url)))
 
 
 subreddit_hidden_attrs='''

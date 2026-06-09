@@ -30,16 +30,12 @@ def format_bytes(vd, n):
 class CacheSheet(Sheet):
     '''View and manage cached remote resources (HTTP/S3/API).
 
-    Commands:
-      - Enter: open cached file from local copy (offline-safe)
-      - zEnter: reload source from original URL/S3 path
-      - Ctrl+R: refresh selected cache entries (re-download)
-      - d: mark selected entries for deletion
-      - gz^R: refresh all cache entries
-      - gd: clear all cache
+    All cache operations go through vd.cache_manager -- this sheet does NOT
+    maintain any cache state on its own.
     '''
     rowtype = 'cached files'
     columns = [
+        Column('status', width=8, getter=lambda c, r: r.status),
         Column('source_type', width=8, getter=lambda c, r: r.source_type),
         Column('url', width=60, getter=lambda c, r: r.url),
         Column('local_path', width=40, getter=lambda c, r: r.local_path),
@@ -53,11 +49,12 @@ class CacheSheet(Sheet):
         Column('etag', width=0, getter=lambda c, r: r.etag[:20] if r.etag else ''),
         Column('last_modified', width=0, getter=lambda c, r: r.last_modified),
         Column('content_type', width=0, getter=lambda c, r: r.content_type),
+        Column('status_msg', width=30, getter=lambda c, r: r.status_msg),
     ]
     nKeys = 1
 
     def iterload(self):
-        for entry in sorted(vd.cache_manager.list(), key=lambda e: e.last_accessed, reverse=True):
+        for entry in sorted(vd.cache_manager.list(verify=True), key=lambda e: e.last_accessed, reverse=True):
             yield entry
 
     def commitDeleteRow(self, row):
@@ -68,17 +65,9 @@ class CacheSheet(Sheet):
 
     @asyncthread
     def refresh_entries(self, rows):
+        '''Refresh selected entries.  Dispatches to CacheManager.refresh().'''
         for entry in vd.Progress(rows, gerund='refreshing'):
-            try:
-                vd.cache_manager.remove(entry.url)
-                if entry.source_type == 'http':
-                    vd.cache_open_http(entry.url)
-                elif entry.source_type == 's3':
-                    vd.cache_open_s3(entry.url, version_id=entry.extra.get('version_id'))
-                else:
-                    vd.cache_open_http(entry.url)
-            except Exception as e:
-                vd.exceptionCaught(e)
+            vd.cache_manager.refresh(entry.url, force=True)
         self.reload()
 
     @asyncthread
@@ -88,15 +77,16 @@ class CacheSheet(Sheet):
         self.reload()
 
     def openCached(self, entry):
-        local = Path(entry.local_path)
-        if not local.exists():
-            vd.fail(f'cache file missing: {entry.local_path}')
+        '''Open the local cached copy.  Uses CacheManager.open_local() exclusively.'''
+        local = vd.cache_manager.open_local(entry.url)
         filetype = local.ext or 'txt'
         vs = vd.openSource(local, filetype=filetype)
         vs.name = f'{entry.source_type}:{os.path.basename(entry.local_path)}'
         return vs
 
     def reloadSource(self, entry):
+        '''Drop cache and reload from the original source.'''
+        vd.cache_manager.remove(entry.url)
         return vd.openSource(entry.url)
 
 
@@ -111,7 +101,7 @@ CacheSheet.addCommand(
     'zEnter',
     'cache-reload-source',
     'vd.push(sheet.reloadSource(cursorRow))',
-    'reload original URL/S3 source',
+    'reload original URL/S3 source (drops cache first)',
 )
 
 CacheSheet.addCommand(
@@ -132,28 +122,28 @@ CacheSheet.addCommand(
     'Ctrl+R',
     'cache-refresh',
     'sheet.refresh_entries([cursorRow])',
-    'refresh current cache entry (re-download)',
+    'refresh current cache entry via CacheManager',
 )
 
 CacheSheet.addCommand(
     'gCtrl+R',
     'cache-refresh-all',
     'sheet.refresh_entries(selectedRows)',
-    'refresh selected cache entries',
+    'refresh selected cache entries via CacheManager',
 )
 
 CacheSheet.addCommand(
     'd',
     'cache-delete-row',
     'deleteRow(cursorRow)',
-    'delete current cache entry',
+    'delete current cache entry via CacheManager',
 )
 
 CacheSheet.addCommand(
     'gd',
     'cache-clear-all',
     'sheet.clear_all_cache()',
-    'clear all cache entries and files',
+    'clear all cache entries and files via CacheManager',
 )
 
 CacheSheet.addCommand(
@@ -193,7 +183,7 @@ BaseSheet.addCommand(
 TableSheet.addCommand(
     'z^R',
     'cache-refresh-source',
-    "src = sheet.source\nif hasattr(src, 'is_url') and src.is_url():\n    vd.cache_manager.remove(src.given)\n    sheet.reload()\nelse:\n    vd.fail('current sheet source is not a remote URL')",
+    "src = sheet.source\nif hasattr(src, 'is_url') and src.is_url():\n    vd.cache_manager.refresh(src.given, force=True)\n    sheet.reload()\nelse:\n    vd.fail('current sheet source is not a remote URL')",
     'drop cache for current sheet source and reload',
 )
 

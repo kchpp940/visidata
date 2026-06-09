@@ -12,8 +12,30 @@ from visidata import vd, VisiData, Sheet, Column, ItemColumn, date, asyncthread,
 vd.option('matrix_token', '', 'matrix API token')
 vd.option('matrix_user_id', '', 'matrix user ID associated with token')
 vd.option('matrix_device_id', 'VisiData', 'device ID associated with matrix login')
+vd.option('matrix_use_cache', True, 'cache matrix API responses locally via cache_manager', replay=True)
 
 vd.matrix_client = None
+
+
+def _matrix_cache_key(kind, **params):
+    import json
+    return f'matrix://{kind}?params={hash(json.dumps(params, sort_keys=True))}'
+
+
+def _matrix_refresh(url):
+    import json
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    kind = parsed.netloc
+    results = []
+    if kind == 'rooms' and vd.matrix_client:
+        results = [{'room_id': r.room_id, 'display_name': r.display_name}
+                   for r in vd.matrix_client.get_rooms().values()]
+    return json.dumps(results).encode('utf-8')
+
+
+vd.cache_manager.register_source_handler('matrix', lambda url: vd.cache_open_api(
+    url, source_type='matrix', fetcher=lambda: _matrix_refresh(url)))
 
 
 @VisiData.api

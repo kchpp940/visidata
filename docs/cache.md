@@ -17,16 +17,22 @@ Open the Cache Sheet with `File > Cache > Open cache sheet` or the `open-cache` 
 
 Each row represents one cached remote resource. The following columns are available:
 
-- **source_type** -- origin protocol (http, s3, etc.)
-- **url** -- the original remote URL
+- **status** -- current cache status: `ok` (valid), `stale` (expired per policy), `missing` (local file gone), `error` (last refresh failed)
+- **source_type** -- origin protocol (http, s3, airtable, reddit, zulip, matrix, etc.)
+- **url** -- the original remote URL or logical cache key
 - **local_path** -- path to the cached file on disk
 - **size** -- size of the cached file
 - **mtime** -- modification time of the cached file
 - **last_accessed** -- when this cache entry was last used
 - **cache_policy** -- the invalidation policy for this entry
+- **status_msg** -- additional status detail (hidden by default)
 - **etag** -- HTTP ETag header (hidden by default)
 - **last_modified** -- HTTP Last-Modified or S3 modification time (hidden by default)
 - **content_type** -- MIME type of the resource (hidden by default)
+- **created_at** -- when the entry was first cached (hidden by default)
+
+On every load the Cache Sheet re-validates each entry against the real filesystem.
+Entries whose local files have disappeared are automatically dropped from the index.
 
 ### Cache Commands
 
@@ -34,17 +40,21 @@ From the Cache Sheet:
 
 | Key(s) | Command | Description |
 |--------|---------|-------------|
-| `Enter` | `cache-open-cached` | Open the cached local file (offline-safe) |
+| `Enter` | `cache-open-cached` | Open the cached local file via CacheManager (offline-safe) |
 | `g Enter` | `cache-open-cached-selected` | Open all selected cached files locally |
-| `z Enter` | `cache-reload-source` | Reload the original URL/S3 source |
-| `gz Enter` | `cache-reload-sources` | Reload original sources for all selected rows |
-| `Ctrl+R` | `cache-refresh` | Re-download the current cache entry |
+| `z Enter` | `cache-reload-source` | Drop cache and reload the original URL/S3/API source |
+| `gz Enter` | `cache-reload-sources` | Drop cache and reload original sources for all selected rows |
+| `Ctrl+R` | `cache-refresh` | Re-download via CacheManager.refresh() dispatcher |
 | `g Ctrl+R` | `cache-refresh-all` | Re-download all selected cache entries |
-| `d` | `cache-delete-row` | Delete the current cache entry |
-| `g d` | `cache-clear-all` | Clear ALL cache entries and files |
+| `d` | `cache-delete-row` | Delete the current cache entry via CacheManager |
+| `g d` | `cache-clear-all` | Clear ALL cache entries and files via CacheManager |
 | `y` | `cache-yank-url` | Copy original URL to clipboard |
 | `g y` | `cache-yank-urls` | Copy all selected URLs to clipboard |
 | `e` | `cache-set-policy` | Edit the cache invalidation policy |
+
+All cache operations are routed exclusively through `vd.cache_manager`.
+Individual loaders (http, s3, API sheets) and the Cache Sheet do NOT maintain any
+cache state on their own.
 
 Global commands (available everywhere):
 
@@ -54,7 +64,7 @@ Global commands (available everywhere):
 | `cache-toggle` | Toggle remote caching on/off |
 | `cache-toggle-offline` | Toggle offline mode (use cache only) |
 | `cache-clear-current` | Clear cache for the current sheet source |
-| `cache-refresh-source` | Drop cache for current sheet source and reload |
+| `cache-refresh-source` | Drop cache for current sheet source and reload via CacheManager |
 
 ### Cache Policies
 
@@ -65,6 +75,18 @@ Each cache entry has a policy that determines when it is considered stale:
 - **last-modified** -- use HTTP Last-Modified for conditional validation (never expires locally)
 - **never** -- never consider the entry stale; always use the cache
 
+### Supported Remote Sources
+
+| Source | source_type | Notes |
+|--------|-------------|-------|
+| HTTP / HTTPS | `http` | Full conditional request support via ETag and Last-Modified |
+| Amazon S3 | `s3` | Caches objects; compares LastModified timestamps |
+| Airtable | `airtable` | Caches full table download as JSON |
+| Reddit | `reddit` | Source handlers registered; SDK uses requests_cache for sub-requests |
+| Zulip | `zulip` | Source handlers registered for streams, members, subscriptions |
+| Matrix | `matrix` | Source handlers registered for rooms listing |
+| Other API | (custom) | Use `vd.cache_open_api()` with your own fetcher callable |
+
 ### Options
 
 | Option | Default | Description |
@@ -74,6 +96,10 @@ Each cache entry has a policy that determines when it is considered stale:
 | `cache_default_days` | 1 | Default cache expiry in days for new entries |
 | `http_use_cache` | True | Cache HTTP responses locally |
 | `s3_use_cache` | True | Cache S3 objects locally |
+| `airtable_use_cache` | True | Cache Airtable table downloads locally |
+| `reddit_use_cache` | True | Cache Reddit API calls (SDK also uses requests_cache) |
+| `zulip_use_cache` | True | Cache Zulip API responses locally |
+| `matrix_use_cache` | True | Cache Matrix API responses locally |
 
 ### How It Works
 

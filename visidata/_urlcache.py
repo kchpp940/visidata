@@ -5,7 +5,7 @@ import json
 import hashlib
 import urllib.parse
 from dataclasses import dataclass, field, asdict
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Callable
 
 from visidata import vd, VisiData, Path, modtime, asyncthread, Progress, BaseSheet
 
@@ -13,6 +13,12 @@ from visidata import vd, VisiData, Path, modtime, asyncthread, Progress, BaseShe
 vd.option('cache_default_days', 1, 'default cache expiry in days', replay=True)
 vd.option('cache_enabled', True, 'enable remote data caching', replay=True)
 vd.option('cache_offline', False, 'offline mode: use cache only, do not make network requests', replay=True)
+
+
+_CACHE_STATUS_OK = 'ok'
+_CACHE_STATUS_MISSING = 'missing'
+_CACHE_STATUS_STALE = 'stale'
+_CACHE_STATUS_ERROR = 'error'
 
 
 @dataclass
@@ -29,6 +35,8 @@ class CacheEntry:
     cache_policy: str = 'days:1'
     created_at: float = field(default_factory=time.time)
     last_accessed: float = field(default_factory=time.time)
+    status: str = _CACHE_STATUS_OK
+    status_msg: str = ''
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -36,9 +44,12 @@ class CacheEntry:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> 'CacheEntry':
-        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+        valid_fields = cls.__dataclass_fields__
+        return cls(**{k: v for k, v in d.items() if k in valid_fields})
 
     def is_expired(self) -> bool:
+        if self.status == _CACHE_STATUS_MISSING:
+            return True
         if self.cache_policy == 'never':
             return False
         if self.cache_policy.startswith('days:'):
@@ -56,6 +67,8 @@ class CacheManager:
     '''Unified manager for remote resource caching.
 
     Maintains a persistent index of all cached resources with full metadata.
+    All cache operations (refresh, remove, open, verify) MUST go through this
+    manager -- individual loaders MUST NOT maintain their own cache state.
     '''
 
     def __init__(self, cache_dir: Path):
@@ -63,6 +76,7 @@ class CacheManager:
         self.index_path = self.cache_dir / '_cache_index.json'
         self._entries: Dict[str, CacheEntry] = {}
         self._loaded = False
+        self._source_handlers: Dict[str, Callable] = {}
 
     def _ensure_dir(self) -> None:
         os.makedirs(self.cache_dir, exist_ok=True)
@@ -109,19 +123,57 @@ class CacheManager:
             return scheme
         return 'other'
 
+    def register_source_handler(self, source_type: str, refresher: Callable) -> None:
+        '''Register a callable refresher(url: str) -> Path for a given source_type.
+
+        The refresher must download (or re-download) the resource and return
+        the Path to the local cached file.  The manager will handle all metadata
+        bookkeeping.
+        '''
+        self._source_handlers[source_type] = refresher
+
+    def sync_entry(self, entry: CacheEntry) -> bool:
+        '''Re-sync entry metadata from actual file on disk.
+
+        Returns True if the local file is present and intact.
+        Updates entry.size, entry.mtime, entry.status, entry.status_msg in-place.
+        '''
+        local = Path(entry.local_path)
+        if not local.exists():
+            entry.status = _CACHE_STATUS_MISSING
+            entry.status_msg = 'local file missing'
+            entry.size = 0
+            entry.mtime = 0
+            return False
+        try:
+            st = local.stat()
+            entry.size = st.st_size
+            entry.mtime = modtime(local)
+            if entry.is_expired():
+                entry.status = _CACHE_STATUS_STALE
+                entry.status_msg = f'policy {entry.cache_policy}'
+            else:
+                entry.status = _CACHE_STATUS_OK
+                entry.status_msg = ''
+            return True
+        except Exception as e:
+            entry.status = _CACHE_STATUS_ERROR
+            entry.status_msg = str(e)
+            return False
+
     def get(self, url: str) -> Optional[CacheEntry]:
+        '''Look up an entry by URL.  Syncs metadata from disk and touches access time.'''
         self._load()
         entry = self._entries.get(url)
-        if entry:
-            entry.touch()
+        if not entry:
+            return None
+        self.sync_entry(entry)
+        if entry.status == _CACHE_STATUS_MISSING:
+            del self._entries[url]
             self._save()
-            local = Path(entry.local_path)
-            if not local.exists():
-                del self._entries[url]
-                self._save()
-                return None
-            entry.size = local.stat().st_size
-            entry.mtime = modtime(local)
+            return None
+        entry.touch()
+        self._save()
         return entry
 
     def put(self, url: str, local_path: Path, *,
@@ -130,27 +182,31 @@ class CacheManager:
             last_modified: str = '',
             content_type: str = '',
             cache_policy: str = '',
+            status: str = _CACHE_STATUS_OK,
+            status_msg: str = '',
             extra: Optional[Dict[str, Any]] = None) -> CacheEntry:
+        '''Store (or update) a cache entry.  Syncs size/mtime from the actual file.'''
         self._load()
         local = Path(local_path)
-        st = local.stat() if local.exists() else None
         entry = CacheEntry(
             url=url,
             local_path=str(local),
             source_type=source_type or self._detect_source_type(url),
-            size=st.st_size if st else 0,
-            mtime=st.st_mtime if st else time.time(),
             etag=etag,
             last_modified=last_modified,
             content_type=content_type,
             cache_policy=cache_policy or f'days:{vd.options.cache_default_days}',
+            status=status,
+            status_msg=status_msg,
             extra=extra or {},
         )
+        self.sync_entry(entry)
         self._entries[url] = entry
         self._save()
         return entry
 
     def remove(self, url: str) -> bool:
+        '''Remove a cache entry and its local file.  Returns True if something was removed.'''
         self._load()
         entry = self._entries.pop(url, None)
         if entry:
@@ -165,6 +221,7 @@ class CacheManager:
         return False
 
     def clear_all(self) -> int:
+        '''Remove ALL cache entries and files.'''
         self._load()
         count = len(self._entries)
         for entry in list(self._entries.values()):
@@ -178,22 +235,103 @@ class CacheManager:
         self._save()
         return count
 
-    def list(self) -> List[CacheEntry]:
+    def list(self, verify: bool = True) -> List[CacheEntry]:
+        '''Return all cache entries.  If verify=True, sync each entry from disk first.'''
         self._load()
+        if verify:
+            removed = []
+            for url, entry in self._entries.items():
+                self.sync_entry(entry)
+                if entry.status == _CACHE_STATUS_MISSING:
+                    removed.append(url)
+            for url in removed:
+                del self._entries[url]
+            if removed:
+                self._save()
         return list(self._entries.values())
+
+    def verify_all(self) -> Dict[str, int]:
+        '''Verify every entry against the real filesystem.
+
+        Drops entries with missing files.  Returns counts per status.
+        '''
+        self._load()
+        counts: Dict[str, int] = {_CACHE_STATUS_OK: 0, _CACHE_STATUS_MISSING: 0,
+                                  _CACHE_STATUS_STALE: 0, _CACHE_STATUS_ERROR: 0}
+        removed = []
+        for url, entry in self._entries.items():
+            self.sync_entry(entry)
+            counts[entry.status] = counts.get(entry.status, 0) + 1
+            if entry.status == _CACHE_STATUS_MISSING:
+                removed.append(url)
+        for url in removed:
+            del self._entries[url]
+        if removed:
+            self._save()
+        return counts
 
     def is_valid(self, url: str) -> bool:
         entry = self.get(url)
         if not entry:
             return False
-        return not entry.is_expired()
+        return entry.status == _CACHE_STATUS_OK
 
-    def refresh_policy(self, url: str, policy: str) -> None:
+    def refresh_policy(self, url: str, policy: str) -> Optional[CacheEntry]:
         self._load()
         entry = self._entries.get(url)
         if entry:
             entry.cache_policy = policy
+            self.sync_entry(entry)
             self._save()
+        return entry
+
+    def open_local(self, url: str) -> Path:
+        '''Return a validated Path to the locally cached file.
+
+        Fails if the file is missing or the cache entry cannot be found.
+        This is the ONLY supported way to do "offline open".
+        '''
+        entry = self.get(url)
+        if not entry:
+            vd.fail(f'no cache entry for {url}')
+        local = Path(entry.local_path)
+        if not local.exists():
+            self.remove(url)
+            vd.fail(f'cache file missing: {entry.local_path}')
+        entry.touch()
+        self._save()
+        return local
+
+    def refresh(self, url: str, force: bool = False) -> Optional[CacheEntry]:
+        '''Refresh (re-download) a single cache entry.
+
+        Dispatches to the registered source handler based on entry.source_type.
+        If force=True the entry is removed first; otherwise the handler decides.
+        Returns the updated CacheEntry or None on failure.
+        '''
+        self._load()
+        entry = self._entries.get(url)
+        source_type = entry.source_type if entry else self._detect_source_type(url)
+
+        if force:
+            self.remove(url)
+
+        handler = self._source_handlers.get(source_type)
+        if not handler:
+            vd.warning(f'no cache refresh handler registered for source type: {source_type}')
+            return None
+
+        try:
+            handler(url)
+        except Exception as e:
+            vd.exceptionCaught(e)
+            if entry:
+                entry.status = _CACHE_STATUS_ERROR
+                entry.status_msg = str(e)
+                self._save()
+            return None
+
+        return self.get(url)
 
 
 @VisiData.cached_property
@@ -208,15 +346,13 @@ def urlcache(vd, url, days=1, text=True, headers=None):
     Legacy API preserved for backward compatibility.  New code should use
     `vd.cache_manager` for more control.
     '''
-    from urllib.request import Request, urlopen
-
     policy = f'days:{days}'
     entry = vd.cache_manager.get(url)
     if entry and not entry.is_expired():
         return Path(entry.local_path)
 
+    from urllib.request import Request, urlopen
     os.makedirs(vd.cache_dir, exist_ok=True)
-
     p = vd.cache_manager._cache_path_for(url)
 
     req = Request(url)
@@ -248,7 +384,6 @@ def urlcache(vd, url, days=1, text=True, headers=None):
         content_type=content_type,
         cache_policy=policy,
     )
-
     return p
 
 
@@ -263,53 +398,36 @@ def enable_requests_cache(vd):
         vd.warning('install requests_cache for less intrusive scraping')
 
 
-@VisiData.api
-def cache_open_http(vd, url: str, *, headers=None, cache_policy: str = '') -> Path:
-    '''Fetch URL via HTTP, cache locally, return Path to cached file.
+def _do_cache_open(vd, url, source_type, *, fetcher, cache_policy='', etag='', last_modified='', content_type='', extra=None):
+    '''Core helper for all cache_open_* entry points.
 
-    Uses conditional requests via ETag/Last-Modified when available.
-    Respects cache_offline and cache_enabled options.
+    fetcher() -> bytes  -- performs the actual download and returns raw bytes.
+    This helper handles: cache lookup, offline mode, cache_enabled gate,
+    writing to disk, storing metadata via CacheManager.put().
+    Returns a Path to the cached local file.
     '''
-    from urllib.request import Request, urlopen
-
     entry = vd.cache_manager.get(url)
 
     if vd.options.cache_offline:
-        if entry:
-            vd.status(f'offline: using cached {url}')
-            p = Path(entry.local_path)
-            p._cache_hit = True
-            p._from_cache = True
-            if entry.etag or entry.last_modified:
-                p._http_headers = {'ETag': entry.etag, 'Last-Modified': entry.last_modified}
-            return p
-        vd.fail(f'offline: no cache available for {url}')
+        local = vd.cache_manager.open_local(url)
+        vd.status(f'offline: using cached {url}')
+        local._cache_hit = True
+        local._from_cache = True
+        if entry and (entry.etag or entry.last_modified):
+            local._http_headers = {'ETag': entry.etag, 'Last-Modified': entry.last_modified}
+        return local
 
     if not vd.options.cache_enabled:
         p = vd.cache_manager._cache_path_for(url)
-        req = Request(url)
-        for k, v in (headers or {}).items():
-            req.add_header(k, v)
-        with urlopen(req) as fp:
-            data = fp.read()
+        data = fetcher(entry=None, conditional=False)
         with p.open_bytes(mode='w') as fpout:
             fpout.write(data)
-        p._http_headers = {h: v for h, v in fp.headers.items()} if hasattr(fp, 'headers') else {}
         return p
 
     p = Path(entry.local_path) if entry else vd.cache_manager._cache_path_for(url)
 
-    req = Request(url)
-    for k, v in (headers or {}).items():
-        req.add_header(k, v)
-
-    if entry and entry.etag:
-        req.add_header('If-None-Match', entry.etag)
-    if entry and entry.last_modified:
-        req.add_header('If-Modified-Since', entry.last_modified)
-
     try:
-        resp = urlopen(req)
+        data, meta = fetcher(entry=entry, conditional=bool(entry))
     except Exception as e:
         if entry:
             vd.status(f'using cached {url} ({e})')
@@ -318,7 +436,7 @@ def cache_open_http(vd, url: str, *, headers=None, cache_policy: str = '') -> Pa
             return p
         raise
 
-    if resp.status == 304 and entry:
+    if meta.get('not_modified', False) and entry:
         vd.debug(f'cache hit (304) for {url}')
         entry.touch()
         vd.cache_manager._save()
@@ -326,31 +444,64 @@ def cache_open_http(vd, url: str, *, headers=None, cache_policy: str = '') -> Pa
         p._from_cache = True
         return p
 
-    data = resp.read()
     with p.open_bytes(mode='w') as fpout:
         fpout.write(data)
 
-    etag = resp.headers.get('ETag', '') or ''
-    last_modified = resp.headers.get('Last-Modified', '') or ''
-    content_type = resp.headers.get('Content-Type', '') or ''
-
-    policy = cache_policy or (
-        'etag' if etag else ('last-modified' if last_modified else f'days:{vd.options.cache_default_days}')
+    policy = cache_policy or meta.get('cache_policy') or (
+        'etag' if meta.get('etag') else ('last-modified' if meta.get('last_modified') else f'days:{vd.options.cache_default_days}')
     )
 
     vd.cache_manager.put(
         url, p,
-        source_type='http',
-        etag=etag,
-        last_modified=last_modified,
-        content_type=content_type,
+        source_type=source_type,
+        etag=meta.get('etag', etag) or '',
+        last_modified=meta.get('last_modified', last_modified) or '',
+        content_type=meta.get('content_type', content_type) or '',
         cache_policy=policy,
+        extra=extra or meta.get('extra') or {},
     )
 
     p._cache_hit = False
     p._from_cache = False
-    p._http_headers = {h: v for h, v in resp.headers.items()}
+    if 'response_headers' in meta:
+        p._http_headers = meta['response_headers']
     return p
+
+
+@VisiData.api
+def cache_open_http(vd, url: str, *, headers=None, cache_policy: str = '') -> Path:
+    '''Fetch URL via HTTP, cache locally, return Path to cached file.
+
+    Uses conditional requests via ETag/Last-Modified when available.
+    ALL HTTP caching goes through this function -- the HTTP loader must not
+    maintain any separate cache state.
+    '''
+    from urllib.request import Request, urlopen
+    from urllib.error import HTTPError
+
+    def _http_fetcher(entry=None, conditional=False):
+        req = Request(url)
+        for k, v in (headers or {}).items():
+            req.add_header(k, v)
+        if conditional and entry:
+            if entry.etag:
+                req.add_header('If-None-Match', entry.etag)
+            if entry.last_modified:
+                req.add_header('If-Modified-Since', entry.last_modified)
+
+        resp = urlopen(req)
+        meta = {}
+        if resp.status == 304:
+            meta['not_modified'] = True
+            return b'', meta
+        data = resp.read()
+        meta['etag'] = resp.headers.get('ETag', '') or ''
+        meta['last_modified'] = resp.headers.get('Last-Modified', '') or ''
+        meta['content_type'] = resp.headers.get('Content-Type', '') or ''
+        meta['response_headers'] = {h: v for h, v in resp.headers.items()}
+        return data, meta
+
+    return _do_cache_open(vd, url, 'http', fetcher=_http_fetcher, cache_policy=cache_policy)
 
 
 @VisiData.api
@@ -358,67 +509,94 @@ def cache_open_s3(vd, url: str, *, version_id=None, cache_policy: str = '') -> P
     '''Fetch S3 object, cache locally, return Path to cached file.'''
     s3fs_core = vd.importExternal('s3fs.core', 's3fs')
 
+    def _s3_fetcher(entry=None, conditional=False):
+        s3fs = s3fs_core.S3FileSystem(
+            client_kwargs={'endpoint_url': vd.options.s3_endpoint or None},
+            anon=vd.options.s3_anon,
+        )
+        info = s3fs.info(url, version_id=version_id)
+        remote_mtime = info.get('LastModified', 0)
+        if hasattr(remote_mtime, 'timestamp'):
+            remote_mtime = remote_mtime.timestamp()
+        meta = {
+            'last_modified': str(remote_mtime),
+            'content_type': info.get('ContentType', ''),
+            'etag': info.get('ETag', ''),
+            'extra': {'version_id': version_id, 'etag': info.get('ETag', '')},
+            'cache_policy': cache_policy or 'last-modified',
+        }
+        if conditional and entry and entry.mtime and entry.mtime >= remote_mtime:
+            meta['not_modified'] = True
+            return b'', meta
+        with s3fs.open(url, mode='rb', version_id=version_id) as src:
+            data = src.read()
+        return data, meta
+
+    return _do_cache_open(vd, url, 's3', fetcher=_s3_fetcher, cache_policy=cache_policy)
+
+
+@VisiData.api
+def cache_open_api(vd, url: str, *, source_type: str, fetcher,
+                   cache_policy: str = '', content_type: str = 'application/json',
+                   extra: Optional[Dict[str, Any]] = None) -> Path:
+    '''Generic API response caching helper.
+
+    Parameters
+    ----------
+    url : str
+        Logical identifier for this API call (may include query params for uniqueness).
+    source_type : str
+        Source identifier, e.g. 'airtable', 'reddit', 'zulip', 'matrix'.
+    fetcher : callable
+        Signature ``fetcher() -> bytes``.  Performs the actual API call and
+        returns the raw response bytes (typically JSON).
+    cache_policy : str
+        One of the standard cache policies.  Defaults to ``days:{cache_default_days}``.
+    content_type : str
+        Stored in the cache entry for later inspection.
+    extra : dict
+        Any additional metadata to store alongside the entry.
+    '''
     entry = vd.cache_manager.get(url)
 
     if vd.options.cache_offline:
-        if entry:
-            vd.status(f'offline: using cached {url}')
-            p = Path(entry.local_path)
-            p._cache_hit = True
-            p._from_cache = True
-            return p
-        vd.fail(f'offline: no cache available for {url}')
-
-    s3fs = s3fs_core.S3FileSystem(
-        client_kwargs={'endpoint_url': vd.options.s3_endpoint or None},
-        anon=vd.options.s3_anon,
-    )
+        local = vd.cache_manager.open_local(url)
+        vd.status(f'offline: using cached {url}')
+        local._cache_hit = True
+        local._from_cache = True
+        return local
 
     if not vd.options.cache_enabled:
         p = vd.cache_manager._cache_path_for(url)
-        with s3fs.open(url, mode='rb', version_id=version_id) as src:
-            data = src.read()
+        data = fetcher()
         with p.open_bytes(mode='w') as fpout:
             fpout.write(data)
         return p
 
-    p = Path(entry.local_path) if entry else vd.cache_manager._cache_path_for(url)
+    use_cached = entry and not entry.is_expired()
+    if use_cached:
+        p = Path(entry.local_path)
+        vd.debug(f'cache hit for {url}')
+        p._cache_hit = True
+        p._from_cache = True
+        return p
 
-    info = s3fs.info(url, version_id=version_id)
-    remote_mtime = info.get('LastModified', 0)
-    if hasattr(remote_mtime, 'timestamp'):
-        remote_mtime = remote_mtime.timestamp()
+    p = vd.cache_manager._cache_path_for(url)
+    data = fetcher()
+    with p.open_bytes(mode='w') as fpout:
+        fpout.write(data)
 
-    need_download = True
-    if entry and entry.mtime and remote_mtime:
-        if entry.mtime >= remote_mtime:
-            need_download = False
-            entry.touch()
-            vd.cache_manager._save()
-            vd.debug(f'cache hit for {url}')
-            p._cache_hit = True
-            p._from_cache = True
+    return vd.cache_manager.put(
+        url, p,
+        source_type=source_type,
+        content_type=content_type,
+        cache_policy=cache_policy or f'days:{vd.options.cache_default_days}',
+        extra=extra or {},
+    ).local_path and p or p
 
-    if need_download:
-        vd.status(f'downloading {url}')
-        with s3fs.open(url, mode='rb', version_id=version_id) as src:
-            data = src.read()
-        with p.open_bytes(mode='w') as fpout:
-            fpout.write(data)
 
-        policy = cache_policy or 'last-modified'
-        vd.cache_manager.put(
-            url, p,
-            source_type='s3',
-            last_modified=str(remote_mtime),
-            content_type=info.get('ContentType', ''),
-            cache_policy=policy,
-            extra={'version_id': version_id, 'etag': info.get('ETag', '')},
-        )
-        p._cache_hit = False
-        p._from_cache = False
-
-    return p
+vd.cache_manager.register_source_handler('http', lambda url: vd.cache_open_http(url))
+vd.cache_manager.register_source_handler('s3', lambda url: vd.cache_open_s3(url))
 
 
 BaseSheet.addCommand(

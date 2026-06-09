@@ -26,21 +26,6 @@ def guessurl_mimetype(vd, path, response):
         return dict(filetype=content_filetypes.get(subtype), _likelihood=10)
 
 
-
-@VisiData.api
-def _http_fetch_response(vd, url, *, ctx=None):
-    import urllib.request
-    import urllib.error
-
-    req = urllib.request.Request(url, **vd.options.getall('http_req_'))
-    try:
-        return urllib.request.urlopen(req, context=ctx)
-    except urllib.error.HTTPError as e:
-        vd.fail(f'cannot open URL: HTTP Error {e.code}: {e.reason}')
-    except urllib.error.URLError as e:
-        vd.fail(f'cannot open URL: {e.reason}')
-
-
 @VisiData.api
 def openurl_http(vd, path, filetype=None):
     schemes = path.scheme.split('+')
@@ -51,8 +36,6 @@ def openurl_http(vd, path, filetype=None):
             vd.fail(f'no handler for `{sch}` url scheme')
         return openfunc(Path(schemes[-1]+'://'+path.given.split('://')[1]))
 
-    import urllib.request
-    import urllib.error
     import mimetypes
 
     ctx = None
@@ -75,14 +58,19 @@ def openurl_http(vd, path, filetype=None):
                 vd.status(f'cached {path.given}')
         src_path = cached_path
     else:
-        response = vd._http_fetch_response(path.given, ctx=ctx)
+        from urllib.request import Request, urlopen
+        req = Request(path.given, **vd.options.getall('http_req_'))
+        try:
+            response = urlopen(req, context=ctx)
+        except Exception as e:
+            vd.fail(f'cannot open URL: {e}')
         filetype = filetype or vd.guessFiletype(path, response, funcprefix='guessurl_').get('filetype')
         filetype = filetype or vd.guessFiletype(path, funcprefix='guess_').get('filetype')
         data = response.read()
-        cached_path = vd.cache_manager._cache_path_for(path.given)
-        with cached_path.open_bytes(mode='w') as fpout:
+        p = vd.cache_manager._cache_path_for(path.given)
+        with p.open_bytes(mode='w') as fpout:
             fpout.write(data)
-        src_path = cached_path
+        src_path = p
         if hasattr(response, 'headers'):
             src_path._http_headers = {h: v for h, v in response.headers.items()}
 
@@ -91,7 +79,6 @@ def openurl_http(vd, path, filetype=None):
         filetype = vd.guessFiletype(path, ft_resp, funcprefix='guessurl_').get('filetype')
         filetype = filetype or vd.guessFiletype(src_path, funcprefix='guess_').get('filetype')
 
-    # Automatically paginate if a 'next' URL is given
     def _iter_lines(path=path, src_path=src_path, max_next=vd.options.http_max_next):
         path.responses = []
         n = 0
@@ -124,7 +111,9 @@ def openurl_http(vd, path, filetype=None):
             if use_cache:
                 cur_path = vd.cache_open_http(src, headers=vd.options.getall('http_req_'))
             else:
-                resp = vd._http_fetch_response(src, ctx=ctx)
+                from urllib.request import Request, urlopen
+                req = Request(src, **vd.options.getall('http_req_'))
+                resp = urlopen(req, context=ctx)
                 cur_path = vd.cache_manager._cache_path_for(src)
                 with cur_path.open_bytes(mode='w') as fpout:
                     fpout.write(resp.read())
@@ -132,20 +121,11 @@ def openurl_http(vd, path, filetype=None):
                     cur_path._http_headers = {h: v for h, v in resp.headers.items()}
             cur_url = src
 
-    # add resettable iterator over contents as an already-open fp
     path.fptext = RepeatFile(_iter_lines())
 
     return vd.openSource(path, filetype=filetype)
 
 def parse_header_links(link_header):
-    '''Return a list of dictionaries:
-    [{'url': 'https://example.com/content?page=1', 'rel': 'prev'},
-     {'url': 'https://example.com/content?page=3', 'rel': 'next'}]
-    Takes a link header string, of the form
-    '<https://example.com/content?page=1>; rel="prev", <https://example.com/content?page=3>; rel="next"'
-    See https://datatracker.ietf.org/doc/html/rfc8288#section-3
-    '''
-
     links = []
     quote_space = ' \'"'
     link_header = link_header.strip(quote_space)
