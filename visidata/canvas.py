@@ -1,3 +1,4 @@
+import json
 import math
 import random
 
@@ -847,77 +848,178 @@ class Canvas(Plotter):
         return '%s %s %s %s' % (self.formatX(xmin), self.formatX(xmax),
                                 self.formatY(ymin), self.formatY(ymax))
 
-    @asyncthread
-    def selectBbox(self, bboxstr, add_undo=True):
-        'Select source rows whose data points fall within "xmin xmax ymin ymax".  Async.'
+    def _resolveRowsFromContext(self, ctxstr):
+        '''Resolve rows from a brush context string (JSON with rowkeys+bbox, or plain bbox).
+        Returns (rows, used_rowkeys_count, missing_count) where rows is the final list of rows.'''
+        bboxstr, saved_rowkeys = self._parseBrushContext(ctxstr)
         xmin, xmax, ymin, ymax = self.parseBbox(bboxstr)
+
+        if saved_rowkeys and self.source:
+            found_rows, missing_count = self._matchRowsByRowkeys(saved_rowkeys)
+            if missing_count > 0:
+                fallback_rows = self.rowsWithinDataBox(xmin, ymin, xmax, ymax)
+                found_keys = set(self._rowkeyStr(r) for r in found_rows)
+                extra = [r for r in fallback_rows if self._rowkeyStr(r) not in found_keys]
+                if extra:
+                    found_rows.extend(extra)
+                vd.warning('%d of %d rowkeys missing; recovered %d via bbox' % (
+                    missing_count, len(saved_rowkeys), len(extra)))
+            return found_rows, len(saved_rowkeys) - missing_count, missing_count
+
         rows = self.rowsWithinDataBox(xmin, ymin, xmax, ymax)
+        return rows, 0, 0
+
+    @asyncthread
+    def selectBbox(self, ctxstr, add_undo=True):
+        'Select source rows from brush context: prefer saved rowkeys, fall back to data bbox.  Async.'
+        rows, _, _ = self._resolveRowsFromContext(ctxstr)
         self.source.select(rows, add_undo=add_undo)
 
     @asyncthread
-    def stoggleBbox(self, bboxstr, add_undo=True):
-        'Toggle selection of source rows whose data points fall within "xmin xmax ymin ymax".  Async.'
-        xmin, xmax, ymin, ymax = self.parseBbox(bboxstr)
-        rows = self.rowsWithinDataBox(xmin, ymin, xmax, ymax)
+    def stoggleBbox(self, ctxstr, add_undo=True):
+        'Toggle selection of source rows from brush context: prefer saved rowkeys, fall back to data bbox.  Async.'
+        rows, _, _ = self._resolveRowsFromContext(ctxstr)
         self.source.toggle(rows, add_undo=add_undo)
 
     @asyncthread
-    def unselectBbox(self, bboxstr, add_undo=True):
-        'Unselect source rows whose data points fall within "xmin xmax ymin ymax".  Async.'
-        xmin, xmax, ymin, ymax = self.parseBbox(bboxstr)
-        rows = self.rowsWithinDataBox(xmin, ymin, xmax, ymax)
+    def unselectBbox(self, ctxstr, add_undo=True):
+        'Unselect source rows from brush context: prefer saved rowkeys, fall back to data bbox.  Async.'
+        rows, _, _ = self._resolveRowsFromContext(ctxstr)
         self.source.unselect(rows, add_undo=add_undo)
 
     def brushSelect(self):
-        'Select source rows within current cursor box, recording bbox for cmdlog replay.'
+        'Select source rows within current cursor box, recording full brush context (bbox+rowkeys) for cmdlog replay.'
         if not self.cursorBox:
             return
-        bboxstr = self.formatBbox(self.cursorBox)
-        vd.setLastArgs(bboxstr)
-        self.selectBbox(bboxstr)
+        rows = self.rowsWithinDataBox(self.cursorBox.xmin, self.cursorBox.ymin,
+                                       self.cursorBox.xmax, self.cursorBox.ymax)
+        ctxstr = self._makeBrushContext(rows, self.cursorBox)
+        vd.setLastArgs(ctxstr)
+        self.selectBbox(ctxstr)
 
     def brushToggle(self):
-        'Toggle selection of source rows within current cursor box, recording bbox for cmdlog replay.'
+        'Toggle selection of source rows within current cursor box, recording full brush context (bbox+rowkeys) for cmdlog replay.'
         if not self.cursorBox:
             return
-        bboxstr = self.formatBbox(self.cursorBox)
-        vd.setLastArgs(bboxstr)
-        self.stoggleBbox(bboxstr)
+        rows = self.rowsWithinDataBox(self.cursorBox.xmin, self.cursorBox.ymin,
+                                       self.cursorBox.xmax, self.cursorBox.ymax)
+        ctxstr = self._makeBrushContext(rows, self.cursorBox)
+        vd.setLastArgs(ctxstr)
+        self.stoggleBbox(ctxstr)
 
     def brushUnselect(self):
-        'Unselect source rows within current cursor box, recording bbox for cmdlog replay.'
+        'Unselect source rows within current cursor box, recording full brush context (bbox+rowkeys) for cmdlog replay.'
         if not self.cursorBox:
             return
-        bboxstr = self.formatBbox(self.cursorBox)
-        vd.setLastArgs(bboxstr)
-        self.unselectBbox(bboxstr)
+        rows = self.rowsWithinDataBox(self.cursorBox.xmin, self.cursorBox.ymin,
+                                       self.cursorBox.xmax, self.cursorBox.ymax)
+        ctxstr = self._makeBrushContext(rows, self.cursorBox)
+        vd.setLastArgs(ctxstr)
+        self.unselectBbox(ctxstr)
 
     def brushVisibleSelect(self):
-        'Select source rows within visible canvas, recording bbox for cmdlog replay.'
+        'Select source rows within visible canvas, recording full brush context (bbox+rowkeys) for cmdlog replay.'
         if not self.visibleBox:
             return
-        bboxstr = self.formatBbox(self.visibleBox)
-        vd.setLastArgs(bboxstr)
-        self.selectBbox(bboxstr)
+        rows = self.rowsWithinDataBox(self.visibleBox.xmin, self.visibleBox.ymin,
+                                       self.visibleBox.xmax, self.visibleBox.ymax)
+        ctxstr = self._makeBrushContext(rows, self.visibleBox)
+        vd.setLastArgs(ctxstr)
+        self.selectBbox(ctxstr)
 
     def brushVisibleToggle(self):
-        'Toggle selection of source rows within visible canvas, recording bbox for cmdlog replay.'
+        'Toggle selection of source rows within visible canvas, recording full brush context (bbox+rowkeys) for cmdlog replay.'
         if not self.visibleBox:
             return
-        bboxstr = self.formatBbox(self.visibleBox)
-        vd.setLastArgs(bboxstr)
-        self.stoggleBbox(bboxstr)
+        rows = self.rowsWithinDataBox(self.visibleBox.xmin, self.visibleBox.ymin,
+                                       self.visibleBox.xmax, self.visibleBox.ymax)
+        ctxstr = self._makeBrushContext(rows, self.visibleBox)
+        vd.setLastArgs(ctxstr)
+        self.stoggleBbox(ctxstr)
 
     def brushVisibleUnselect(self):
-        'Unselect source rows within visible canvas, recording bbox for cmdlog replay.'
+        'Unselect source rows within visible canvas, recording full brush context (bbox+rowkeys) for cmdlog replay.'
         if not self.visibleBox:
             return
-        bboxstr = self.formatBbox(self.visibleBox)
-        vd.setLastArgs(bboxstr)
-        self.unselectBbox(bboxstr)
+        rows = self.rowsWithinDataBox(self.visibleBox.xmin, self.visibleBox.ymin,
+                                       self.visibleBox.xmax, self.visibleBox.ymax)
+        ctxstr = self._makeBrushContext(rows, self.visibleBox)
+        vd.setLastArgs(ctxstr)
+        self.unselectBbox(ctxstr)
+
+    def _rowkeyStr(self, row):
+        'Return JSON-safe string representation of the row key for persistent storage.'
+        if not self.source:
+            return None
+        try:
+            rk = self.source.rowkey(row)
+            return json.dumps([self._toJsonSafe(v) for v in rk])
+        except Exception:
+            return str(self.source.rowid(row))
+
+    def _toJsonSafe(self, v):
+        'Convert a value to a JSON-safe representation.'
+        if isinstance(v, (int, float, str, bool)) or v is None:
+            return v
+        if hasattr(v, 'isoformat'):
+            return {'__type__': type(v).__name__, '__value__': v.isoformat()}
+        return str(v)
+
+    def _rowkeyFromStr(self, s):
+        'Parse a rowkey string back into a comparable tuple.'
+        try:
+            parts = json.loads(s)
+            return tuple(parts)
+        except Exception:
+            return (s,)
+
+    def _matchRowsByRowkeys(self, saved_rowkeys):
+        '''Match saved rowkey strings against current source rows.
+        Returns (found_rows, missing_count) where missing_count is the number of saved keys not found.'''
+        if not self.source or not saved_rowkeys:
+            return [], 0
+
+        current_map = {}
+        for r in self.source.rows:
+            rkstr = self._rowkeyStr(r)
+            if rkstr is not None:
+                current_map[rkstr] = r
+
+        found_rows = []
+        saved_set = set(saved_rowkeys)
+        for rkstr in saved_rowkeys:
+            if rkstr in current_map:
+                found_rows.append(current_map[rkstr])
+
+        missing_count = len(saved_set) - len(set(self._rowkeyStr(r) for r in found_rows))
+        return found_rows, missing_count
+
+    def _makeBrushContext(self, rows, bbox):
+        '''Build a JSON string encoding the full brush context for cmdlog replay:
+        bbox coordinates, source sheet, x/y columns, and rowkeys of selected rows.'''
+        ctx = {
+            'bbox': self.formatBbox(bbox),
+            'source_sheet': self.source.name if self.source else '',
+            'xcols': [c.name for c in getattr(self, 'xcols', [])],
+            'ycols': [c.name for c in getattr(self, 'ycols', [])],
+        }
+        if self.source and rows:
+            ctx['rowkeys'] = [self._rowkeyStr(r) for r in rows]
+        return json.dumps(ctx, ensure_ascii=False)
+
+    def _parseBrushContext(self, ctxstr):
+        '''Parse either an old-format bbox string or a new-format JSON brush context.
+        Returns (bboxstr, rowkeys_list_or_None).'''
+        if ctxstr and ctxstr.startswith('{'):
+            try:
+                ctx = json.loads(ctxstr)
+                return ctx.get('bbox', ''), ctx.get('rowkeys')
+            except Exception:
+                pass
+        return ctxstr, None
 
     def saveNamedSelection(self, name):
-        'Save current brush selection as a named selection, storing source rowids for accurate replay.'
+        'Save current brush selection as a named selection, storing source rowkeys (key column values) for stable cross-session replay.'
         if not self.cursorBox:
             vd.fail('no cursor box to save')
         bb = self.cursorBox
@@ -932,13 +1034,16 @@ class Canvas(Plotter):
             'xmax': float(bb.xmax),
             'ymin': float(bb.ymin),
             'ymax': float(bb.ymax),
-            'rowids': [str(self.source.rowid(r)) for r in rows] if self.source else [],
         }
+        if self.source and rows:
+            sel['rowkeys'] = [self._rowkeyStr(r) for r in rows]
         vd.selections.append(sel)
-        vd.status('saved selection "%s" (%d %s)' % (name, len(rows), self.source.rowtype if self.source else 'points'))
+        nkeys = len(sel.get('rowkeys', []))
+        label = 'rowkeys' if nkeys else 'points'
+        vd.status('saved selection "%s" (%d %s)' % (name, nkeys or len(rows), label))
 
     def loadNamedSelection(self, name):
-        'Load/apply a named selection: restore cursor bbox and select rows by rowid; fall back to bbox with warning for missing rows.'
+        'Load/apply a named selection: restore cursor bbox and select rows by stable rowkey; fall back to bbox with warning for missing rows.'
         vd.selections.reload()
         for sel in vd.selections:
             if sel.name == name:
@@ -951,16 +1056,15 @@ class Canvas(Plotter):
                     self.cursorBox.ymin = float(sel.ymin)
                     self.cursorBox.h = float(sel.ymax) - float(sel.ymin)
 
-                saved_rowids = getattr(sel, 'rowids', None)
-                if saved_rowids is None:
-                    saved_rowids = []
-                saved_rowids = list(saved_rowids)
+                saved_rowkeys = getattr(sel, 'rowkeys', None)
+                if saved_rowkeys is None:
+                    saved_rowkeys = getattr(sel, 'rowids', None)
+                if saved_rowkeys is None:
+                    saved_rowkeys = []
+                saved_rowkeys = list(saved_rowkeys)
 
-                if self.source and saved_rowids:
-                    current_map = {str(self.source.rowid(r)): r for r in self.source.rows}
-                    saved_set = set(saved_rowids)
-                    found_rows = [current_map[rid] for rid in saved_rowids if rid in current_map]
-                    missing_count = len(saved_set) - len(found_rows)
+                if self.source and saved_rowkeys:
+                    found_rows, missing_count = self._matchRowsByRowkeys(saved_rowkeys)
 
                     if found_rows:
                         self.source.select(found_rows)
@@ -969,18 +1073,19 @@ class Canvas(Plotter):
                         fallback_rows = self.rowsWithinDataBox(
                             float(sel.xmin), float(sel.ymin),
                             float(sel.xmax), float(sel.ymax))
-                        extra = [r for r in fallback_rows if str(self.source.rowid(r)) not in saved_set]
+                        found_keys = set(self._rowkeyStr(r) for r in found_rows)
+                        extra = [r for r in fallback_rows if self._rowkeyStr(r) not in found_keys]
                         if extra:
                             self.source.select(extra)
-                        vd.warning('selection "%s": %d of %d rowids missing; recovered %d via bbox' % (
-                            name, missing_count, len(saved_rowids), len(extra)))
+                        vd.warning('selection "%s": %d of %d rowkeys missing; recovered %d via bbox' % (
+                            name, missing_count, len(saved_rowkeys), len(extra)))
                     else:
-                        vd.status('loaded selection "%s" (%d %s by rowid)' % (
+                        vd.status('loaded selection "%s" (%d %s by rowkey)' % (
                             name, len(found_rows), self.source.rowtype))
                 else:
                     self.selectBbox(bboxstr)
-                    if not saved_rowids:
-                        vd.warning('selection "%s" has no rowids; using bbox fallback' % name)
+                    if not saved_rowkeys:
+                        vd.warning('selection "%s" has no rowkeys; using bbox fallback' % name)
                     else:
                         vd.status('loaded selection "%s" (by bbox, no source sheet)' % name)
                 return
