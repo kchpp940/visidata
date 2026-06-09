@@ -59,6 +59,8 @@ class HelpSheet(MetaSheet):
     columns = [
         ColumnAttr('sheet'),
         ColumnAttr('module'),
+        Column('feature', width=18, getter=lambda col,row: (vd.getFeatureForCommand(row.longname).name if vd.getFeatureForCommand(row.longname) else '')),
+        Column('feature_status', width=12, getter=lambda col,row: (vd.getFeatureForCommand(row.longname).status if vd.getFeatureForCommand(row.longname) else 'core')),
         ColumnAttr('longname'),
         Column('menupath', width=0, cache=True, getter=lambda col,row: vd.menuPathsByLongname.get(row.longname, None)),
         Column('keystrokes', getter=lambda col,row: col.sheet.revbinds.get(row.longname, [None])[0]),

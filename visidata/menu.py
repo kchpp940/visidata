@@ -123,6 +123,9 @@ def addMenu(vd, *args):
             obj = c
         assert not obj.menus, 'cannot override submenu with longname'
         obj.longname = item.longname
+        if hasattr(vd, 'featureRegistry') and vd.featureRegistry:
+            leaf = item.longname if item.longname else item.title
+            vd.featureRegistry.track_menu(' > '.join(menupath + [leaf]))
 
 
 def _intMenuPath(obj, menupath):

@@ -236,6 +236,10 @@ def inputLongname(sheet):
         else:
             r += ' '
 
+        feat = vd.getFeatureForCommand(row.longname) if hasattr(vd, 'getFeatureForCommand') else None
+        if feat:
+            r += f' [[:onclick open-features]{feat.name:<16}[/]] '
+
         r += f' {formatted_name}'
         if row.description:
             formatted_desc = match.formatted.get('description', row.description) if match else row.description

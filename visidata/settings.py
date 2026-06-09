@@ -366,6 +366,8 @@ def addCommand(cls, keystrokes, longname, execstr, helpstr='', replay=True, **kw
     '''
     cmd = Command(longname, execstr, helpstr=helpstr, module=vd.importingModule, replay=replay, **kwargs)
     vd.commands.set(longname, cmd, cls)
+    if hasattr(vd, 'featureRegistry') and vd.featureRegistry:
+        vd.featureRegistry.track_command(cls.__name__, longname)
     if keystrokes:
         vd.bindkey(keystrokes, longname, cls)
     return longname

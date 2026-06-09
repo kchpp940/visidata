@@ -1,101 +1,5 @@
 # Release process for the next `stable` version
 
-## Preflight: Auto-Fix + Consistency Checks (Run First)
-
-The preflight toolchains version synchronization, manpage generation, and
-consistency validation into a single engineering entry point. Always run it
-before manual release steps.
-
-### Quick Start
-
-```bash
-# Recommended full release gate: auto-fix everything, build wheel/sdist, then run ALL checks
-make preflight-package
-
-# Lightweight: auto-fix version/date/docs, then run only source-level checks
-make preflight-fix
-
-# Build wheel + sdist only (no checks)
-make preflight-build
-```
-
-### What It Does
-
-**Auto-Fixers** (run by `make preflight-fix` or `python3 dev/preflight_check.py --fix`):
-
-| Fixer | What it does |
-|---|---|
-| `--fix-version` | Syncs version numbers from the **canonical source** `visidata/__init__.py`. Display version (e.g. `3.4dev`) goes to `visidata/main.py` and `README.md`; PEP 440 mapped version (e.g. `3.4.dev0`) goes to `setup.py`. See "Version Mapping" below. |
-| `--fix-date`    | Updates the `.Dd` date line in `visidata/man/vd.inc` to today |
-| `--fix-docs`    | Rebuilds manpages (`vd.1`, `visidata.1`, `vd.txt`, `docs/man.md`) via `dev/mkman.sh` (requires `soelim`, `preconv` from groff; optionally `man`, `aha`). Missing tools produce a **WARN** (non-fatal) so version/date fixes still apply; the docs check will flag missing artifacts explicitly. |
-| `--fix-build`   | Clears `dist/` and builds both wheel (`*.whl`) and sdist (`*.tar.gz`) via `python3 -m build`. Requires `pip install build`. Produces **WARN** if `build` package is missing so other checks can still run. Triggered by `--build` or `--package` flags. |
-
-**Version Mapping Rules** (display version ↔ PEP 440 package version):
-
-| Display (for UI, README, manpage) | PEP 440 (for setup.py, wheel/sdist metadata) |
-|---|---|
-| `3.4dev`  | `3.4.dev0` |
-| `3.4`     | `3.4`       (identical) |
-| `3.4.1`   | `3.4.1`     (identical) |
-
-Only `visidata/__init__.py` is the canonical source of truth. Never edit `setup.py`'s `__version__` by hand; run `--fix-version` instead.
-
-**Fixer status semantics**:
-- `[OK]`   — no changes needed, already correct
-- `[DONE]` — file(s) updated successfully
-- `[WARN]` — skipped (e.g. missing tools); non-fatal so other fixers still run. The matching checker (e.g. `docs`, `metadata`) will flag the underlying problem as `[FAIL]` at the check stage.
-- `[FAIL]` — hard error (e.g. canonical version file missing); aborts the fix phase.
-
-**Checkers** (always run after fixes):
-
-| Check | What it validates |
-|---|---|
-| `version`   | Display-version files agree, PEP 440 files agree, and the two sides map correctly |
-| `imports`   | All submodules under `features/`, `loaders/`, `themes/` have valid Python syntax and are declared in `setup.py packages` |
-| `cli`       | `console_scripts` entry points resolve to real callables; `bin/vd` and `visidata/__main__.py` reference `visidata.main:vd_cli` |
-| `docs`      | Manpage artifacts (`vd.1`, `visidata.1`, `vd.txt`, `docs/man.md`) exist on disk |
-| `formats`   | Every internal format in `docs/internal_formats.md` has a matching `open_<ext>()` function somewhere in the package |
-| `metadata`  | All paths referenced by `MANIFEST.in`, `setup.py package_data`, and `setup.py data_files` exist |
-| `changelog` | `CHANGELOG.md` contains a `# vX.Y` heading for the current version |
-| `package`   | Built wheel and sdist contain expected files: METADATA Name/Version, entry_points.txt for `vd`/`visidata`, ALL package_data files (manpages, 28 guides/*.md, desktop files, 2 icon sizes, ddw samples, test fixtures — auto-enumerated from `setup.py`), and ALL MANIFEST.in entries (auto-enumerated). Missing files are reported individually by relative path. |
-| `smoke`     | Installs the wheel in a throwaway venv under `/tmp`, then runs `vd --version` and imports **ALL 122+ submodules** under `visidata.features/`, `visidata.loaders/`, `visidata.themes/` (auto-enumerated from the source tree — no hand-picked subset). Venvs are cleaned up automatically. Missing modules / import errors are reported individually with their stderr. |
-
-### Diagnostics
-
-```bash
-# List all available checks and fixers
-make preflight-checks
-# or:
-python3 dev/preflight_check.py --list
-
-# Run only specific checks
-python3 dev/preflight_check.py version imports metadata
-python3 dev/preflight_check.py package smoke   # package-level only (needs dist/)
-
-# Run only a specific fixer
-python3 dev/preflight_check.py --fix-version       # just sync version numbers
-python3 dev/preflight_check.py --fix-date          # just update manpage date
-python3 dev/preflight_check.py --fix-docs          # just rebuild manpages
-python3 dev/preflight_check.py --build             # just build wheel + sdist
-
-# Full release gate: build dist AND run all checks
-python3 dev/preflight_check.py --package
-# or:
-make preflight-package
-```
-
-### Manpage Build Dependencies
-
-If `--fix-docs` complains about missing tools:
-
-```bash
-# macOS
-brew install groff    # provides soelim, preconv
-brew install aha      # provides aha (ANSI->HTML for man.txt)
-```
-
----
-
 1. Merge `stable` to `develop` (if necessary)
 
 2. Verify that documentation/docstrings are up-to-date on features and functionality
@@ -123,33 +27,16 @@ brew install aha      # provides aha (ANSI->HTML for man.txt)
 
    a. add to front of CHANGELOG, along with the release date and bullet points of major changes;
 
-   b. **(auto)** `python3 dev/preflight_check.py --fix-date` updates the date in the manpage;
+   b. update the date in the manpage;
 
-   c. **(auto)** `python3 dev/preflight_check.py --fix-version` updates version number on README and setup.py and visidata/main.py;
+   c. update version number on README
 
-   d. bump version in `__version__` in the canonical source `visidata/__init__.py` (this is what the auto-fixer syncs from);
+   d. bump version in `__version__` in source code (visidata/main.py, visidata/__init__.py) and setup.py;
 
-6. **(auto)** `python3 dev/preflight_check.py --fix-docs` runs dev/mkman.sh to build the manpage and updated website
+6. Run dev/mkman.sh to build the manpage and updated website
     - Run ./mkmanhtml.sh, and move that to visidata.org:site/docs/man, and to visidata:docs/man.md
 
-7. **(auto)** Run the full release gate — builds dist, validates package contents, smoke-tests in a throwaway venv:
-
-   ```bash
-   make preflight-package
-   ```
-
-   This is equivalent to:
-   - `python3 dev/preflight_check.py --fix --build` (fix version/date/docs, build wheel+sdist)
-   - then ALL 9 checks (including `package` and `smoke`)
-
-   If you only want source-level validation (no dist build):
-   ```bash
-   make preflight-fix
-   ```
-
-8. Merge `develop` to stable
-
-(... rest of the existing release steps continue unchanged ...)
+7. Merge `develop` to stable
 
 14. motd
     a. Upload new motd for new version.

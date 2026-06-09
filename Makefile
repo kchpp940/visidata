@@ -3,7 +3,7 @@
        test test-all test-vgit test-vdsql \
        build man zsh-completion docker \
        setup-hooks setup-vscode lint \
-       diff-test clean preflight preflight-checks preflight-fix preflight-build preflight-package
+       diff-test clean
 
 help:
 	@echo "Install:"
@@ -19,13 +19,6 @@ help:
 	@echo "  make man               generate man pages (requires soelim, preconv, aha)"
 	@echo "  make zsh-completion    generate zsh completion script"
 	@echo "  make docker            build docker images"
-	@echo ""
-	@echo "Release:"
-	@echo "  make preflight-fix     auto-fix version/date/docs, then run source-level checks"
-	@echo "  make preflight         build manpages then run all source-level preflight checks"
-	@echo "  make preflight-build   build wheel + sdist into dist/ (needs: pip install build)"
-	@echo "  make preflight-package full release gate: build dist + package inspection + venv install smoke"
-	@echo "  make preflight-checks  list available preflight checks and fixers"
 	@echo ""
 	@echo "Setup:"
 	@echo "  make setup-hooks       configure git to use dev/hooks"
@@ -92,20 +85,3 @@ diff-test:
 clean:
 	rm -f visidata/man/vd.1 visidata/man/visidata.1 visidata/man/vd.txt
 	rm -f docs/man.md
-
-# Release Engineering
-
-preflight-fix:
-	python3 dev/preflight_check.py --fix
-
-preflight: man
-	python3 dev/preflight_check.py
-
-preflight-build:
-	python3 dev/preflight_check.py --build
-
-preflight-package:
-	python3 dev/preflight_check.py --package
-
-preflight-checks:
-	python3 dev/preflight_check.py --list
