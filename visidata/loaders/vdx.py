@@ -2,20 +2,14 @@ import json
 import re
 
 import visidata
-from visidata import VisiData, CommandLogBase, BaseSheet, Sheet, AttrDict, Progress, Path
+from visidata import VisiData, CommandLogBase, BaseSheet, Sheet, AttrDict, Progress
 
 VDX_VD_COLUMNS = ['sheet', 'col', 'row', 'longname', 'input', 'keystrokes', 'comment']
 
 
 @VisiData.api
 def open_vdx(vd, p):
-    if not isinstance(p, Path):
-        p = Path(p)
-    snap = vd.read_snapshot(p, fmt='vdx')
-    has_manifest = (snap.get('sheets') or snap.get('global_options') or snap.get('macros'))
-    if has_manifest:
-        vd.load_snapshot(snap, apply_cmdlog=False)
-    return vd.cmdlog_sheet_from_snapshot(snap, p.base_stem, source=p)
+    return CommandLogSimple(p.base_stem, source=p, precious=True)
 
 
 VDX_CONTEXT_COMMANDS = {'sheet', 'col', 'row'}
@@ -65,16 +59,25 @@ class CommandLogSimple(CommandLogBase, Sheet):
 
 @VisiData.api
 def save_vdx(vd, p, *vsheets):
-    if not isinstance(p, Path):
-        p = Path(p)
-    snap = {
-        'version': visidata.__version_info__,
-        'cmdlog': [],
-    }
-    for vs in vsheets:
-        for r in vs.rows:
-            snap['cmdlog'].append({k: getattr(r, k, '') for k in ('sheet', 'col', 'row', 'longname', 'input', 'keystrokes', 'comment')})
-    vd.write_snapshot(p, 'vdx', snap, encoding=vsheets[0].options.save_encoding if vsheets else 'utf-8')
+    with p.open(mode='w', encoding=vsheets[0].options.save_encoding) as fp:
+        fp.write(f"#!/usr/bin/env -S vd -p\n")
+        fp.write(f"# {visidata.__version_info__}\n")
+        for vs in vsheets:
+            prevrow = None
+            for r in vs.rows:
+                if prevrow is not None and r.sheet and prevrow.sheet != r.sheet:
+                    fp.write(f'sheet {r.sheet}\n')
+                if r.col and (prevrow is None or prevrow.col != r.col):
+                    fp.write(f'col {r.col}\n')
+                if r.row and (prevrow is None or prevrow.row != r.row):
+                    fp.write(f'row {r.row}\n')
+
+                line = r.longname
+                if r.input:
+                    line += ' ' + str(r.input)
+                fp.write(line + '\n')
+
+                prevrow = r
 
 
 @VisiData.api

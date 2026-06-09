@@ -2,61 +2,92 @@
 
 import json
 
-from visidata import vd, VisiData, JsonSheet, Progress, IndexSheet, Path
+from visidata import vd, VisiData, JsonSheet, Progress, IndexSheet, SettableColumn, ItemColumn, ExprColumn
 
 
 NL='\n'
 
-
 @VisiData.api
 def open_vds(vd, p):
-    if not isinstance(p, Path):
-        p = Path(p)
     return VdsIndexSheet(p.base_stem, source=p)
 
 
 @VisiData.api
 def save_vds(vd, p, *sheets):
     'Save in custom VisiData format, preserving columns and their attributes.'
-    if not isinstance(p, Path):
-        p = Path(p)
-    snap = vd.generate_snapshot(scope=list(sheets), include_cmdlog=False, include_macros=False, include_data=True)
-    vd.write_snapshot(p, 'vds', snap)
+
+    with p.open(mode='w', encoding='utf-8') as fp:
+        for vs in sheets:
+            # class and attrs for vs
+            d = { 'name': vs.name, }
+            fp.write('#'+json.dumps(d)+NL)
+
+            # class and attrs for each column in vs
+            for col in vs.columns:
+                d = col.__getstate__()
+                if isinstance(col, SettableColumn):
+                    d['col'] = 'Column'
+                elif isinstance(col, ItemColumn):
+                    d['col'] = 'Column'
+                    d['expr'] = col.name  #2037  override expr
+                else:
+                    d['col'] = type(col).__name__
+                fp.write('#'+json.dumps(d)+NL)
+
+            if not vs.rows:
+                fp.write(NL)  #2342  blank line to separate sheets without rows
+                continue
+
+            with Progress(gerund='saving'):
+                for row in vs.iterdispvals(*vs.columns, format=False):
+                    d = {col.name:val for col, val in row.items()}
+                    fp.write(json.dumps(d, default=str)+NL)
 
 
 class VdsIndexSheet(IndexSheet):
     def iterload(self):
-        snap = vd.read_snapshot(self.source, fmt='vds')
-        for name in snap.get('order', []):
-            info = snap['sheets'].get(name, {})
-            fpos = getattr(self.source, '_vds_fpos_cache', {}).get(name, 0)
-            vs = VdsSheet(name, columns=[], source=self.source, source_fpos=fpos)
-            if info.get('data'):
-                vs._preloaded_data = list(info['data'])
-            vs._preloaded_columns = list(info.get('columns', []))
-            yield vs
+        vs = None
+        with self.source.open(encoding='utf-8') as fp:
+            line = fp.readline()
+            while line:
+                if line.startswith('#{'):
+                    d = json.loads(line[1:])
+                    if 'col' not in d:
+                        vs = VdsSheet(d.pop('name'), columns=[], source=self.source, source_fpos=fp.tell())
+                        yield vs
+                line = fp.readline()
 
 
 class VdsSheet(JsonSheet):
     def newRow(self):
-        return {}
+        return {}   # rowdef: dict
 
     def iterload(self):
-        snap = vd.read_snapshot(self.source, fmt='vds')
-        info = snap['sheets'].get(self.name, {})
-        cols = getattr(self, '_preloaded_columns', None)
-        if cols is None:
-            cols = info.get('columns', [])
-        if cols:
-            _restore_columns = vd.getGlobals().get('_restore_columns')
-            if _restore_columns:
-                _restore_columns(self, cols)
+        self.colnames = {}
+        self.columns = []
 
-        preloaded = getattr(self, '_preloaded_data', None)
-        if preloaded is not None:
-            for r in preloaded:
-                yield r
-            return
+        with self.source.open(encoding='utf-8') as fp:
+            fp.seek(self.source_fpos)
 
-        for r in info.get('data', []):
-            yield r
+            # consume all metadata, create columns
+            line = fp.readline()
+            while line and line.startswith('#{'):
+                d = json.loads(line[1:])
+                if 'col' not in d:
+                    raise Exception(d)
+                classname = d.pop('col')
+                if classname == 'Column':
+                    classname = 'ItemColumn'
+                    d['expr'] = d['name']
+
+                c = vd.getGlobals()[classname](d.pop('name'), sheet=self)
+                self.addColumn(c)
+                self.colnames[c.name] = c
+                c.__setstate__(d)  # must happen after addColumn sets .sheet
+
+                line = fp.readline()
+
+            while line and not line.startswith('#{'):
+                d = json.loads(line)
+                yield d
+                line = fp.readline()

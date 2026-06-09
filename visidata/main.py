@@ -36,51 +36,6 @@ vd.option('s3_anon', False, 'run S3 in anonymous mode')
 # for --play
 def eval_vd(logpath, *args, **kwargs):
     'Instantiate logpath with args/kwargs replaced and replay all commands.'
-
-    # detect format first
-    fmt = None
-    is_binary_or_dir = False
-    if logpath is vd.stdinSource:
-        fmt = 'vdx'
-    elif logpath.is_dir():
-        fmt = 'delivery'
-        is_binary_or_dir = True
-    else:
-        ext = (logpath.ext or 'vdx').lower()
-        if ext == 'vdz':
-            fmt = 'delivery'
-            is_binary_or_dir = True
-        elif ext in ('zip',):
-            fmt = 'delivery'
-            is_binary_or_dir = True
-        else:
-            fmt = ext
-
-    # snapshot-aware formats that can carry full workspace state
-    snapshot_fmts = {'vds', 'vd', 'vdj', 'vdx', 'manifest', 'delivery'}
-
-    # For delivery packages (directory, zip, .vdz) and other binary formats,
-    # skip template substitution and operate on the original path directly.
-    if is_binary_or_dir or fmt in ('vds', 'manifest'):
-        if fmt in snapshot_fmts:
-            snap = vd.read_snapshot(logpath, fmt=fmt)
-            if snap and (snap.get('sheets') or snap.get('global_options')
-                         or snap.get('macros') or snap.get('cmdlog')):
-                vd.load_snapshot(snap, apply_cmdlog=False)
-                vs = vd.cmdlog_sheet_from_snapshot(snap, logpath.base_stem + '_vd', source=logpath)
-                vs.cmdlog_sheet.addRow(vs.cmdlog_sheet.newRow(sheet=None, row='', keystrokes='', input='', longname='no-op', undofuncs=[]))
-                vd.sync(vs.reload())
-                vs.vd = vd
-                return vs
-        # fallback (should not happen for vds/manifest/delivery, but safe default)
-        vs = vd.openSource(logpath, filetype=fmt)
-        vs.cmdlog_sheet.addRow(vs.cmdlog_sheet.newRow(sheet=None, row='', keystrokes='', input='', longname='no-op', undofuncs=[]))
-        vs.name += '_vd'
-        vd.sync(vs.reload())
-        vs.vd = vd
-        return vs
-
-    # text cmdlog formats: read, apply template substitution
     log = logpath.read_text()
     if args or kwargs:
         if logpath.ext in ['vdj', 'json', 'jsonl'] or logpath is vd.stdinSource:
@@ -90,25 +45,8 @@ def eval_vd(logpath, *args, **kwargs):
             log = log.format(*args, **kwargs)
 
     src = Path(logpath.given, fptext=io.StringIO(log), filesize=len(log))
-
-    if fmt in snapshot_fmts:
-        try:
-            snap = vd.read_snapshot(src, fmt=fmt)
-        except Exception:
-            snap = None
-
-        if snap and (snap.get('sheets') or snap.get('global_options')
-                     or snap.get('macros') or snap.get('cmdlog')):
-            # full snapshot: restore sheets/options/macros first, then replay cmdlog
-            vd.load_snapshot(snap, apply_cmdlog=False)
-            vs = vd.cmdlog_sheet_from_snapshot(snap, logpath.base_stem + '_vd', source=src)
-            vs.cmdlog_sheet.addRow(vs.cmdlog_sheet.newRow(sheet=None, row='', keystrokes='', input='', longname='no-op', undofuncs=[]))
-            vd.sync(vs.reload())
-            vs.vd = vd
-            return vs
-
-    # fallback: plain cmdlog format, no embedded manifest
     if logpath is vd.stdinSource:
+        # vdx format handles .vd (tsv), .vdj (json), and .vdx (minimal) lines
         vs = vd.openSource(src, filetype='vdx')
     else:
         vs = vd.openSource(src, filetype=src.ext or 'vdx')
