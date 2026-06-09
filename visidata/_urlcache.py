@@ -20,6 +20,36 @@ _CACHE_STATUS_MISSING = 'missing'
 _CACHE_STATUS_STALE = 'stale'
 _CACHE_STATUS_ERROR = 'error'
 
+_CACHE_MERGE_CONCAT = 'concat'
+_CACHE_MERGE_JSON_ARRAY = 'json_array_concat'
+_CACHE_MERGE_JSON_RECORDS = 'json_records_concat'
+_CACHE_MERGE_JSON_LINES = 'jsonl'
+
+
+@dataclass
+class CachePage:
+    '''Metadata for a single page / shard within a paginated / multi-endpoint API response.
+
+    Each CachePage references its own cache entry (by page_cache_key) so it can
+    be refreshed, validated, or discarded independently.
+    '''
+    page_number: int
+    page_cache_key: str
+    request_params: Dict[str, Any] = field(default_factory=dict)
+    response_format: Dict[str, Any] = field(default_factory=dict)
+    endpoint: str = ''
+    status: str = _CACHE_STATUS_OK
+    status_msg: str = ''
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> 'CachePage':
+        valid_fields = cls.__dataclass_fields__
+        return cls(**{k: v for k, v in d.items() if k in valid_fields})
+
+
 _SECRET_KEY_PATTERNS = (
     'authorization', 'cookie', 'x-api-key', 'x-auth-token',
     'token', 'secret', 'password', 'passwd', 'api_key', 'apikey',
@@ -89,6 +119,10 @@ class CacheEntry:
     auth_hint: str = ''
     descr: str = ''
 
+    pages: List[CachePage] = field(default_factory=list)
+    merge_strategy: str = ''
+    parser_hint: str = ''
+
     extra: Dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -105,11 +139,15 @@ class CacheEntry:
         kwargs = {k: v for k, v in d.items() if k in valid_fields}
         if 'cache_key' not in kwargs and 'url' in d:
             kwargs['cache_key'] = d['url']
+        if 'pages' in kwargs and isinstance(kwargs['pages'], list):
+            kwargs['pages'] = [CachePage.from_dict(p) for p in kwargs['pages']]
         return cls(**kwargs)
 
     def is_expired(self) -> bool:
         if self.status == _CACHE_STATUS_MISSING:
             return True
+        if self.pages:
+            return any(p.status != _CACHE_STATUS_OK for p in self.pages)
         if self.cache_policy == 'never':
             return False
         if self.cache_policy.startswith('days:'):
@@ -118,6 +156,15 @@ class CacheEntry:
         if self.cache_policy == 'etag' or self.cache_policy == 'last-modified':
             return False
         return False
+
+    def has_pages(self) -> bool:
+        return bool(self.pages)
+
+    def total_pages(self) -> int:
+        return len(self.pages)
+
+    def sorted_pages(self) -> List[CachePage]:
+        return sorted(self.pages, key=lambda p: p.page_number)
 
     def touch(self) -> None:
         self.last_accessed = time.time()
@@ -292,16 +339,35 @@ class CacheManager:
         return entry
 
     def remove(self, cache_key: str) -> bool:
-        '''Remove a cache entry and its local file.  Returns True if something was removed.'''
+        '''Remove a cache entry and its local file.  Returns True if something was removed.
+
+        If the entry has pages (paginated API cache), all page entries and
+        their local files are also removed.
+        '''
         self._load()
         entry = self._entries.pop(cache_key, None)
         if entry:
+            if entry.pages:
+                for p in list(entry.pages):
+                    self._entries.pop(p.page_cache_key, None)
+                    local = Path(self._cache_path_for(p.page_cache_key))
+                    if local.exists():
+                        try:
+                            local.unlink()
+                        except Exception:
+                            pass
             local = Path(entry.local_path)
             if local.exists():
                 try:
                     local.unlink()
                 except Exception as e:
                     vd.warning(f'cannot remove cache file {local}: {e}')
+            merged = self._cache_path_for(cache_key + '.merged')
+            if merged.exists():
+                try:
+                    merged.unlink()
+                except Exception:
+                    pass
             self._save()
             return True
         return False
@@ -424,6 +490,185 @@ class CacheManager:
             return None
 
         return self.get(cache_key)
+
+    # ------------------------------------------------------------------
+    # Manifest / paginated API support
+    # ------------------------------------------------------------------
+
+    def add_page(self, parent_key: str, *,
+                 page_number: int,
+                 page_cache_key: str,
+                 request_params: Optional[Dict[str, Any]] = None,
+                 response_format: Optional[Dict[str, Any]] = None,
+                 endpoint: str = '',
+                 merge_strategy: str = _CACHE_MERGE_JSON_RECORDS,
+                 parser_hint: str = '') -> CachePage:
+        '''Add a page record to an existing (or newly created) parent entry.
+
+        The parent CacheEntry's ``pages`` list is updated, along with
+        ``merge_strategy`` and ``parser_hint``.  Each page also becomes a
+        regular cache entry (keyed by ``page_cache_key``) so it can be
+        refreshed / validated independently.
+        '''
+        self._load()
+        parent = self._entries.get(parent_key)
+        if not parent:
+            vd.fail(f'no parent cache entry for {parent_key}; create one first via put()')
+
+        page = CachePage(
+            page_number=page_number,
+            page_cache_key=page_cache_key,
+            request_params=mask_secrets(request_params or {}),
+            response_format=response_format or {},
+            endpoint=endpoint,
+            status=_CACHE_STATUS_OK,
+        )
+        parent.pages = [p for p in parent.pages if p.page_number != page_number]
+        parent.pages.append(page)
+        parent.pages.sort(key=lambda p: p.page_number)
+        if merge_strategy:
+            parent.merge_strategy = merge_strategy
+        if parser_hint:
+            parent.parser_hint = parser_hint
+
+        total = 0
+        latest_mtime = 0.0
+        for p in parent.pages:
+            sub = self._entries.get(p.page_cache_key)
+            if sub:
+                total += sub.size
+                latest_mtime = max(latest_mtime, sub.mtime)
+        parent.size = total
+        if latest_mtime:
+            parent.mtime = latest_mtime
+        self._save()
+        return page
+
+    def get_page(self, parent_key: str, page_number: int) -> Optional[CachePage]:
+        self._load()
+        parent = self._entries.get(parent_key)
+        if not parent:
+            return None
+        for p in parent.pages:
+            if p.page_number == page_number:
+                self._sync_page(parent, p)
+                return p
+        return None
+
+    def list_pages(self, parent_key: str, verify: bool = True) -> List[CachePage]:
+        self._load()
+        parent = self._entries.get(parent_key)
+        if not parent:
+            return []
+        if verify:
+            for p in parent.pages:
+                self._sync_page(parent, p)
+            self._save()
+        return parent.sorted_pages()
+
+    def _sync_page(self, parent: CacheEntry, page: CachePage) -> None:
+        sub = self._entries.get(page.page_cache_key)
+        if not sub:
+            page.status = _CACHE_STATUS_MISSING
+            page.status_msg = 'page cache entry missing'
+            return
+        page.status = sub.status
+        page.status_msg = sub.status_msg
+
+    def remove_pages(self, parent_key: str) -> int:
+        '''Remove all page files and page entries for a paginated cache.'''
+        self._load()
+        parent = self._entries.get(parent_key)
+        if not parent:
+            return 0
+        count = 0
+        for p in list(parent.pages):
+            if self.remove(p.page_cache_key):
+                count += 1
+        parent.pages = []
+        parent.size = 0
+        self._save()
+        return count
+
+    def rebuild_pages(self, parent_key: str) -> Path:
+        '''Merge all page files into a single file per merge_strategy.
+
+        Returns a Path to the merged file.  The merge respects the manifest's
+        merge_strategy and response_format so the output is usable by the
+        original loader.
+        '''
+        self._load()
+        parent = self._entries.get(parent_key)
+        if not parent:
+            vd.fail(f'no cache entry for {parent_key}')
+
+        pages = self.list_pages(parent_key, verify=True)
+        if not pages:
+            vd.fail(f'no pages found for {parent_key}')
+
+        strategy = parent.merge_strategy or _CACHE_MERGE_JSON_RECORDS
+        merged_path = self._cache_path_for(parent_key + '.merged')
+        encoding = (parent.response_format or {}).get('encoding', 'utf-8')
+
+        if strategy == _CACHE_MERGE_JSON_RECORDS:
+            all_records = []
+            for page in pages:
+                sub = self._entries.get(page.page_cache_key)
+                if not sub:
+                    continue
+                with Path(sub.local_path).open_bytes(mode='rb') as fp:
+                    data = fp.read()
+                try:
+                    records = json.loads(data.decode(encoding))
+                    if isinstance(records, list):
+                        all_records.extend(records)
+                    elif isinstance(records, dict) and 'records' in records:
+                        all_records.extend(records.get('records', []))
+                    else:
+                        all_records.append(records)
+                except Exception as e:
+                    vd.warning(f'cannot parse page {page.page_number}: {e}')
+            with merged_path.open(mode='w', encoding=encoding) as fp:
+                json.dump(all_records, fp)
+        elif strategy == _CACHE_MERGE_JSON_ARRAY:
+            merged = []
+            for page in pages:
+                sub = self._entries.get(page.page_cache_key)
+                if not sub:
+                    continue
+                with Path(sub.local_path).open_bytes(mode='rb') as fp:
+                    try:
+                        merged.extend(json.loads(fp.read().decode(encoding)))
+                    except Exception as e:
+                        vd.warning(f'cannot parse page {page.page_number}: {e}')
+            with merged_path.open(mode='w', encoding=encoding) as fp:
+                json.dump(merged, fp)
+        elif strategy == _CACHE_MERGE_JSON_LINES:
+            with merged_path.open(mode='w', encoding=encoding) as out:
+                for page in pages:
+                    sub = self._entries.get(page.page_cache_key)
+                    if not sub:
+                        continue
+                    with Path(sub.local_path).open_bytes(mode='rb') as fp:
+                        for line in fp:
+                            out.write(line.decode(encoding))
+        else:
+            with merged_path.open_bytes(mode='w') as out:
+                for page in pages:
+                    sub = self._entries.get(page.page_cache_key)
+                    if not sub:
+                        continue
+                    with Path(sub.local_path).open_bytes(mode='rb') as fp:
+                        out.write(fp.read())
+
+        return merged_path
+
+    def iter_page_paths(self, parent_key: str, verify: bool = True):
+        '''Yield (page_number, Path) tuples for every valid page.'''
+        for page in self.list_pages(parent_key, verify=verify):
+            sub = self._entries.get(page.page_cache_key)
+            if sub and sub.status == _CACHE_STATUS_OK:
+                yield page.page_number, Path(sub.local_path)
 
 
 @VisiData.cached_property
@@ -694,39 +939,52 @@ def _refresh_s3_entry(entry: CacheEntry) -> Path:
 
 
 @VisiData.api
-def cache_open_api(vd, cache_key: str, *, source_type: str, fetcher,
+def cache_open_api(vd, cache_key: str, *, source_type: str,
+                   fetcher=None,
+                   page_iterator=None,
                    cache_policy: str = '', content_type: str = 'application/json',
                    source_config: Optional[Dict[str, Any]] = None,
                    request_params: Optional[Dict[str, Any]] = None,
                    response_format: Optional[Dict[str, Any]] = None,
+                   merge_strategy: str = _CACHE_MERGE_JSON_RECORDS,
+                   parser_hint: str = '',
                    auth_hint: str = '', descr: str = '',
                    extra: Optional[Dict[str, Any]] = None) -> Path:
     '''Generic API response caching helper.
 
-    Parameters
-    ----------
-    cache_key : str
-        Stable unique identifier for this API call.
-    source_type : str
-        Source identifier used to route refresh calls (e.g. 'airtable').
-    fetcher : callable
-        Signature ``fetcher() -> bytes``.  Performs the actual API call and
-        returns the raw response bytes.
-    source_config : dict
-        Endpoint / account-level config needed to rebuild the request
-        (base id, server url, etc).  Values are masked for secrets.
-    request_params : dict
-        Per-request parameters (view, filters, pagination range, etc).
-        Values are masked for secrets.
-    response_format : dict
-        Hints about the stored response (filetype, encoding, compression).
-    auth_hint : str
-        Where to find credentials at refresh time, e.g.
-        ``"env:AIRTABLE_AUTH_TOKEN / option:airtable_auth_token"``.
-        The actual token is NEVER stored in the cache index.
-    descr : str
-        Short human-readable label shown in the Cache Sheet.
+    Two modes of operation:
+
+    **Single-response mode** (``fetcher`` only):
+        ``fetcher() -> bytes`` performs a single API call and returns bytes.
+        A single cache entry is created.
+
+    **Paginated / multi-endpoint mode** (``page_iterator``):
+        ``page_iterator`` is a generator that yields tuples::
+
+            (page_number: int,
+             page_cache_key: str,
+             request_params: dict,
+             data_bytes: bytes,
+             endpoint: str = '')
+
+        Each page becomes its own cache entry (independently refreshable).
+        A parent manifest entry is created that records the page order,
+        merge_strategy, and parser_hint so the full dataset can be
+        reconstructed by :meth:`CacheManager.rebuild_pages` *without* any
+        loader runtime state.
     '''
+    if page_iterator is not None:
+        return _cache_open_api_paged(
+            cache_key, source_type=source_type,
+            page_iterator=page_iterator,
+            cache_policy=cache_policy, content_type=content_type,
+            source_config=source_config, request_params=request_params,
+            response_format=response_format,
+            merge_strategy=merge_strategy, parser_hint=parser_hint,
+            auth_hint=auth_hint, descr=descr, extra=extra,
+        )
+
+    # --- single-response mode (legacy) ---
     entry = vd.cache_manager.get(cache_key)
 
     if vd.options.cache_offline:
@@ -771,6 +1029,102 @@ def cache_open_api(vd, cache_key: str, *, source_type: str, fetcher,
     return p
 
 
+def _cache_open_api_paged(cache_key: str, *, source_type: str, page_iterator,
+                          cache_policy: str = '', content_type: str = 'application/json',
+                          source_config: Optional[Dict[str, Any]] = None,
+                          request_params: Optional[Dict[str, Any]] = None,
+                          response_format: Optional[Dict[str, Any]] = None,
+                          merge_strategy: str = _CACHE_MERGE_JSON_RECORDS,
+                          parser_hint: str = '',
+                          auth_hint: str = '', descr: str = '',
+                          extra: Optional[Dict[str, Any]] = None) -> Path:
+    '''Paginated variant: create parent manifest + per-page cache entries.'''
+    cm = vd.cache_manager
+
+    existing_parent = cm.get(cache_key)
+    if vd.options.cache_offline:
+        if not existing_parent:
+            vd.fail(f'no cache entry for {cache_key}')
+        return cm.rebuild_pages(cache_key)
+
+    if not vd.options.cache_enabled:
+        merged = []
+        for item in page_iterator:
+            if len(item) >= 4:
+                merged.append(item[3])
+        p = cm._cache_path_for(cache_key)
+        with p.open_bytes(mode='w') as fpout:
+            fpout.write(b''.join(merged))
+        return p
+
+    if existing_parent and not existing_parent.is_expired() and existing_parent.pages:
+        all_ok = all(p.status == _CACHE_STATUS_OK
+                     for p in cm.list_pages(cache_key, verify=True))
+        if all_ok:
+            vd.debug(f'cache hit for paginated {cache_key}')
+            merged_path = cm.rebuild_pages(cache_key)
+            merged_path._cache_hit = True
+            merged_path._from_cache = True
+            return merged_path
+
+    # Ensure parent entry exists (even if empty) before registering pages
+    parent_path = cm._cache_path_for(cache_key + '.parent')
+    with parent_path.open_bytes(mode='w') as fpout:
+        fpout.write(b'[]')
+    parent = cm.put(
+        cache_key, parent_path,
+        source_type=source_type,
+        content_type=content_type,
+        cache_policy=cache_policy or f'days:{vd.options.cache_default_days}',
+        source_config=source_config,
+        request_params=request_params,
+        response_format=response_format or {'filetype': 'json', 'encoding': 'utf-8'},
+        auth_hint=auth_hint,
+        descr=descr or f'{source_type}:{cache_key[:60]}',
+        extra=extra,
+    )
+    parent.merge_strategy = merge_strategy
+    parent.parser_hint = parser_hint
+    cm._save()
+
+    for item in page_iterator:
+        if len(item) == 5:
+            page_number, page_cache_key, page_params, data_bytes, endpoint = item
+        else:
+            page_number, page_cache_key, page_params, data_bytes = item
+            endpoint = ''
+        page_path = cm._cache_path_for(page_cache_key)
+        with page_path.open_bytes(mode='w') as fpout:
+            fpout.write(data_bytes)
+        cm.put(
+            page_cache_key, page_path,
+            source_type=source_type,
+            content_type=content_type,
+            cache_policy=cache_policy or f'days:{vd.options.cache_default_days}',
+            source_config=source_config,
+            request_params=page_params,
+            response_format=response_format or {'filetype': 'json', 'encoding': 'utf-8'},
+            auth_hint=auth_hint,
+            descr=f'{descr} page {page_number}' if descr else f'page {page_number}',
+            extra=extra,
+        )
+        cm.add_page(
+            cache_key,
+            page_number=page_number,
+            page_cache_key=page_cache_key,
+            request_params=page_params,
+            response_format=response_format or {'filetype': 'json', 'encoding': 'utf-8'},
+            endpoint=endpoint,
+            merge_strategy=merge_strategy,
+            parser_hint=parser_hint,
+        )
+
+    merged_path = cm.rebuild_pages(cache_key)
+    merged_path._cache_hit = False
+    merged_path._from_cache = False
+    return merged_path
+
+
 vd.cache_manager.register_source_handler('http', _refresh_http_entry)
 vd.cache_manager.register_source_handler('s3', _refresh_s3_entry)
 
@@ -805,5 +1159,5 @@ vd.addMenuItems('''
 ''')
 
 
-vd.addGlobals({'urlcache': urlcache, 'CacheEntry': CacheEntry, 'CacheManager': CacheManager,
+vd.addGlobals({'urlcache': urlcache, 'CacheEntry': CacheEntry, 'CachePage': CachePage, 'CacheManager': CacheManager,
                'sanitize_headers': sanitize_headers, 'mask_secrets': mask_secrets})

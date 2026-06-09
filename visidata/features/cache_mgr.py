@@ -59,6 +59,8 @@ class CacheSheet(Sheet):
         Column('status', width=8, getter=lambda c, r: r.status),
         Column('descr', width=40, getter=lambda c, r: r.descr or r.summary()),
         Column('source_type', width=10, getter=lambda c, r: r.source_type),
+        Column('n_pages', type=int, width=8,
+               getter=lambda c, r: r.total_pages() if r.has_pages() else 1),
         Column('cache_key', width=60, getter=lambda c, r: r.cache_key),
         Column('local_path', width=40, getter=lambda c, r: r.local_path),
         Column('size', type=int, width=10,
@@ -67,6 +69,8 @@ class CacheSheet(Sheet):
         Column('mtime', type=date, width=18, getter=lambda c, r: r.mtime),
         Column('last_accessed', type=date, width=18, getter=lambda c, r: r.last_accessed),
         Column('cache_policy', width=12, getter=lambda c, r: r.cache_policy),
+        Column('merge_strategy', width=18, getter=lambda c, r: r.merge_strategy or ''),
+        Column('parser_hint', width=18, getter=lambda c, r: r.parser_hint or ''),
         Column('auth_hint', width=30, getter=lambda c, r: r.auth_hint),
         Column('source_config', width=0, getter=lambda c, r: _pp(r.source_config)),
         Column('request_params', width=0, getter=lambda c, r: _pp(r.request_params)),
@@ -104,13 +108,30 @@ class CacheSheet(Sheet):
         self.reload()
 
     def openCached(self, entry):
-        '''Open the local cached copy.  Uses CacheManager.open_local() exclusively.
+        '''Open the local cached copy.  Works purely from the stored index entry.
 
-        Works without any loader state -- only the stored index entry is needed.
+        For paginated (manifest) entries: first rebuild via
+        :meth:`CacheManager.rebuild_pages`, which merges per-page shards
+        according to ``entry.merge_strategy``.  Then dispatch the merged file
+        through ``entry.parser_hint`` so the resulting sheet matches what the
+        original loader would have produced.
         '''
-        local = vd.cache_manager.open_local(entry.cache_key)
+        cm = vd.cache_manager
+
+        if entry.has_pages():
+            local = cm.rebuild_pages(entry.cache_key)
+        else:
+            local = cm.open_local(entry.cache_key)
+
         response_format = entry.response_format or {}
+        parser_hint = entry.parser_hint or ''
+
         filetype = response_format.get('filetype') or local.ext or 'txt'
+        if parser_hint == 'airtable-records':
+            vs = vd.openSource(local, filetype='json')
+            vs.name = entry.descr or f'{entry.source_type}:{os.path.basename(entry.local_path)}'
+            return vs
+
         vs = vd.openSource(local, filetype=filetype)
         vs.name = entry.descr or f'{entry.source_type}:{os.path.basename(entry.local_path)}'
         return vs
@@ -118,8 +139,11 @@ class CacheSheet(Sheet):
     def reloadSource(self, entry):
         '''Drop cache and trigger a full CacheManager.refresh().
 
-        The refresh handler rebuilds the request using only stored metadata
-        (source_config, request_params, auth_hint) -- no loader state needed.
+        The refresh handler rebuilds the request (including every page of a
+        paginated manifest) using only stored metadata -- no loader state is
+        needed.  After refresh, open the merged / parsed result via
+        :meth:`openCached` so the sheet is produced exactly as the original
+        loader would have made it.
         '''
         vd.cache_manager.refresh(entry.cache_key, force=True)
         updated = vd.cache_manager.get(entry.cache_key)
