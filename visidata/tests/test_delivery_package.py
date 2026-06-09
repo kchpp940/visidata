@@ -200,6 +200,188 @@ def test_restore_graph_command_exists():
     print('\n=== restore-graph command: PASSED ===')
 
 
+def test_restore_macro_command_exists():
+    print('\n=== restore-macro command registration ===')
+    vd.resetVisiData()
+    from visidata.features import delivery_package
+    from visidata.settings import getCommand
+
+    vs = Sheet('test')
+    cmd = getCommand(vs, 'restore-macro')
+    assert cmd is not None, 'restore-macro command not registered'
+    print(f'  restore-macro registered: {cmd.longname}')
+    print('\n=== restore-macro command: PASSED ===')
+
+
+def test_collect_options_non_default():
+    print('\n=== Collect non-default options ===')
+    vd.resetVisiData()
+    from visidata.features import delivery_package
+
+    original = vd.options.delivery_data_format
+    try:
+        vd.options.delivery_data_format = 'tsv'
+        opts = vd._collect_options()
+        print(f'  collected options scopes: {list(opts.keys())}')
+        assert 'global' in opts or any(
+            any(v == 'tsv' for v in scope_opts.values())
+            for scope_opts in opts.values()
+        ), 'non-default option should be collected'
+        print(f'  delivery_data_format=tsv captured OK')
+    finally:
+        vd.options.delivery_data_format = original
+
+    print('\n=== Collect non-default options: PASSED ===')
+
+
+def test_workspace_vdx_contains_macros():
+    print('\n=== Workspace VDX contains macros ===')
+    tmpdir = tempfile.mkdtemp(prefix='vd_dp_test_')
+    try:
+        vd.resetVisiData()
+        rows = [{'a': 1, 'b': 'x'}, {'a': 2, 'b': 'y'}]
+        vs = make_sheet('macro_sheet', rows)
+        vd.push(vs)
+
+        from visidata.features import delivery_package
+        from visidata.cmdlog import CommandLogJsonl
+        from visidata import AttrDict
+
+        fake_cmdlog = CommandLogJsonl('test_macro', rows=[
+            AttrDict(longname='show-version', sheet='', col='', row='', keystrokes='', input='', comment=''),
+        ])
+        fake_cmdlog.helpstr = 'test macro help'
+        fake_cmdlog.keystroke = 'Alt+t'
+        vd.macrobindings['test-macro'] = fake_cmdlog
+
+        pkgdir = os.path.join(tmpdir, 'macro_pkg')
+        vd.exportDeliveryPackage(Path(pkgdir), scope='current')
+
+        vdx_path = os.path.join(pkgdir, 'workspace.vdx')
+        with open(vdx_path) as fp:
+            content = fp.read()
+
+        assert 'restore-macro' in content, 'restore-macro not found in workspace.vdx'
+        assert 'test-macro' in content, 'macro binding not found in workspace.vdx'
+        print('  restore-macro in vdx OK')
+        print('  macro binding in vdx OK')
+
+        macro_dir = os.path.join(pkgdir, 'config', 'macros')
+        macro_files = os.listdir(macro_dir)
+        print(f'  macro files: {macro_files}')
+        assert any('test' in f for f in macro_files), 'no vdj macro file saved'
+
+        with open(os.path.join(pkgdir, 'manifest.json')) as fp:
+            manifest = json.load(fp)
+        assert len(manifest['macros']) == 1, 'manifest should have 1 macro'
+        assert manifest['macros'][0]['binding'] == 'test-macro'
+        print('  manifest macros OK')
+
+        del vd.macrobindings['test-macro']
+        print('\n=== Workspace VDX macros: PASSED ===')
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_workspace_vdx_contains_options():
+    print('\n=== Workspace VDX contains options ===')
+    tmpdir = tempfile.mkdtemp(prefix='vd_dp_test_')
+    try:
+        vd.resetVisiData()
+        rows = [{'a': 1, 'b': 'x'}]
+        vs = make_sheet('opts_sheet', rows)
+        vd.push(vs)
+
+        from visidata.features import delivery_package
+
+        vd.options.delivery_data_format = 'tsv'
+        pkgdir = os.path.join(tmpdir, 'opts_pkg')
+        vd.exportDeliveryPackage(Path(pkgdir), scope='current')
+        vd.options.delivery_data_format = 'vds'
+
+        vdx_path = os.path.join(pkgdir, 'workspace.vdx')
+        with open(vdx_path) as fp:
+            content = fp.read()
+
+        assert '# -- options --' in content, 'options section missing'
+        assert 'option global delivery_data_format tsv' in content, 'non-default option not embedded'
+        print('  options section OK')
+        print('  non-default option embedded OK')
+
+        opts_json_path = os.path.join(pkgdir, 'config', 'options.json')
+        with open(opts_json_path) as fp:
+            opts_json = json.load(fp)
+        assert any(
+            any(v == 'tsv' for v in scope_opts.values())
+            for scope_opts in opts_json.values()
+        ), 'options.json missing non-default value'
+        print('  options.json OK')
+
+        print('\n=== Workspace VDX options: PASSED ===')
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_zip_extract_paths():
+    print('\n=== Zip extract relative paths ===')
+    tmpdir = tempfile.mkdtemp(prefix='vd_dp_test_')
+    try:
+        vd.resetVisiData()
+        rows = [{'a': 1, 'b': 'x'}, {'a': 2, 'b': 'y'}]
+        vs = make_sheet('zip_extract', rows)
+        vd.push(vs)
+
+        from visidata.features import delivery_package
+        import zipfile
+
+        zip_path = os.path.join(tmpdir, 'test_extract.zip')
+        vd.exportDeliveryPackage(Path(zip_path), scope='current')
+
+        extract_dir = os.path.join(tmpdir, 'extracted')
+        os.makedirs(extract_dir, exist_ok=True)
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(extract_dir)
+
+        entries = os.listdir(extract_dir)
+        pkg_subdir = os.path.join(extract_dir, entries[0])
+        print(f'  extracted package dir: {os.path.basename(pkg_subdir)}')
+
+        required = ['README.md', 'manifest.json', 'workspace.vdx', 'start.sh', 'start.bat']
+        for r in required:
+            p = os.path.join(pkg_subdir, r)
+            assert os.path.exists(p), f'missing after extract: {r}'
+            print(f'  {r} exists OK')
+
+        data_dir = os.path.join(pkg_subdir, 'data')
+        assert os.path.isdir(data_dir), 'data/ missing after extract'
+        data_files = os.listdir(data_dir)
+        assert any('zip_extract' in f for f in data_files), 'no data file after extract'
+        print(f'  data/ OK: {data_files}')
+
+        config_dir = os.path.join(pkg_subdir, 'config')
+        assert os.path.isdir(config_dir), 'config/ missing after extract'
+        assert os.path.exists(os.path.join(config_dir, 'options.json')), 'options.json missing'
+        print('  config/ OK')
+
+        macros_dir = os.path.join(config_dir, 'macros')
+        macro_vdj_exists = os.path.isdir(macros_dir) and any(f.endswith('.vdj') for f in os.listdir(macros_dir)) if os.path.isdir(macros_dir) else False
+        print(f'  config/macros/: exists={os.path.isdir(macros_dir)}, has_vdj={macro_vdj_exists}')
+        if vd.macrobindings:
+            assert os.path.isdir(macros_dir), 'config/macros/ should exist when macros present'
+        else:
+            print('  (no macros present, so config/macros/ not required)')
+
+        start_sh = os.path.join(pkg_subdir, 'start.sh')
+        with open(start_sh) as fp:
+            sh_content = fp.read()
+        assert 'cd "$SCRIPT_DIR"' in sh_content, 'start.sh missing cd to script dir'
+        print('  start.sh relative-path guard OK')
+
+        print('\n=== Zip extract relative paths: PASSED ===')
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_derived_sheet_discovery():
     print('\n=== Derived sheet discovery ===')
     tmpdir = tempfile.mkdtemp(prefix='vd_dp_test_')
@@ -293,6 +475,11 @@ if __name__ == '__main__':
         test_zip_export,
         test_column_types_preserved_in_vds,
         test_restore_graph_command_exists,
+        test_restore_macro_command_exists,
+        test_collect_options_non_default,
+        test_workspace_vdx_contains_macros,
+        test_workspace_vdx_contains_options,
+        test_zip_extract_paths,
         test_derived_sheet_discovery,
         test_workspace_vdx_contains_cmdlog,
         test_workspace_vdx_filters_original_openfile,

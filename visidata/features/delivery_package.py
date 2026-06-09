@@ -2,13 +2,15 @@
 
 Exports a single workspace.vdx entry point that, when replayed via `vd -p workspace.vdx`,
 will:
-  1. Set saved global options
-  2. Open each data sheet (with column types preserved via .vds)
-  3. Rebuild GraphSheets with full state (xcols/ycols/reflines/visibleBox)
-  4. Replay the original command log (with conflicting open-file commands filtered)
+  1. Restore all macro bindings (from bundled .vdj files in config/macros/)
+  2. Set all non-default global and sheet-class options
+  3. Open each data sheet (with column types preserved via .vds)
+  4. Rebuild GraphSheets with full state (xcols/ycols/reflines/visibleBox)
+  5. Replay the original command log (with conflicting open-file commands filtered)
 """
 
 import datetime
+import inspect
 import json
 import os
 import shutil
@@ -16,7 +18,7 @@ import tempfile
 import zipfile
 
 from visidata import vd, VisiData, BaseSheet, GraphSheet, Path, Progress, BoundingBox
-from visidata import globalCommand, Sheet, AttrDict
+from visidata import globalCommand, Sheet, AttrDict, Option
 import visidata
 
 
@@ -169,6 +171,46 @@ globalCommand('', 'restore-graph',
 
 
 @VisiData.api
+def restore_macro(vd, json_input):
+    """Replay command: load a macro file and register it as a command/keybinding."""
+    try:
+        data = json.loads(json_input)
+    except (json.JSONDecodeError, TypeError) as e:
+        vd.fail(f'invalid macro JSON: {e}')
+        return
+
+    binding = data.get('binding', '')
+    relpath = data.get('file', '')
+    helpstr = data.get('helpstr', '')
+    keystroke = data.get('keystroke', '')
+
+    if not binding or not relpath:
+        vd.warning(f'skipping invalid macro entry: {json_input}')
+        return
+
+    p = Path(relpath)
+    if not p.is_absolute():
+        base = getattr(vd, 'currentReplay', None)
+        if base and getattr(base, 'source', None):
+            replay_src = base.source
+            if isinstance(replay_src, Path):
+                p = replay_src.parent / relpath
+
+    cmdlog = vd.loadMacro(p)
+    if not cmdlog:
+        vd.warning(f'could not load macro file {p}')
+        return
+
+    vd.setMacro(binding, cmdlog, helpstr=helpstr, keystroke=keystroke)
+    vd.status(f'restored macro: {binding}')
+
+
+globalCommand('', 'restore-macro',
+    'vd.restore_macro(input("macro spec JSON: "))',
+    'restore a macro from serialized binding and file (internal replay command)')
+
+
+@VisiData.api
 def _collect_initial_sources(vd, data_sheets):
     """Return set of original source paths used to open the given data sheets."""
     original_sources = set()
@@ -184,17 +226,63 @@ def _collect_initial_sources(vd, data_sheets):
 
 
 @VisiData.api
-def _write_workspace_vdx(vd, pkgdir, data_sheets, graph_sheets, manifest, data_format, original_sources):
+def _collect_options(vd):
+    """Collect options that differ from defaults, but only user-relevant scopes.
+
+    Returns {scope: {name: value}} suitable for VDX 'option scope name value' lines.
+    Captures:
+      - 'global' scope overrides (user changed via .visidatarc, CLI, or Options sheet)
+      - specific sheet instance names (user changed options on a particular sheet)
+    Excludes:
+      - 'default' scope (the original defaults)
+      - Sheet CLASS names (GridSheet, CommandLog, etc.) — these are re-set by theme on import
+    """
+    options_data = {}
+
+    try:
+        mgr = vd.options._opts
+        allobjs = mgr.allobjs
+
+        for (optname, scope), opt in mgr.iterall():
+            if scope == 'default':
+                continue
+            if not isinstance(opt, Option):
+                continue
+
+            obj = allobjs.get(scope)
+            if inspect.isclass(obj) and issubclass(obj, BaseSheet):
+                continue
+
+            try:
+                default_val = vd.options.getdefault(optname)
+            except Exception:
+                default_val = None
+            current_val = opt.value
+            if default_val == current_val:
+                continue
+
+            if scope not in options_data:
+                options_data[scope] = {}
+            options_data[scope][optname] = current_val
+    except Exception as e:
+        vd.warning(f'error collecting options: {e}')
+
+    return options_data
+
+
+@VisiData.api
+def _write_workspace_vdx(vd, pkgdir, data_sheets, graph_sheets, manifest, data_format, original_sources, options_data, macro_data):
     """Write the unified workspace.vdx replay entry point.
 
     Layout of workspace.vdx (mixed VDX minimal + VDJ JSON lines, as both are
     handled by CommandLogSimple.iterload):
 
       1. Shebang and replay-reset
-      2. option scope name value  -- restored global options
-      3. open-file data/xxx.vds   -- for each saved data sheet in order
-      4. sheet SourceName + restore-graph {...}  -- for each graph
-      5. JSON lines for the original cmdlog rows (with open-file filtered)
+      2. restore-macro {...}                -- restore each macro binding from vdj file
+      3. option scope name value            -- restored global options
+      4. open-file data/xxx.vds             -- for each saved data sheet in order
+      5. sheet SourceName + restore-graph {...}  -- for each graph
+      6. JSON lines for the original cmdlog rows (with open-file filtered)
     """
     vdx_path = pkgdir / 'workspace.vdx'
     cmdlog_nrows = 0
@@ -205,16 +293,16 @@ def _write_workspace_vdx(vd, pkgdir, data_sheets, graph_sheets, manifest, data_f
         fp.write(f'# delivery package generated at {manifest["created_at"]}\n')
         fp.write('replay-reset\n')
 
-        if vd.options.delivery_include_config and manifest.get('config'):
-            opts_path = pkgdir / Path(manifest['config'])
-            try:
-                with open(str(opts_path), encoding='utf-8') as ofp:
-                    options_data = json.load(ofp)
-                for scope, opts in options_data.items():
-                    for oname, oval in opts.items():
-                        fp.write(f'option {scope} {oname} {oval}\n')
-            except Exception:
-                pass
+        if vd.options.delivery_include_macros and macro_data:
+            fp.write('\n# -- macros --\n')
+            for m in macro_data:
+                fp.write('restore-macro ' + json.dumps(m, separators=(',', ':'), default=str) + '\n')
+
+        if vd.options.delivery_include_config and options_data:
+            fp.write('\n# -- options --\n')
+            for scope, opts in options_data.items():
+                for oname, oval in opts.items():
+                    fp.write(f'option {scope} {oname} {oval}\n')
 
         fp.write('\n# -- data sheets --\n')
         for s in manifest['sheets']:
@@ -321,33 +409,29 @@ def exportDeliveryPackage(vd, outpath, scope='current_derived', data_format=None
                 'ycols': state['ycols'],
             })
 
+        macro_data = []
         if vd.options.delivery_include_macros:
             try:
                 for binding, cmdlog in vd.macrobindings.items():
                     fname = _sanitize_filename(binding)
                     fpath = pkgdir / 'config' / 'macros' / f'{fname}.vdj'
                     vd.sync(vd.save_vdj(fpath, cmdlog))
-                    manifest['macros'].append({
+                    macro_entry = {
                         'binding': binding,
                         'file': f'config/macros/{fname}.vdj',
                         'helpstr': getattr(cmdlog, 'helpstr', ''),
-                    })
+                        'keystroke': getattr(cmdlog, 'keystroke', ''),
+                    }
+                    macro_data.append(macro_entry)
+                    manifest['macros'].append(macro_entry)
             except Exception as e:
                 vd.warning(f'error saving macros: {e}')
 
+        options_data = {}
         if vd.options.delivery_include_config:
+            options_data = vd._collect_options()
             opts_path = pkgdir / 'config' / 'options.json'
             try:
-                options_data = {}
-                if vd.cmdlog:
-                    set_option_rows = [r for r in vd.cmdlog.rows if r.longname == 'set-option']
-                    for r in set_option_rows:
-                        opt_scope = r.sheet or 'global'
-                        name = r.row
-                        value = r.input
-                        if opt_scope not in options_data:
-                            options_data[opt_scope] = {}
-                        options_data[opt_scope][name] = value
                 with open(str(opts_path), 'w', encoding='utf-8') as fp:
                     json.dump(options_data, fp, indent=2, default=str)
                 manifest['config'] = 'config/options.json'
@@ -355,7 +439,8 @@ def exportDeliveryPackage(vd, outpath, scope='current_derived', data_format=None
                 vd.warning(f'error saving options: {e}')
 
         vdx_path, cmdlog_nrows = vd._write_workspace_vdx(
-            pkgdir, data_sheets, graph_sheets, manifest, data_format, original_sources
+            pkgdir, data_sheets, graph_sheets, manifest, data_format, original_sources,
+            options_data, macro_data
         )
         manifest['cmdlog_nrows'] = cmdlog_nrows
 
@@ -409,8 +494,9 @@ def _generate_readme(manifest, data_format, is_zip):
     lines.append('```')
     lines.append('')
     lines.append('The single `workspace.vdx` replay file orchestrates everything:')
+    lines.append('- restoring macro bindings and commands')
+    lines.append('- restoring all non-default options')
     lines.append('- loading saved data sheets (column types preserved)')
-    lines.append('- restoring global options')
     lines.append('- rebuilding graph sheets with exact view state')
     lines.append('- replaying the original command log')
     lines.append('')
@@ -470,6 +556,8 @@ def _generate_readme(manifest, data_format, is_zip):
     lines.append('- Other formats (tsv, csv, json) preserve values but types may need re-setting.')
     lines.append('- Graph state (xcols/ycols/reflines/visibleBox) is embedded in workspace.vdx')
     lines.append('  and restored automatically via the `restore-graph` replay command.')
+    lines.append('- Macro definitions and option settings are embedded in workspace.vdx')
+    lines.append('  via `restore-macro` and `option` lines, restored automatically on replay.')
     lines.append('')
 
     return '\n'.join(lines)
