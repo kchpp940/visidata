@@ -1,6 +1,6 @@
 import math
 
-from visidata import VisiData, Canvas, Sheet, Progress, BoundingBox, Point, ColumnsSheet
+from visidata import VisiData, Canvas, Sheet, Progress, BoundingBox, Point, ColumnsSheet, RowIdentityMixin
 from visidata import vd, asyncthread, dispwidth, colors, clipstr, ColorAttr, update_attr
 from visidata.type_date import date
 from statistics import median
@@ -70,13 +70,15 @@ class InvertedCanvas(Canvas):
         # direction from Canvas, the cursor has to be shifted.
         self.cursorBox.ymin -= self.canvasCharHeight
 
+
 # provides axis labels, legend
-class GraphSheet(InvertedCanvas):
+class GraphSheet(RowIdentityMixin, InvertedCanvas):
     rowtype = 'points'
 
     def __init__(self, *names, **kwargs):
         self.ylabel_maxw = 0
         super().__init__(*names, **kwargs)
+        self.initRowIdentity()
 
         self.reflines_x = []
         self.reflines_y = []
@@ -102,7 +104,7 @@ class GraphSheet(InvertedCanvas):
         nplotted = 0
 
         self.reset()
-        self.row_order = {}
+        self.initRowIdentity()
 
         vd.status('loading data points')
         catcols = [c for c in self.xcols if not vd.isNumeric(c)]
@@ -118,13 +120,12 @@ class GraphSheet(InvertedCanvas):
 
                     attr = self.plotColor(k)
                     self.point(graph_x, graph_y, attr, row)
-                    self.row_order[self.source.rowid(row)] = rownum
+                    self.recordRowIdentity(row, rownum)
                     nplotted += 1
                 except Exception as e:
                     nerrors += 1
                     if vd.options.debug:
                         vd.exceptionCaught(e)
-
 
         vd.status('loaded %d points (%d errors)' % (nplotted, nerrors))
 
@@ -312,9 +313,9 @@ class GraphSheet(InvertedCanvas):
         self.plotlabel(0, self.plotviewBox.ymax+4, xname+'»', 'graph_axis')
 
     def rowsWithin(self, plotter_bbox):
-        'return list of deduped rows within plotter_bbox'
+        'return list of deduped rows within plotter_bbox, sorted by original source row order'
         rows = super().rowsWithin(plotter_bbox)
-        return sorted(rows, key=lambda r: self.row_order[self.source.rowid(r)])
+        return self.sortRowsBySourceOrder(rows)
 
     def draw_refline_x(self):
         xcol = vd.numericCols(self.xcols)[0]
@@ -340,7 +341,7 @@ class GraphSheet(InvertedCanvas):
 
     def erase_refline_x(self):
         if len(self.reflines_x) == 0:
-            vd.fail(f'no x refline to erase')
+            vd.fail('no x refline to erase')
         xtype = vd.numericCols(self.xcols)[0].type
         suggested = format_input_value(self.reflines_x[0], xtype)
 
@@ -354,7 +355,7 @@ class GraphSheet(InvertedCanvas):
 
     def erase_refline_y(self):
         if len(self.reflines_y) == 0:
-            vd.fail(f'no y refline to erase')
+            vd.fail('no y refline to erase')
         ytype = self.ycols[0].type
         suggested = format_input_value(self.reflines_y[0], ytype) if self.reflines_y else ''
         ystrs = vd.input('remove line(s) at y = ', value=suggested, type='refliney', defaultLast=True).split()
@@ -364,6 +365,7 @@ class GraphSheet(InvertedCanvas):
             except ValueError:
                 vd.warning(f'value {y} not in reflines_y')
         self.refresh()
+
 
 def format_input_value(val, type):
     '''format a value for entry into vd.input(), so its representation has no spaces and no commas'''

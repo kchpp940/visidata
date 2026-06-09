@@ -9,9 +9,8 @@
 - [:keystrokes]ga[/] to append more subreddits matching input by name or description
 '''
 
-import json
 import visidata
-from visidata import vd, VisiData, Sheet, AttrColumn, asyncthread, anytype, date, AttrDict
+from visidata import vd, VisiData, Sheet, AttrColumn, asyncthread, anytype, date
 
 
 vd.option('reddit_client_id', '', 'client_id for reddit API')
@@ -19,379 +18,28 @@ vd.option('reddit_client_secret', '', 'client_secret for reddit API')
 vd.option('reddit_user_agent', visidata.__version_info__, 'user_agent for reddit API')
 
 
-def _strip_attr_prefix(attr):
-    '''Strip type prefix chars (#, @, -) from an attr name.'''
-    while attr and not attr[0].isalpha():
-        attr = attr[1:]
-    return attr
+@VisiData.api
+def open_reddit(vd, p):
+    vd.importExternal('praw')
+    vd.enable_requests_cache()
 
+    if not vd.options.reddit_client_id:
+        return RedditGuide('reddit_guide')
 
-def _praw_attr_list(attrs_str):
-    '''Parse a hidden_attrs string into a list of plain attribute names.'''
-    return [_strip_attr_prefix(a) for a in attrs_str.split()]
+    if p.given.startswith('r/') or p.given.startswith('/r/'):
+        return SubredditSheet(p.base_stem, source=p.base_stem.split('+'), search=(p.given[0]=='/'))
 
+    if p.given.startswith('u/') or p.given.startswith('/u/'):
+        return RedditorsSheet(p.base_stem, source=p.base_stem.split('+'), search=(p.given[0]=='/'))
 
-def _praw_row_type_and_id(obj):
-    '''Infer (row_type, id_value) tuple from a live PRAW object.
+    return SubredditSheet(p.base_stem, source=p)
 
-    row_type is one of: 'subreddit', 'submission', 'redditor', 'comment', 'unknown'.
-    '''
-    cls_name = type(obj).__name__.lower()
-    if 'subreddit' in cls_name:
-        return 'subreddit', getattr(obj, 'display_name', None) or getattr(obj, 'name', None)
-    if 'submission' in cls_name or 'link' in cls_name:
-        return 'submission', getattr(obj, 'id', None)
-    if 'redditor' in cls_name:
-        return 'redditor', getattr(obj, 'name', None)
-    if 'comment' in cls_name:
-        return 'comment', getattr(obj, 'id', None)
-    return 'unknown', None
+vd.new_reddit = vd.open_reddit
 
-
-def _make_praw_builder(praw_info):
-    '''Return a callable() -> PRAW object from a _praw_info dict.'''
-    row_type = (praw_info or {}).get('type', 'unknown')
-    if row_type == 'subreddit':
-        name = praw_info.get('name')
-        return lambda: vd.reddit.subreddit(name) if name else None
-    if row_type == 'submission':
-        sid = praw_info.get('id')
-        return lambda: vd.reddit.submission(id=sid) if sid else None
-    if row_type == 'redditor':
-        name = praw_info.get('name')
-        return lambda: vd.reddit.redditor(name) if name else None
-    if row_type == 'comment':
-        cid = praw_info.get('id')
-        return lambda: vd.reddit.comment(id=cid) if cid else None
-    return lambda: None
-
-
-class LiveRedditRef:
-    '''Independent reference to a live PRAW object, fully detached from snapshot rows.
-
-    Probes availability once at construction time (creating a lazy PRAW stub does not
-    trigger a real network call) so every consumer can inspect `.available` / `.error`
-    immediately without accidentally touching the network during column rendering,
-    str(), hasattr(), or other read-only operations.
-
-    Usage::
-
-        ref = LiveRedditRef({'type': 'subreddit', 'id': 'test', 'name': 'test'})
-        if ref.available:
-            praw_obj = ref.get()
-        else:
-            print(ref.error)
-    '''
-
-    __slots__ = ('praw_info', '_builder', '_cached_praw', 'available', 'error')
-
-    def __init__(self, praw_info):
-        self.praw_info = dict(praw_info or {})
-        self._builder = _make_praw_builder(praw_info)
-        self._cached_praw = None
-
-        # One-time availability probe at construction.  _make_praw_builder returns a
-        # lambda that either produces None (no id/name) or creates a lazy PRAW stub.
-        # Creating the stub does not touch the network; real I/O happens only when
-        # attributes are read from the stub.
-        self.available = False
-        self.error = None
-        try:
-            stub = self._builder()
-        except Exception as e:
-            self.error = f'{type(e).__name__}: {e}'
-            return
-        if stub is None:
-            self.error = 'missing id or name in _praw_info'
-            return
-        self._cached_praw = stub
-        self.available = True
-
-    # ---- public API ----
-
-    def get(self, context=None):
-        '''Return the live PRAW object (lazy stub), or raise RuntimeError if unavailable.
-
-        *context* is an optional caller description (e.g. "opening submission comments")
-        embedded in the error message.  Note that returning the stub does NOT itself
-        touch the network; attribute reads on the stub may still fail later.
-        '''
-        if not self.available:
-            label = (self.praw_info.get('display_name') or self.praw_info.get('name')
-                     or self.praw_info.get('id') or self.praw_info.get('fullname')
-                     or repr(self.praw_info)[:80])
-            ctx = f' while {context}' if context else ''
-            msg = (f'Reddit row `{label}` is offline: no live PRAW object available{ctx}. '
-                   f'Cause: {self.error or "unknown"}. '
-                   'Check reddit_client_id / reddit_client_secret and network connectivity.')
-            raise RuntimeError(msg)
-        return self._cached_praw
-
-    def try_get(self):
-        '''Return the live PRAW object or None.  Never raises.'''
-        return self._cached_praw if self.available else None
-
-
-class PrawSnapshotRow:
-    '''Pure-data snapshot row — NO network access, NO live PRAW fallback.
-
-    All attribute reads come from the local snapshot dict.  Nested dicts and list
-    elements are recursively wrapped into sibling PrawSnapshotRow instances so
-    expressions like `row.subreddit.display_name` or `row.replies[0].body` remain
-    O(1) local lookups.
-
-    The (optional) associated `LiveRedditRef` is accessed explicitly via the
-    `.live_ref`, `.live_available`, and `.live_error` attributes.  Callers that
-    need a real PRAW object *must* go through `.live_ref.get()`; nothing on this
-    object ever triggers a network call on its own.
-
-    Extra runtime attributes (e.g. `_comments_ref` on submission rows) can be set
-    freely and are stored alongside the snapshot; they are visible to `getattr`
-    and `hasattr` but not part of `__getstate__` / equality / hashing.
-    '''
-
-    __slots__ = ('_snapshot', '_extras', 'live_ref')
-
-    # Names that bypass the snapshot and resolve directly to the wrapper's own state.
-    _INTERNAL_ATTRS = frozenset((
-        '_snapshot', '_extras', 'live_ref',
-        'live_available', 'live_error', 'snapshot',
-    ))
-
-    def __init__(self, snapshot, live_ref=None):
-        object.__setattr__(self, '_snapshot', dict(snapshot or {}))
-        object.__setattr__(self, '_extras', {})
-        object.__setattr__(self, 'live_ref', live_ref)
-
-    # -- convenience accessors --
-
-    @property
-    def live_available(self):
-        '''True iff this row has an associated LiveRedditRef and it is available.'''
-        ref = object.__getattribute__(self, 'live_ref')
-        return bool(ref and ref.available)
-
-    @property
-    def live_error(self):
-        '''Error string from the LiveRedditRef, or None.'''
-        ref = object.__getattribute__(self, 'live_ref')
-        return ref.error if ref else None
-
-    @property
-    def snapshot(self):
-        '''Read-only view of the raw snapshot dict.'''
-        return dict(object.__getattribute__(self, '_snapshot'))
-
-    # -- attribute protocol (snapshot-only) --
-
-    def __getattr__(self, name):
-        # 1) Runtime extras (e.g. _comments_ref attached by iterload)
-        extras = object.__getattribute__(self, '_extras')
-        if name in extras:
-            val = extras[name]
-            return _wrap_value(val)
-        # 2) Snapshot dict (recursively wrapped)
-        snap = object.__getattribute__(self, '_snapshot')
-        if name in snap:
-            val = snap[name]
-            return _wrap_value(val)
-        raise AttributeError(name)
-
-    def __setattr__(self, name, value):
-        if name in PrawSnapshotRow._INTERNAL_ATTRS:
-            object.__setattr__(self, name, value)
-            return
-        extras = object.__getattribute__(self, '_extras')
-        extras[name] = value
-
-    def __delattr__(self, name):
-        extras = object.__getattribute__(self, '_extras')
-        extras.pop(name, None)
-
-    def __hasattr__(self, name):
-        if name in PrawSnapshotRow._INTERNAL_ATTRS:
-            return True
-        extras = object.__getattribute__(self, '_extras')
-        if name in extras:
-            return True
-        snap = object.__getattribute__(self, '_snapshot')
-        return name in snap
-
-    # -- display / serialization --
-
-    def __str__(self):
-        snap = object.__getattribute__(self, '_snapshot')
-        for key in ('display_name', 'name', 'id'):
-            if key in snap and snap[key] is not None:
-                return str(snap[key])
-        return object.__repr__(self)
-
-    def __repr__(self):
-        snap = object.__getattribute__(self, '_snapshot')
-        ref = object.__getattribute__(self, 'live_ref')
-        avail = f' live={ref.available}' if ref else ''
-        return f'PrawSnapshotRow({snap}{avail})'
-
-    def __getstate__(self):
-        # Only the pure snapshot survives pickling — no live refs, no extras.
-        return dict(object.__getattribute__(self, '_snapshot'))
-
-    def __eq__(self, other):
-        if isinstance(other, PrawSnapshotRow):
-            return (object.__getattribute__(self, '_snapshot')
-                    == object.__getattribute__(other, '_snapshot'))
-        return NotImplemented
-
-    def __hash__(self):
-        snap = object.__getattribute__(self, '_snapshot')
-        return hash(tuple(sorted(
-            (k, str(v)) for k, v in snap.items()
-            if k.startswith('_') or not callable(v)
-        )))
-
-
-def _wrap_value(val):
-    '''Recursively wrap snapshot values: dict → PrawSnapshotRow, list/dict-elts → recursed.
-
-    The nested rows do *not* get their own LiveRedditRef even if they carry
-    _praw_info — live references are attached only to top-level rows returned
-    by the loader parse_fn.  Nested objects stay pure snapshot.
-    '''
-    if isinstance(val, dict):
-        inner = dict(val)
-        inner.pop('_praw_info', None)  # nested rows stay pure, no live_ref
-        return PrawSnapshotRow(inner, live_ref=None)
-    if isinstance(val, list):
-        return [_wrap_value(x) for x in val]
-    return val
-
-
-def _build_row_from_snapshot(snap):
-    '''Build a top-level PrawSnapshotRow from a raw cache dict; attach LiveRedditRef if possible.
-
-    This is the canonical parse_fn helper.  Nested snapshot values are recursively
-    wrapped into pure (no live_ref) PrawSnapshotRow instances; the top-level row
-    gets a LiveRedditRef constructed from the `_praw_info` key (if present).
-    '''
-    data = dict(snap or {})
-    praw_info = data.pop('_praw_info', None)
-    ref = LiveRedditRef(praw_info) if praw_info else None
-    row = PrawSnapshotRow(data, live_ref=ref)
-    return row
-
-
-def _fallback_attrs_for(v):
-    '''Return a best-effort attrs_str for a PRAW-like object when no explicit attrs given.'''
-    markers = ('display_name', 'display_name_prefixed', 'name', 'title', 'id', 'fullname',
-               'author', 'body', 'selftext', 'url', 'score', 'ups', 'downs',
-               'created', 'created_utc', 'num_comments', 'depth', 'edited',
-               'over_18', 'subreddit_type', 'subscribers', 'description',
-               'comment_karma', 'link_karma')
-    return ' '.join(a for a in markers if hasattr(v, a))
-
-
-def _val_to_cacheable(v, attrs_str=None):
-    '''Recursively convert a value into JSON-serializable cacheable form.
-
-    - PRAW objects → snapshot dict with _praw_info
-    - list/tuple → list of cacheable values
-    - dict → dict of cacheable values
-    - primitives → unchanged
-    - other → str()
-    '''
-    if isinstance(v, (str, int, float, bool, type(None))):
-        return v
-    if isinstance(v, dict):
-        return {k: _val_to_cacheable(x) for k, x in v.items()}
-    if isinstance(v, (list, tuple)):
-        return [_val_to_cacheable(x) for x in v]
-    # Detect PRAW-like objects (have id/display_name/name attributes and not JSON-serializable)
-    has_praw_markers = any(hasattr(v, attr) for attr in ('display_name', 'name', 'id', 'fullname'))
-    if has_praw_markers:
-        row_type, rid = _praw_row_type_and_id(v)
-        inner_attrs = attrs_str if attrs_str else _fallback_attrs_for(v)
-        inner_snap = _praw_obj_to_snapshot(v, inner_attrs)
-        inner_snap['_praw_info'] = {'type': row_type, 'id': rid,
-                                     'name': getattr(v, 'display_name', None) or getattr(v, 'name', None)}
-        return inner_snap
-    try:
-        return str(v)
-    except Exception:
-        return None
-
-
-def _praw_obj_to_snapshot(obj, attrs_str=None):
-    '''Extract snapshot dict from a live PRAW object (no _praw_info injected yet).'''
-    d = {}
-    attrs = _praw_attr_list(attrs_str) if attrs_str else None
-
-    if attrs:
-        for attr in attrs:
-            try:
-                v = getattr(obj, attr)
-                d[attr] = _val_to_cacheable(v)
-            except Exception:
-                pass
-    else:
-        try:
-            for k, v in vars(obj).items():
-                if k.startswith('_'):
-                    continue
-                d[k] = _val_to_cacheable(v)
-        except Exception:
-            pass
-    return d
-
-
-def _praw_to_cacheable(obj, attrs_str=None):
-    '''Convert a single PRAW object into its fully cacheable dict form (with _praw_info).'''
-    row_type, rid = _praw_row_type_and_id(obj)
-    snap = _praw_obj_to_snapshot(obj, attrs_str)
-    snap['_praw_info'] = {
-        'type': row_type,
-        'id': rid,
-        'name': getattr(obj, 'display_name', None) or getattr(obj, 'name', None),
-    }
-    return snap
-
-
-def _reddit_source_params(operation, params):
-    '''Return cache-key params for a Reddit API operation.'''
-    return {
-        'operation': operation,
-        'params': params,
-        'client_id': vd.options.reddit_client_id,
-    }
-
-
-def _reddit_fetch_rows(operation, params, fetch_fn, attrs_str=None,
-                       status_online=None, error_msg=None):
-    '''Build spec, call remote_open, return list of PrawSnapshotRow rows.
-
-    Each returned row has:
-      * pure snapshot data (all column reads are local)
-      * an associated LiveRedditRef at row.live_ref (None if _praw_info was missing)
-      * row.live_available / row.live_error convenience accessors
-    '''
-    source_params = _reddit_source_params(operation, params)
-
-    def _fetch():
-        objs = list(fetch_fn())
-        cacheable = [_praw_to_cacheable(o, attrs_str) for o in objs]
-        return json.dumps(cacheable, ensure_ascii=False, default=str)
-
-    def _parse(raw):
-        return [_build_row_from_snapshot(d) for d in json.loads(raw)]
-
-    spec = vd.make_remote_spec(
-        'reddit', source_params, _fetch,
-        days=0,
-        parse_fn=_parse,
-        status_online=status_online or f'fetching {operation} from reddit',
-        status_offline=f'offline: using cached data for reddit `{operation}`',
-        error_msg=error_msg or f'cannot fetch reddit `{operation}`',
-    )
-    return vd.remote_open(spec)
+@VisiData.cached_property
+def reddit(vd):
+    import praw
+    return praw.Reddit(check_for_updates=False, **vd.options.getall('reddit_'))
 
 
 subreddit_hidden_attrs='''
@@ -481,32 +129,10 @@ def hiddenCols(hidden_attrs):
         yield AttrColumn(attr, type=coltype, width=0)
 
 
-@VisiData.api
-def open_reddit(vd, p):
-    vd.importExternal('praw')
-
-    if not vd.options.reddit_client_id:
-        return RedditGuide('reddit_guide')
-
-    if p.given.startswith('r/') or p.given.startswith('/r/'):
-        return SubredditSheet(p.base_stem, source=p.base_stem.split('+'), search=(p.given[0]=='/'))
-
-    if p.given.startswith('u/') or p.given.startswith('/u/'):
-        return RedditorsSheet(p.base_stem, source=p.base_stem.split('+'), search=(p.given[0]=='/'))
-
-    return SubredditSheet(p.base_stem, source=p)
-
-vd.new_reddit = vd.open_reddit
-
-@VisiData.cached_property
-def reddit(vd):
-    import praw
-    return praw.Reddit(check_for_updates=False, **vd.options.getall('reddit_'))
-
-
 class SubredditSheet(Sheet):
     guide = __doc__
-    rowtype = 'subreddits'
+    # source is a text list of subreddits
+    rowtype = 'subreddits'  # rowdef: praw.Subreddit
     nKeys=1
     search=False
     columns = [
@@ -520,81 +146,29 @@ class SubredditSheet(Sheet):
     ] + list(hiddenCols(subreddit_hidden_attrs))
 
     def iterload(self):
-        all_attrs = 'display_name_prefixed active_user_count subscribers subreddit_type title description url ' + subreddit_hidden_attrs
         for name in self.source:
             name = name.strip()
             if self.search:
-                results = _reddit_fetch_rows(
-                    'subreddit_search', {'query': name},
-                    lambda: vd.reddit.subreddits.search(name),
-                    attrs_str=all_attrs,
-                    status_online=f'searching subreddits matching `{name}`',
-                    error_msg=f'cannot search subreddits matching `{name}`',
-                )
-                yield from results
+                yield from vd.reddit.subreddits.search(name)
             else:
                 try:
-                    results = _reddit_fetch_rows(
-                        'subreddit_get', {'name': name},
-                        lambda: [vd.reddit.subreddit(name)],
-                        attrs_str=all_attrs,
-                        status_online=f'loading subreddit `{name}`',
-                        error_msg=f'cannot load subreddit `{name}`',
-                    )
-                    yield from results
+                    r = vd.reddit.subreddit(name)
+                    r.display_name_prefixed
+                    yield r
                 except Exception as e:
                     vd.exceptionCaught(e)
 
     def openRow(self, row):
-        if row.live_ref and not row.live_available:
-            vd.fail(row.live_ref.error or 'Reddit subreddit row is offline')
-        return RedditSubmissions(row.display_name_prefixed, source=_SubredditRef(row.display_name))
+        return RedditSubmissions(row.display_name_prefixed, source=row)
 
     def openRows(self, rows):
-        for row in rows:
-            if row.live_ref and not row.live_available:
-                vd.fail(row.live_ref.error or 'Reddit subreddit row is offline')
         comboname = '+'.join(row.display_name for row in rows)
-        return RedditSubmissions(comboname, source=_SubredditRef(comboname))
-
-
-class _SubredditRef:
-    '''Serializable reference to a subreddit (replaces raw PRAW object for caching).'''
-    def __init__(self, name):
-        self.name = name
-        self.display_name = name
-        self.display_name_prefixed = 'r/' + name
-
-    def new(self, limit=None):
-        return vd.reddit.subreddit(self.name).new(limit=limit)
-
-    def hot(self, limit=None):
-        return vd.reddit.subreddit(self.name).hot(limit=limit)
-
-    def top(self, limit=None):
-        return vd.reddit.subreddit(self.name).top(limit=limit)
-
-    def search(self, query, limit=None):
-        return vd.reddit.subreddit(self.name).search(query, limit=limit)
-
-
-class _RedditorRef:
-    '''Serializable reference to a redditor.'''
-    def __init__(self, name):
-        self.name = name
-        self.fullname = name
-
-    @property
-    def submissions(self):
-        return vd.reddit.redditor(self.name).submissions
-
-    @property
-    def comments(self):
-        return vd.reddit.redditor(self.name).comments
+        return RedditSubmissions(comboname, source=vd.reddit.subreddit(comboname))
 
 
 class RedditorsSheet(Sheet):
-    rowtype = 'redditors'
+    # source is a text list of usernames
+    rowtype = 'redditors'  # rowdef: praw.Subreddit
     nKeys=1
     columns = [
         AttrColumn('name', width=15),
@@ -605,38 +179,18 @@ class RedditorsSheet(Sheet):
     ] + list(hiddenCols(redditor_hidden_attrs))
 
     def iterload(self):
-        all_attrs = 'name comment_karma link_karma ' + redditor_hidden_attrs
         for name in self.source:
             if self.search:
-                results = _reddit_fetch_rows(
-                    'redditor_popular', {'query': name},
-                    lambda: vd.reddit.redditors.popular(name),
-                    attrs_str=all_attrs,
-                    status_online=f'searching redditors matching `{name}`',
-                    error_msg=f'cannot search redditors matching `{name}`',
-                )
-                yield from results
+                yield from vd.reddit.redditors.popular(name)
             else:
-                results = _reddit_fetch_rows(
-                    'redditor_get', {'name': name},
-                    lambda: [vd.reddit.redditor(name)],
-                    attrs_str=all_attrs,
-                    status_online=f'loading redditor `{name}`',
-                    error_msg=f'cannot load redditor `{name}`',
-                )
-                yield from results
+                yield vd.reddit.redditor(name)
 
     def openRow(self, row):
-        if row.live_ref and not row.live_available:
-            vd.fail(row.live_ref.error or 'Reddit redditor row is offline')
-        return RedditSubmissions(row.fullname, source=_RedditorRef(row.name))
+        return RedditSubmissions(row.fullname, source=row.submissions)
 
     def openRows(self, rows):
-        for row in rows:
-            if row.live_ref and not row.live_available:
-                vd.fail(row.live_ref.error or 'Reddit redditor row is offline')
         comboname = '+'.join(row.name for row in rows)
-        return RedditSubmissions(comboname, source=_RedditorRef(comboname).submissions)
+        return RedditSubmissions(comboname, source=vd.reddit.redditor(comboname).submissions)
 
 
 class RedditSubmissions(Sheet):
@@ -645,7 +199,8 @@ class RedditSubmissions(Sheet):
   [:keys]Enter[/] to open sheet with comments for the current post
   [:keys]ga[/] to add posts in this subreddit matching input'''
 
-    rowtype='reddit posts'
+    # source=ListingGenerator
+    rowtype='reddit posts' # rowdef: praw.Submission
     nKeys=2
     columns = [
         AttrColumn('subreddit'),
@@ -661,56 +216,19 @@ class RedditSubmissions(Sheet):
         AttrColumn('comments', width=0),
     ] + list(hiddenCols(post_hidden_attrs))
 
-    def _source_kind_and_params(self):
-        src = self.source
-        if isinstance(src, _SubredditRef):
-            return 'subreddit_submissions', {'subreddit': src.name, 'kind': 'new'}
-        if isinstance(src, _RedditorRef):
-            return 'redditor_submissions', {'redditor': src.name}
-        if hasattr(src, 'display_name'):
-            return 'subreddit_submissions', {'subreddit': src.display_name, 'kind': 'new'}
-        if hasattr(src, 'name'):
-            return 'redditor_submissions', {'redditor': src.name}
-        return 'unknown_submissions', {}
-
     def iterload(self):
-        kind = 'new'
-        operation, params = self._source_kind_and_params()
-        all_attrs = 'subreddit id created author ups downs num_comments title selftext url comments ' + post_hidden_attrs
-
+        kind = 'new' # 'top'
         f = getattr(self.source, kind, None)
         if f:
-            results = _reddit_fetch_rows(
-                operation, params,
-                lambda: f(limit=10000),
-                attrs_str=all_attrs,
-                status_online=f'fetching submissions from reddit',
-                error_msg='cannot fetch reddit submissions',
-            )
-            for row in results:
-                try:
-                    row._comments_ref = _SubmissionCommentsRef(row.id)
-                except Exception:
-                    pass
-                yield row
+            yield from f(limit=10000)
 
     def openRow(self, row):
-        if row.live_ref and not row.live_available:
-            vd.fail(row.live_ref.error or 'Reddit submission row is offline')
-        return RedditComments(row.id, source=getattr(row, '_comments_ref', _SubmissionCommentsRef(row.id)))
-
-
-class _SubmissionCommentsRef:
-    '''Serializable reference to a submission's comments.'''
-    def __init__(self, submission_id):
-        self.submission_id = submission_id
-
-    def list(self):
-        return vd.reddit.submission(id=self.submission_id).comments.list()
+        return RedditComments(row.id, source=row.comments.list())
 
 
 class RedditComments(Sheet):
-    rowtype='comments'
+    # source=list of comments
+    rowtype='comments' # rowdef: praw.Comment
     nKeys=2
     columns=[
         AttrColumn('subreddit', width=0),
@@ -726,33 +244,10 @@ class RedditComments(Sheet):
     ] + list(hiddenCols(comment_hidden_attrs))
 
     def iterload(self):
-        src = self.source
-        if isinstance(src, _SubmissionCommentsRef):
-            sid = src.submission_id
-            operation, params = 'submission_comments', {'submission_id': sid}
-        else:
-            operation, params = 'comments_list', {}
-
-        all_attrs = 'subreddit id ups downs replies created author depth body edited ' + comment_hidden_attrs
-
-        def _list_comments():
-            if isinstance(src, _SubmissionCommentsRef):
-                return src.list()
-            return list(src)
-
-        results = _reddit_fetch_rows(
-            operation, params,
-            _list_comments,
-            attrs_str=all_attrs,
-            status_online=f'fetching comments from reddit',
-            error_msg='cannot fetch reddit comments',
-        )
-        yield from results
+        yield from self.source
 
     def openRow(self, row):
-        if row.live_ref and not row.live_available:
-            vd.fail(row.live_ref.error or 'Reddit comment row is offline')
-        return RedditComments(row.id, source=row.replies if hasattr(row, 'replies') else [])
+        return RedditComments(row.id, source=row.replies)
 
 
 class RedditGuide(RedditSubmissions):
@@ -779,41 +274,14 @@ Multiple may be specified, joined with "+".
 @SubredditSheet.api
 @asyncthread
 def addRowsFromQuery(sheet, q):
-    all_attrs = 'display_name_prefixed active_user_count subscribers subreddit_type title description url ' + subreddit_hidden_attrs
-    results = _reddit_fetch_rows(
-        'subreddit_search', {'query': q},
-        lambda: vd.reddit.subreddits.search(q),
-        attrs_str=all_attrs,
-        status_online=f'searching subreddits matching `{q}`',
-        error_msg=f'cannot search subreddits matching `{q}`',
-    )
-    for r in results:
-        if r.live_ref and not r.live_available:
-            vd.warning(r.live_ref.error or f'Reddit search result `{r.display_name}` is offline')
+    for r in vd.reddit.subreddits.search(q):
         sheet.addRow(r, index=sheet.cursorRowIndex+1)
 
 
 @RedditSubmissions.api
 @asyncthread
 def addRowsFromQuery(sheet, q):
-    operation, params = sheet._source_kind_and_params()
-    params['query'] = q
-    all_attrs = 'subreddit id created author ups downs num_comments title selftext url comments ' + post_hidden_attrs
-
-    results = _reddit_fetch_rows(
-        operation + '_search', params,
-        lambda: sheet.source.search(q, limit=None),
-        attrs_str=all_attrs,
-        status_online=f'searching submissions matching `{q}`',
-        error_msg=f'cannot search submissions matching `{q}`',
-    )
-    for r in results:
-        if r.live_ref and not r.live_available:
-            vd.warning(r.live_ref.error or f'Reddit search result `{r.title}` is offline')
-        try:
-            r._comments_ref = _SubmissionCommentsRef(r.id)
-        except Exception:
-            pass
+    for r in sheet.source.search(q, limit=None):
         sheet.addRow(r, index=sheet.cursorRowIndex+1)
 
 

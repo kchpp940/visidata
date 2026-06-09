@@ -1,7 +1,5 @@
 import re
 import os
-import json
-import hashlib
 
 from visidata import vd, date, asyncthread, VisiData, Progress, Sheet, Column, ItemColumn, deduceType, TypedWrapper, setitem, AttrDict
 
@@ -9,17 +7,6 @@ from visidata import vd, date, asyncthread, VisiData, Progress, Sheet, Column, I
 vd.option('airtable_auth_token', '', 'Airtable API key from https://airtable.com/account')
 
 airtable_regex = r'^https://airtable.com/(app[A-Za-z0-9]+)/(tbl[A-Za-z0-9]+)/?(viw[A-z0-9]+)?'
-
-
-def _airtable_source_params(base, table, view, token=None):
-    '''Return cache-key params for an Airtable API call.'''
-    return {
-        'base': base,
-        'table': table,
-        'view': view,
-        'token_hash': hashlib.sha256((token or '').encode()).hexdigest()[:16] if token else None,
-    }
-
 
 @VisiData.api
 def guessurl_airtable(vd, p, response):
@@ -53,7 +40,7 @@ class AirtableSheet(Sheet):
         # Airtable
         This sheet is a read-only download of all records in a table at _airtable.com_.
     '''
-    rowtype = 'records'
+    rowtype = 'records'  # rowdef: dict
 
     columns = [
         ItemColumn('id', 'id', type=str, width=0),
@@ -64,30 +51,10 @@ class AirtableSheet(Sheet):
         self.fields = set()
 
         table = self.api.table(self.airtable_base, self.airtable_table)
-
-        source_params = _airtable_source_params(
-            self.airtable_base, self.airtable_table, self.airtable_view,
-            self.airtable_auth_token
-        )
-
-        def _fetch():
-            all_pages = []
-            for page in table.iterate(view=self.airtable_view):
-                all_pages.append(page)
-            return json.dumps(all_pages, ensure_ascii=False, default=str)
-
-        spec = vd.make_remote_spec(
-            'airtable', source_params, _fetch,
-            days=0,
-            parse_fn=json.loads,
-            status_online=f'fetching {self.airtable_table} from airtable',
-            error_msg=f'cannot fetch airtable `{self.airtable_table}`',
-        )
-        all_pages = vd.remote_open(spec)
-
-        for page in all_pages:
+        
+        for page in table.iterate(view=self.airtable_view):
             for row in page:
-                yield AttrDict(row)
+                yield row
 
                 for field, value in row['fields'].items():
                     if field not in self.fields:

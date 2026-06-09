@@ -6,9 +6,6 @@ A list of messages from [:underline]{sheet.sourcename}[/].
 - `a` to send a message to [:underline]{sheet.cursorRow.room.display_name}[/].
 '''
 
-import json
-import hashlib
-
 from visidata import vd, VisiData, Sheet, Column, ItemColumn, date, asyncthread, AttrDict, vlen, Path
 
 
@@ -17,16 +14,6 @@ vd.option('matrix_user_id', '', 'matrix user ID associated with token')
 vd.option('matrix_device_id', 'VisiData', 'device ID associated with matrix login')
 
 vd.matrix_client = None
-
-
-def _matrix_source_params(homeserver, operation, params=None):
-    '''Return cache-key params for a Matrix API call.'''
-    return {
-        'homeserver': homeserver,
-        'operation': operation,
-        'params': params or {},
-        'token_hash': hashlib.sha256((vd.options.matrix_token or '').encode()).hexdigest()[:16],
-    }
 
 
 @VisiData.api
@@ -102,7 +89,7 @@ class MatrixSheet(Sheet):
 
         vd.matrix_client._sync()
 
-        vd.matrix_client.listen_for_events()
+        vd.matrix_client.listen_for_events() # vd.matrix_client.sync(full_state=True)
 
     def add_room(self, room):
         room.add_listener(self.room_event)
@@ -111,26 +98,8 @@ class MatrixSheet(Sheet):
 
     @asyncthread
     def get_room_messages(self, room):
-            homeserver = getattr(vd.matrix_client, 'homeserver', self.source.given)
             while room.prev_batch:
-                source_params = _matrix_source_params(
-                    homeserver, 'get_room_messages',
-                    {'room_id': room.room_id, 'prev_batch': room.prev_batch}
-                )
-
-                def _fetch(room=room):
-                    ret = vd.matrix_client.api.get_room_messages(room.room_id, room.prev_batch, direction='b', limit=100)
-                    return json.dumps(ret, ensure_ascii=False, default=str)
-
-                spec = vd.make_remote_spec(
-                    'matrix', source_params, _fetch,
-                    days=0,
-                    parse_fn=json.loads,
-                    status_online=f'fetching messages from {room.display_name or room.room_id}',
-                    error_msg=f'cannot fetch matrix messages from `{room.display_name or room.room_id}`',
-                )
-                ret = vd.remote_open(spec)
-
+                ret = vd.matrix_client.api.get_room_messages(room.room_id, room.prev_batch, direction='b', limit=100)
                 for r in ret['chunk']:
                     r['room'] = room
                     self.addRow(r)

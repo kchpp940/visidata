@@ -8,7 +8,6 @@ Functionality is more limited than local paths, but supports:
 """
 
 import textwrap
-import io
 from functools import cached_property
 
 from visidata import (
@@ -35,15 +34,6 @@ vd.option(
     "show all object versions in a versioned bucket",
     replay=True,
 )
-
-
-def _s3_source_params(given, version_id=None, endpoint=None):
-    '''Return cache-key params dict for an S3 source.'''
-    return {
-        'path': given,
-        'version_id': version_id,
-        'endpoint': endpoint or vd.options.s3_endpoint,
-    }
 
 
 class S3Path(Path):
@@ -73,64 +63,32 @@ class S3Path(Path):
     def fs(self, val):
         self._fs = val
 
-    def _s3_fetch_raw(self, mode='r'):
-        '''Fetch raw bytes from S3 via s3fs, with transparent caching and offline fallback.'''
-        source_params = _s3_source_params(self.given, self.version_id)
-
-        def _fetch():
-            fp = self.fs.open(self.given, mode="rb", version_id=self.version_id)
-            data = fp.read()
-            fp.close()
-            return data
-
-        spec = vd.make_remote_spec(
-            's3', source_params, _fetch,
-            text=False,
-            status_online=f'fetching {self.given} from s3',
-            status_offline=f'offline: using cached data for `{self.given}`',
-            error_msg=f'cannot open s3 path `{self.given}`',
-        )
-        cp = vd.remote_open(spec)
-
-        with cp.open_bytes() as fp:
-            raw = fp.read()
-
-        if self.compression == "gz":
-            import gzip
-            if 'b' not in mode:
-                return io.TextIOWrapper(gzip.open(io.BytesIO(raw), mode),
-                                       encoding=vd.options.encoding)
-            return gzip.open(io.BytesIO(raw), mode)
-
-        if self.compression == "bz2":
-            import bz2
-            if 'b' not in mode:
-                return io.TextIOWrapper(bz2.open(io.BytesIO(raw), mode),
-                                       encoding=vd.options.encoding)
-            return bz2.open(io.BytesIO(raw), mode)
-
-        if self.compression == "xz":
-            import lzma
-            if 'b' not in mode:
-                return io.TextIOWrapper(lzma.open(io.BytesIO(raw), mode),
-                                       encoding=vd.options.encoding)
-            return lzma.open(io.BytesIO(raw), mode)
-
-        if 'b' not in mode:
-            return io.TextIOWrapper(io.BytesIO(raw), encoding=vd.options.encoding)
-        return io.BytesIO(raw)
-
     def open(self, mode='r', **kwargs):
         """Open the current S3 path, decompressing along the way if needed."""
 
-        fp = self._s3_fetch_raw(mode=mode)
+        fp = self.fs.open(self.given, mode="rb" if self.compression else mode, version_id=self.version_id)
 
-        if hasattr(fp, "cache") and hasattr(fp, "size") and hasattr(self, "size"):
-            if fp.cache.size != fp.size:
-                vd.debug(
-                    f"updating cache size from {fp.cache.size} to {fp.size} to match object size"
-                )
-                fp.cache.size = fp.size
+        # Workaround for https://github.com/ajkerrigan/visidata-plugins/issues/12
+        if hasattr(fp, "cache") and fp.cache.size != fp.size:
+            vd.debug(
+                f"updating cache size from {fp.cache.size} to {fp.size} to match object size"
+            )
+            fp.cache.size = fp.size
+
+        if self.compression == "gz":
+            import gzip
+
+            return gzip.open(fp, mode, **kwargs)
+
+        if self.compression == "bz2":
+            import bz2
+
+            return bz2.open(fp, mode, **kwargs)
+
+        if self.compression == "xz":
+            import lzma
+
+            return lzma.open(fp, mode, **kwargs)
 
         return fp
 
@@ -266,8 +224,6 @@ class S3DirSheet(Sheet):
         By default, clear the entire cache.
         """
         self.fs.invalidate_cache(path)
-        if path:
-            vd.remote_invalidate('s3', _s3_source_params(path))
         self.reload()
 
     def toggle_versioning(self):
