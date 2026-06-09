@@ -6,6 +6,7 @@ from visidata.loaders.tsv import splitter
 vd.option('http_max_next', 0, 'max next.url pages to follow in http response') #848
 vd.option('http_req_headers', {'User-Agent': __version_info__}, 'http headers to send to requests')
 vd.option('http_ssl_verify', True, 'verify host and certificates for https')
+vd.option('http_use_cache', True, 'cache http responses locally via cache_manager', replay=True)
 
 
 @VisiData.api
@@ -24,6 +25,20 @@ def guessurl_mimetype(vd, path, response):
     if subtype in content_filetypes:
         return dict(filetype=content_filetypes.get(subtype), _likelihood=10)
 
+
+
+@VisiData.api
+def _http_fetch_response(vd, url, *, ctx=None):
+    import urllib.request
+    import urllib.error
+
+    req = urllib.request.Request(url, **vd.options.getall('http_req_'))
+    try:
+        return urllib.request.urlopen(req, context=ctx)
+    except urllib.error.HTTPError as e:
+        vd.fail(f'cannot open URL: HTTP Error {e.code}: {e.reason}')
+    except urllib.error.URLError as e:
+        vd.fail(f'cannot open URL: {e.reason}')
 
 
 @VisiData.api
@@ -48,28 +63,46 @@ def openurl_http(vd, path, filetype=None):
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
 
-    req = urllib.request.Request(path.given, **vd.options.getall('http_req_'))
-    try:
-        response = urllib.request.urlopen(req, context=ctx)
-    except urllib.error.HTTPError as e:
-        vd.fail(f'cannot open URL: HTTP Error {e.code}: {e.reason}')
-    except urllib.error.URLError as e:
-        vd.fail(f'cannot open URL: {e.reason}')
+    use_cache = vd.options.http_use_cache and vd.options.cache_enabled
 
-    filetype = filetype or vd.guessFiletype(path, response, funcprefix='guessurl_').get('filetype')  # try guessing by url
-    filetype = filetype or vd.guessFiletype(path, funcprefix='guess_').get('filetype')  # try guessing by contents
+    if use_cache:
+        cached_path = vd.cache_open_http(path.given, headers=vd.options.getall('http_req_'))
+        entry = vd.cache_manager.get(path.given)
+        if entry:
+            if getattr(cached_path, '_cache_hit', False):
+                vd.status(f'using cached {path.given}')
+            else:
+                vd.status(f'cached {path.given}')
+        src_path = cached_path
+    else:
+        response = vd._http_fetch_response(path.given, ctx=ctx)
+        filetype = filetype or vd.guessFiletype(path, response, funcprefix='guessurl_').get('filetype')
+        filetype = filetype or vd.guessFiletype(path, funcprefix='guess_').get('filetype')
+        data = response.read()
+        cached_path = vd.cache_manager._cache_path_for(path.given)
+        with cached_path.open_bytes(mode='w') as fpout:
+            fpout.write(data)
+        src_path = cached_path
+        if hasattr(response, 'headers'):
+            src_path._http_headers = {h: v for h, v in response.headers.items()}
+
+    if not filetype:
+        ft_resp = type('FakeResp', (), {'getheader': lambda self, k: getattr(src_path, '_http_headers', {}).get(k, '')})()
+        filetype = vd.guessFiletype(path, ft_resp, funcprefix='guessurl_').get('filetype')
+        filetype = filetype or vd.guessFiletype(src_path, funcprefix='guess_').get('filetype')
 
     # Automatically paginate if a 'next' URL is given
-    def _iter_lines(path=path, response=response, max_next=vd.options.http_max_next):
+    def _iter_lines(path=path, src_path=src_path, max_next=vd.options.http_max_next):
         path.responses = []
         n = 0
-        while response:
-            path.responses.append(response)
-            with response as fp:
-                for line in splitter(response, delim=b'\n'):
+        cur_url = path.given
+        cur_path = src_path
+        while cur_path:
+            with cur_path.open_bytes(mode='rb') as fp:
+                for line in splitter(fp, delim=b'\n'):
                     yield line.decode(vd.options.encoding)
 
-            linkhdr = response.getheader('Link')
+            linkhdr = getattr(cur_path, '_http_headers', {}).get('Link', '')
             src = None
             if linkhdr:
                 links = parse_header_links(linkhdr)
@@ -88,8 +121,16 @@ def openurl_http(vd, path, filetype=None):
                 break
 
             vd.status(f'fetching next page from {src}')
-            req = urllib.request.Request(src, **vd.options.getall('http_req_'))
-            response = urllib.request.urlopen(req)
+            if use_cache:
+                cur_path = vd.cache_open_http(src, headers=vd.options.getall('http_req_'))
+            else:
+                resp = vd._http_fetch_response(src, ctx=ctx)
+                cur_path = vd.cache_manager._cache_path_for(src)
+                with cur_path.open_bytes(mode='w') as fpout:
+                    fpout.write(resp.read())
+                if hasattr(resp, 'headers'):
+                    cur_path._http_headers = {h: v for h, v in resp.headers.items()}
+            cur_url = src
 
     # add resettable iterator over contents as an already-open fp
     path.fptext = RepeatFile(_iter_lines())

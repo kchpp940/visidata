@@ -34,6 +34,7 @@ vd.option(
     "show all object versions in a versioned bucket",
     replay=True,
 )
+vd.option("s3_use_cache", True, "cache s3 objects locally via cache_manager", replay=True)
 
 
 class S3Path(Path):
@@ -66,14 +67,22 @@ class S3Path(Path):
     def open(self, mode='r', **kwargs):
         """Open the current S3 path, decompressing along the way if needed."""
 
-        fp = self.fs.open(self.given, mode="rb" if self.compression else mode, version_id=self.version_id)
+        if 'r' in mode and vd.options.s3_use_cache and vd.options.cache_enabled:
+            cached_path = vd.cache_open_s3(self.given, version_id=self.version_id)
+            entry = vd.cache_manager.get(self.given)
+            if entry and getattr(cached_path, '_cache_hit', False):
+                vd.status(f'using cached {self.given}')
 
-        # Workaround for https://github.com/ajkerrigan/visidata-plugins/issues/12
-        if hasattr(fp, "cache") and fp.cache.size != fp.size:
-            vd.debug(
-                f"updating cache size from {fp.cache.size} to {fp.size} to match object size"
-            )
-            fp.cache.size = fp.size
+            fp = cached_path.open(mode="rb" if self.compression else mode, **kwargs)
+        else:
+            fp = self.fs.open(self.given, mode="rb" if self.compression else mode, version_id=self.version_id)
+
+            # Workaround for https://github.com/ajkerrigan/visidata-plugins/issues/12
+            if hasattr(fp, "cache") and fp.cache.size != fp.size:
+                vd.debug(
+                    f"updating cache size from {fp.cache.size} to {fp.size} to match object size"
+                )
+                fp.cache.size = fp.size
 
         if self.compression == "gz":
             import gzip
