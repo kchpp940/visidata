@@ -6,6 +6,10 @@ Note: When unfurling a column, non-iterable objects (numbers, and also strings) 
 Credit to Jeremy Singer-Vine for the idea and original implementation.
 '''
 
+__description__ = "This adds the `unfurl-col` command, to unfurl a column containing iterable values, such as lists and dicts."
+__commands__ = ["unfurl-col"]
+__menus__ = ["Data > Unfurl column > unfurl-col"]
+
 from collections.abc import Iterable, Mapping
 from visidata import vd, Progress, Sheet, Column, ColumnItem, SettableColumn, SubColumnFunc, asyncthread
 from visidata import stacktrace, TypedExceptionWrapper

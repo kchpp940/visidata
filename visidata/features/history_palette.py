@@ -1,5 +1,7 @@
 '''History palette: shows previous inputs during search/regex/etc input.'''
 
+__description__ = "History palette: shows previous inputs during search/regex/etc input."
+
 from visidata import vd, VisiData, clipdraw, colors
 
 

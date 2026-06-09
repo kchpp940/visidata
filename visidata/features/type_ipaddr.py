@@ -1,6 +1,9 @@
 """
 Column types and utility commands related to IP addresses.
 """
+
+__description__ = "Column types and utility commands related to IP addresses."
+__commands__ = ["type-ipaddr", "type-ipnet", "select-supernets"]
 from ipaddress import ip_address, ip_network, _BaseNetwork
 
 from visidata import vd

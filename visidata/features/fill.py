@@ -1,3 +1,5 @@
+__commands__ = ["setcol-fill"]
+__menus__ = ["Column > Fill > setcol-fill"]
 from visidata import vd, VisiData, asyncthread, Sheet, Progress
 
 

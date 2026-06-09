@@ -8,6 +8,10 @@ Usage:
    - on the DirSheet, `Ctrl+V` or `gCtrl+V` to view file(s) using mailcap entry for the guessed (or given via options) mimetype
 '''
 
+__description__ = "Plugin for viewing files with appropriate mailcap-specified application."
+__commands__ = ["sysopen-mailcap", "sysopen-mailcap-selected"]
+__menus__ = ["File > Open > using mailcap > file at cursor > sysopen-mailcap", "File > Open > using mailcap > selected files > sysopen-mailcap-selected"]
+
 import os
 from visidata import vd, DirSheet, SuspendCurses
 

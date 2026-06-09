@@ -1,3 +1,7 @@
+__description__ = "freeze columns/sheet and cache computed cells"
+
+__commands__ = ["setcol-freeze", "freeze-col", "freeze-sheet", "cache-col", "cache-cols"]
+__menus__ = ["Column > Freeze > setcol-freeze", "File > Freeze > freeze-sheet"]
 import collections
 from visidata import Column, Sheet, VisiData, ColumnItem, Progress, TypedExceptionWrapper, SettableColumn
 from visidata import asyncthread, vd

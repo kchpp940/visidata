@@ -1,3 +1,5 @@
+__commands__ = ["addcol-window", "select-around-n"]
+__menus__ = ["Row > Select > N rows around each selected row > select-around-n"]
 import itertools
 import functools
 

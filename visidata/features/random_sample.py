@@ -1,3 +1,5 @@
+__commands__ = ["random-rows", "select-random"]
+__menus__ = ["Row > Select > random sample > select-random"]
 from visidata import vd, Sheet
 
 Sheet.addCommand(None, 'random-rows', 'nrows=int(input("random number to filter: ", value=nRows)); vs=copy(sheet); vs.name=name+"_sample"; vs.rows=sample(rows, nrows or nRows); vd.push(vs)', 'open duplicate sheet with a random population subset of N rows')

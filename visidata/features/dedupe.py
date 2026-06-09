@@ -19,6 +19,10 @@ values in just those columns.
   active sheet are included.
 """
 
+__description__ = "# Usage"
+__commands__ = ["select-duplicate-rows", "dedupe-rows"]
+__menus__ = ["Row > Select > duplicate rows > select-duplicate-rows", "Data > Deduplicate rows > dedupe-rows"]
+
 
 __author__ = "Jeremy Singer-Vine <jsvine@gmail.com>"
 

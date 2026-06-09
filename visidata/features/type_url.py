@@ -1,3 +1,4 @@
+__commands__ = ["type-url", "open-url"]
 from visidata import Sheet, Column, DisplayWrapper
 
 

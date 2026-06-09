@@ -1,3 +1,5 @@
+__commands__ = ["go-col-regex", "go-col-number", "go-col-name"]
+__menus__ = ["Column > Goto > by regex > go-col-regex", "Column > Goto > by number > go-col-number", "Column > Goto > by name > go-col-name"]
 import itertools
 import re
 from visidata import vd, Sheet, AttrDict, dispwidth, escape_vdcode

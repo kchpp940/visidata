@@ -1,3 +1,5 @@
+__commands__ = ["melt", "melt-regex"]
+__menus__ = ["Data > Melt > nonkey columns > melt", "Data > Melt > nonkey columns by regex > melt-regex"]
 import collections
 import re
 from copy import copy

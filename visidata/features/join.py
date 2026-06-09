@@ -1,3 +1,5 @@
+__commands__ = ["join-selected", "join-sheets-top2", "join-sheets-all", "join-sheets-cols"]
+__menus__ = ["Data > Join > Selected Sheets > choose jointype > join-selected", "Data > Join > Top Two Sheets > choose jointype > join-sheets-top2", "Data > Join > All Sheets > choose jointype > join-sheets-all"]
 import collections
 import itertools
 import functools

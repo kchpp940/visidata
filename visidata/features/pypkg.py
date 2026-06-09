@@ -1,3 +1,5 @@
+__commands__ = ["open-python-packages"]
+__menus__ = ["System > Python > installed packages > open-python-packages"]
 from visidata import vd, BaseSheet, Column
 from visidata.pyobj import PythonSheet, PyobjSheet
 

@@ -2,6 +2,8 @@
 Uses data from api.apilayer.com/fixer. Requires an API key for apilayer.com.
 '''
 
+__description__ = "Provide USD(s) function to convert string like '£300' or '205 AUD' to equivalent US$ as float."
+
 from visidata import vd
 import functools
 import json

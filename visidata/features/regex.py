@@ -1,3 +1,5 @@
+__commands__ = ["addcol-split", "addcol-capture", "addcol-regex-subst", "setcol-regex-subst", "setcol-regex-subst-all"]
+__menus__ = ["Edit > Modify > selected cells > regex substitution > setcol-regex-subst", "Column > Add column > capture by regex > addcol-capture", "Column > Add column > split by regex > addcol-split", "Column > Add column > subst by regex > addcol-regex-subst", "Row > Select > by regex > current column > select-col-regex", "Row > Select > by regex > all columns > select-cols-regex", "Row > Unselect > by regex > current column > unselect-col-regex", "Row > Unselect > by regex > all columns > unselect-cols-regex"]
 import re
 import random
 

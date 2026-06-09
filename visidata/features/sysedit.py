@@ -1,3 +1,4 @@
+__commands__ = ["sysedit-cell", "sysedit-selected"]
 from copy import copy
 from visidata import vd, asyncthread, Path, Sheet, IndexSheet, TableSheet
 

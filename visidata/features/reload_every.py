@@ -1,3 +1,5 @@
+__commands__ = ["reload-every", "reload-modified", "reload-rows"]
+__menus__ = ["File > Reload > rows only > reload-rows", "File > Reload > every N seconds > reload-every", "File > Reload > when source modified > reload-modified"]
 import os
 import time
 

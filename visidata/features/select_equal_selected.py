@@ -1,3 +1,4 @@
+__commands__ = ["select-equal-selected"]
 from visidata import Sheet, asyncthread, Progress
 
 

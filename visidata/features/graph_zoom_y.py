@@ -1,5 +1,7 @@
 # contributed by Ram Rachum (@cool-RR) via ChatGPT  #2751
 
+
+__commands__ = ["zoom-all-y"]
 from visidata import GraphSheet
 
 @GraphSheet.api

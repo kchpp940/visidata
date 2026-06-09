@@ -2,6 +2,9 @@
 Generate sparkline column for numeric columns
 """
 
+__description__ = "Generate sparkline column for numeric columns"
+__commands__ = ["addcol-sparkline"]
+
 from visidata import vd, Column, Sheet
 
 __author__ = 'Lucas Messenger @layertwo'

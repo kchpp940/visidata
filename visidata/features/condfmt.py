@@ -1,5 +1,9 @@
 '''Conditional formatting commands.  #3061'''
 
+__description__ = "Conditional formatting commands.  #3061"
+__commands__ = ["color-cell", "color-row", "color-col"]
+__menus__ = ["View > Color > cells where > color-cell", "View > Color > rows where > color-row", "View > Color > columns where > color-col"]
+
 from visidata import vd, Sheet, CellColorizer, RowColorizer, ColumnColorizer
 
 

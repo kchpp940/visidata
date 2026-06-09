@@ -1,5 +1,9 @@
 '''slide rows/columns around'''
 
+__description__ = "slide rows/columns around"
+__commands__ = ["slide-left", "slide-right", "slide-down", "slide-up", "slide-leftmost", "slide-rightmost", "slide-bottom", "slide-top", "slide-left-n", "slide-right-n", "slide-down-n", "slide-up-n"]
+__menus__ = ["Edit > Slide > Row > up > slide-up", "Edit > Slide > Row > up N > slide-up-n", "Edit > Slide > Row > down > slide-down", "Edit > Slide > Row > down N > slide-down-n", "Edit > Slide > Row > to top > slide-top", "Edit > Slide > Row > to bottom > slide-bottom", "Edit > Slide > Column > left > slide-left", "Edit > Slide > Column > left N > slide-left-n", "Edit > Slide > Column > leftmost > slide-leftmost", "Edit > Slide > Column > right > slide-right", "Edit > Slide > Column > right N > slide-right-n", "Edit > Slide > Column > rightmost > slide-rightmost"]
+
 import visidata
 from visidata import Sheet, moveListItem, vd
 

@@ -1,3 +1,4 @@
+__commands__ = ["replay-reset", "replay-end", "replay-output", "replay-exit", "allow-error"]
 import re
 import time
 

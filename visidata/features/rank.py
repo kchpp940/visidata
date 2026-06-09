@@ -1,3 +1,4 @@
+__commands__ = ["addcol-rank-sheet"]
 import itertools
 
 from visidata import Sheet, ListAggregator, SettableColumn

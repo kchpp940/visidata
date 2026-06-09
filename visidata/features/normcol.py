@@ -39,6 +39,10 @@ For instance, a sheet with the following columns names:
 
 """
 
+__description__ = "# Usage"
+__commands__ = ["normalize-col-names"]
+__menus__ = ["Column > Rename > normalize all > normalize-col-names"]
+
 __author__ = "Jeremy Singer-Vine <jsvine@gmail.com>"
 
 from visidata import vd, Sheet, asyncthread, Progress

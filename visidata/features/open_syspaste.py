@@ -2,6 +2,9 @@
 Load new table from system clipboard
 '''
 
+__description__ = "Load new table from system clipboard"
+__commands__ = ["open-syspaste"]
+
 from visidata import vd, BaseSheet, Path
 
 

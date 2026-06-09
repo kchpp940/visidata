@@ -15,6 +15,7 @@ FEATURE_STATUS_FAILED = 'failed'
 FEATURE_STATUS_DISABLED = 'disabled'
 FEATURE_STATUS_MISSING_DEPS = 'missing_deps'
 FEATURE_STATUS_CONFLICT = 'conflict'
+FEATURE_STATUS_INCOMPLETE = 'incomplete'
 
 
 @dataclass
@@ -26,12 +27,35 @@ class FeatureSpec:
     dependencies: List[str] = field(default_factory=list)
     optional_dependencies: List[str] = field(default_factory=list)
     declared_commands: List[str] = field(default_factory=list)
+    declared_menus: List[str] = field(default_factory=list)
     enabled: bool = True
     status: str = FEATURE_STATUS_PENDING
     error: Optional[str] = None
     commands_registered: List[Tuple[str, str]] = field(default_factory=list)
     menus_registered: List[str] = field(default_factory=list)
     load_time_ms: float = 0.0
+
+    @property
+    def is_complete(self) -> bool:
+        has_registered = len(self.commands_registered) > 0 or len(self.menus_registered) > 0
+        has_declared = len(self.declared_commands) > 0 or len(self.declared_menus) > 0
+        if not has_registered and not has_declared:
+            return True
+        if has_registered and not has_declared:
+            return False
+        registered_cmds = {c for _, c in self.commands_registered}
+        declared_cmds = set(self.declared_commands)
+        cmds_ok = registered_cmds >= declared_cmds
+        registered_menus = set(self.menus_registered)
+        declared_menus = set(self.declared_menus)
+        menus_ok = registered_menus >= declared_menus
+        return cmds_ok and menus_ok
+
+    @property
+    def display_status(self) -> str:
+        if self.status == FEATURE_STATUS_LOADED and not self.is_complete:
+            return FEATURE_STATUS_INCOMPLETE
+        return self.status
 
 
 def _ast_get_constant(node: ast.expr) -> Optional[object]:
@@ -50,6 +74,7 @@ def _extract_feature_declarations(source_file: str) -> Dict:
         'dependencies': [],
         'optional_dependencies': [],
         'commands': [],
+        'menus': [],
     }
     try:
         with open(source_file, 'r', encoding='utf-8') as f:
@@ -80,6 +105,10 @@ def _extract_feature_declarations(source_file: str) -> Dict:
                     val = _ast_get_constant(node.value)
                     if isinstance(val, list):
                         result['commands'] = [str(v) for v in val if isinstance(v, str)]
+                elif name == '__menus__':
+                    val = _ast_get_constant(node.value)
+                    if isinstance(val, list):
+                        result['menus'] = [str(v) for v in val if isinstance(v, str)]
 
         if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
             if not result['description']:
@@ -96,7 +125,7 @@ class FeatureRegistry:
         self._cmd_tracking_enabled: bool = False
         self._cmd_tracking_buffer: List[Tuple[str, str]] = []
         self._menu_tracking_buffer: List[str] = []
-        self._conflict_detected: bool = False
+        self._registered_menu_paths: Dict[str, str] = {}
 
     def register(self, name: str, module_path: str, **kwargs) -> FeatureSpec:
         spec = FeatureSpec(name=name, module_path=module_path, **kwargs)
@@ -132,8 +161,7 @@ class FeatureRegistry:
                 discovered.append(spec)
             else:
                 spec = self._features[module_info.name]
-                if not spec.source_file or not spec.declared_commands:
-                    self._populate_from_source(spec)
+                self._populate_from_source(spec)
         return discovered
 
     def _populate_from_source(self, spec: FeatureSpec):
@@ -150,6 +178,8 @@ class FeatureRegistry:
                     spec.optional_dependencies = decls['optional_dependencies']
                 if decls['commands'] and not spec.declared_commands:
                     spec.declared_commands = decls['commands']
+                if decls['menus'] and not spec.declared_menus:
+                    spec.declared_menus = decls['menus']
         except (ImportError, ValueError):
             pass
 
@@ -174,9 +204,17 @@ class FeatureRegistry:
                             break
         return (len(conflicts) == 0, conflicts)
 
+    def check_menu_conflicts(self, spec: FeatureSpec) -> Tuple[bool, List[str]]:
+        conflicts = []
+        for menupath in spec.declared_menus:
+            if menupath in self._registered_menu_paths:
+                owner = self._registered_menu_paths[menupath]
+                if owner != spec.name and owner in self._features:
+                    conflicts.append(f'{menupath} (registered by feature `{owner}`)')
+        return (len(conflicts) == 0, conflicts)
+
     def _start_tracking(self):
         self._cmd_tracking_enabled = True
-        self._conflict_detected = False
         self._cmd_tracking_buffer = []
         self._menu_tracking_buffer = []
 
@@ -184,6 +222,8 @@ class FeatureRegistry:
         self._cmd_tracking_enabled = False
         spec.commands_registered = list(self._cmd_tracking_buffer)
         spec.menus_registered = list(self._menu_tracking_buffer)
+        for menupath in spec.menus_registered:
+            self._registered_menu_paths[menupath] = spec.name
         self._cmd_tracking_buffer = []
         self._menu_tracking_buffer = []
 
@@ -198,6 +238,9 @@ class FeatureRegistry:
         if self._cmd_tracking_enabled:
             if menupath not in self._menu_tracking_buffer:
                 self._menu_tracking_buffer.append(menupath)
+
+    def find_menu_owner(self, menupath: str) -> Optional[str]:
+        return self._registered_menu_paths.get(menupath)
 
     def _rollback_feature(self, spec: FeatureSpec):
         for sheet_class_name, cmd_longname in list(self._cmd_tracking_buffer):
@@ -225,6 +268,38 @@ class FeatureRegistry:
                         del vd.commands[cmd_longname]
             except Exception:
                 pass
+
+        for menupath in list(self._menu_tracking_buffer):
+            self._rollback_menu(menupath, spec.name)
+        for menupath in spec.menus_registered:
+            self._rollback_menu(menupath, spec.name)
+
+    def _rollback_menu(self, menupath: str, owner: str):
+        if self._registered_menu_paths.get(menupath) != owner:
+            return
+        try:
+            del self._registered_menu_paths[menupath]
+            parts = menupath.split(' > ')
+            if len(parts) < 2:
+                return
+            parent_menu = vd
+            for p in parts[:-1]:
+                found = None
+                for m in getattr(parent_menu, 'menus', []):
+                    if getattr(m, 'title', None) == p:
+                        found = m
+                        break
+                if not found:
+                    return
+                parent_menu = found
+            leaf_name = parts[-1]
+            if hasattr(parent_menu, 'menus'):
+                for i, m in enumerate(parent_menu.menus):
+                    if getattr(m, 'title', None) == leaf_name or getattr(m, 'longname', None) == leaf_name:
+                        del parent_menu.menus[i]
+                        break
+        except Exception:
+            pass
 
     def load_feature(self, name: str) -> FeatureSpec:
         spec = self._features.get(name)
@@ -256,6 +331,14 @@ class FeatureRegistry:
                 vd.warning(f'feature `{name}` not loaded; {spec.error}')
                 return spec
 
+        if spec.declared_menus:
+            ok, conflicts = self.check_menu_conflicts(spec)
+            if not ok:
+                spec.status = FEATURE_STATUS_CONFLICT
+                spec.error = f'menu conflicts: {", ".join(conflicts)}'
+                vd.warning(f'feature `{name}` not loaded; {spec.error}')
+                return spec
+
         t0 = time.time()
         self._start_tracking()
         old_importing = vd.importingModule
@@ -276,7 +359,7 @@ class FeatureRegistry:
         except Exception as e:
             self._rollback_feature(spec)
             error_msg = str(e)
-            if 'already registered by feature' in error_msg or 'core command, cannot be overridden' in error_msg:
+            if 'already registered by feature' in error_msg or 'core command, cannot be overridden' in error_msg or 'already in menu' in error_msg:
                 spec.status = FEATURE_STATUS_CONFLICT
                 spec.error = error_msg
             else:
@@ -309,6 +392,12 @@ class FeatureRegistry:
                     return spec
         return None
 
+    def find_feature_by_menu(self, menupath: str) -> Optional[FeatureSpec]:
+        owner = self._registered_menu_paths.get(menupath)
+        if owner:
+            return self._features.get(owner)
+        return None
+
 
 @VisiData.lazy_property
 def featureRegistry(vd):
@@ -320,18 +409,25 @@ def getFeatureForCommand(vd, longname: str) -> Optional[FeatureSpec]:
     return vd.featureRegistry.find_feature_by_command(longname) if vd.featureRegistry else None
 
 
+@VisiData.api
+def getFeatureForMenu(vd, menupath: str) -> Optional[FeatureSpec]:
+    return vd.featureRegistry.find_feature_by_menu(menupath) if vd.featureRegistry else None
+
+
 class FeaturesSheet(Sheet):
     rowtype = 'features'
     colorizers = [
         CellColorizer(2, 'color_warning', lambda s,c,r,v: r and r.status in (FEATURE_STATUS_FAILED, FEATURE_STATUS_MISSING_DEPS, FEATURE_STATUS_CONFLICT)),
         CellColorizer(2, 'color_working', lambda s,c,r,v: r and r.status == FEATURE_STATUS_LOADED),
+        CellColorizer(3, 'color_pending', lambda s,c,r,v: r and r.display_status == FEATURE_STATUS_INCOMPLETE),
     ]
     columns = [
         ItemColumn('name', width=25),
-        ItemColumn('status', width=14),
+        Column('status', width=14, getter=lambda c,r: r.display_status),
         ItemColumn('description', width=50),
         Column('dependencies', getter=lambda c,r: ', '.join(r.dependencies) if r.dependencies else ''),
         Column('declared_commands', width=8, getter=lambda c,r: len(r.declared_commands)),
+        Column('declared_menus', width=8, getter=lambda c,r: len(r.declared_menus)),
         Column('commands', width=6, getter=lambda c,r: len(r.commands_registered)),
         Column('menus', width=6, getter=lambda c,r: len(r.menus_registered)),
         Column('load_time_ms', width=10, type=float, fmtstr='%.1f', getter=lambda c,r: r.load_time_ms),
@@ -350,7 +446,10 @@ class FeaturesSheet(Sheet):
                 dependencies=spec.dependencies,
                 optional_dependencies=spec.optional_dependencies,
                 declared_commands=spec.declared_commands,
+                declared_menus=spec.declared_menus,
                 status=spec.status,
+                display_status=spec.display_status,
+                is_complete=spec.is_complete,
                 error=spec.error,
                 commands_registered=spec.commands_registered,
                 menus_registered=spec.menus_registered,
@@ -383,10 +482,29 @@ class FeatureCommandsSheet(Sheet):
         self.rows = list(self.iterload())
 
 
+class FeatureMenusSheet(Sheet):
+    rowtype = 'menus'
+    columns = [
+        ItemColumn('menupath', width=60),
+    ]
+    nKeys = 1
+
+    def iterload(self):
+        spec = vd.featureRegistry.get(self.source.name)
+        if spec:
+            for menupath in spec.menus_registered:
+                yield AttrDict(menupath=menupath)
+
+    def reload(self):
+        self.rows = list(self.iterload())
+
+
+FeaturesSheet.addCommand('zEnter', 'open-feature-menus', 'vd.push(FeatureMenusSheet(cursorRow.name + "_menus", source=cursorRow))', 'open list of menus registered by this feature')
+
 BaseSheet.addCommand(None, 'open-features', 'vd.push(FeaturesSheet("features"))', 'open Features Sheet to view and manage features')
 
 vd.addMenuItems('''
     System > Features Sheet > open-features
 ''')
 
-vd.addGlobals(FeatureRegistry=FeatureRegistry, FeatureSpec=FeatureSpec, FeaturesSheet=FeaturesSheet, FeatureCommandsSheet=FeatureCommandsSheet)
+vd.addGlobals(FeatureRegistry=FeatureRegistry, FeatureSpec=FeatureSpec, FeaturesSheet=FeaturesSheet, FeatureCommandsSheet=FeatureCommandsSheet, FeatureMenusSheet=FeatureMenusSheet)

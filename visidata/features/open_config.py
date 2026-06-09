@@ -1,3 +1,5 @@
+__commands__ = ["open-config"]
+__menus__ = ["File > Options > edit config file > open-config"]
 from visidata import vd, BaseSheet
 
 BaseSheet.addCommand('gO', 'open-config', 'vd.push(open_txt(Path(options.config)))', 'open options.config as text sheet')

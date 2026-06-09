@@ -6,6 +6,8 @@ Usage (in .visidatarc):
     Sheet.knownCols.date.type = date
 '''
 
+__description__ = "#1488"
+
 from visidata import Sheet, DefaultAttrDict
 
 

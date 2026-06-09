@@ -10,6 +10,10 @@ Thanks to:
        - color-cycle: change plot colors to another palette
        - color-reset:
 '''
+
+__description__ = "Colorbrewer scales for plotting in Visidata."
+__commands__ = ["open-palettes", "cycle-palette", "unset-palette", "open-palettes-sheet", "cycle-palette-sheet", "unset-palette-sheet", "choose-palette"]
+__menus__ = ["Plot > Palette > cycle > cycle-palette-sheet", "Plot > Palette > unset > unset-palette-sheet", "Plot > Palette > choose > open-palettes"]
 from visidata import vd, VisiData, GraphSheet, BaseSheet, Sheet, ItemColumn, CellColorizer
 
 # https://raw.githubusercontent.com/er1kb/colorbrewer-python/master/colorbrewer.py

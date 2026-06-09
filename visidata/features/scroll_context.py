@@ -13,6 +13,10 @@ NOTE:
     - disables scroll-middle command (zz)
 '''
 
+__description__ = "Enables two functions:"
+__commands__ = ["toggle-scrollfix"]
+__menus__ = ["View > Toggle display > lock cursor to screen row > toggle-scrollfix"]
+
 __author__ = 'Geekscrapy'
 __version__ = '1.2'
 

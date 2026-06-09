@@ -1,3 +1,5 @@
+__commands__ = ["transpose"]
+__menus__ = ["Data > Transpose > transpose"]
 from visidata import vd, VisiData, Sheet, asyncthread, Progress, Column
 
 # rowdef: Column

@@ -1,3 +1,5 @@
+__commands__ = ["type-customdate", "type-customdate-selected"]
+__menus__ = ["Column > Type as > custom date format > type-customdate"]
 import time
 from visidata import vd, Sheet, ColumnsSheet
 from visidata.type_date import date

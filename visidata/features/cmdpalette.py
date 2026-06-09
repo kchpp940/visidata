@@ -1,3 +1,4 @@
+__commands__ = ["exec-longname", "exec-longname-simple"]
 import collections
 import math
 from functools import partial
