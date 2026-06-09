@@ -1,3 +1,4 @@
+__description__ = "select all rows with values equal to any selected row in the current column"
 __commands__ = ["select-equal-selected"]
 from visidata import Sheet, asyncthread, Progress
 

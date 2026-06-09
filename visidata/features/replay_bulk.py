@@ -1,3 +1,4 @@
+__description__ = "bulk replay VisiData command logs (.vd, .vdx, .vdj) across multiple files"
 __commands__ = ["replay-reset", "replay-end", "replay-output", "replay-exit", "allow-error"]
 import re
 import time

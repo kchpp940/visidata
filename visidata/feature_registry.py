@@ -36,20 +36,46 @@ class FeatureSpec:
     load_time_ms: float = 0.0
 
     @property
-    def is_complete(self) -> bool:
-        has_registered = len(self.commands_registered) > 0 or len(self.menus_registered) > 0
-        has_declared = len(self.declared_commands) > 0 or len(self.declared_menus) > 0
-        if not has_registered and not has_declared:
-            return True
-        if has_registered and not has_declared:
-            return False
+    def incomplete_reasons(self) -> List[str]:
+        if self.status in (FEATURE_STATUS_MISSING_DEPS, FEATURE_STATUS_DISABLED, FEATURE_STATUS_PENDING):
+            return []
+
+        reasons = []
+        BAD_DESCRIPTIONS = {'', '# Usage', 'Usage', '#', 'TODO', 'todo', 'placeholder', 'Placeholder', 'TBD', 'tbd'}
+
+        desc = self.description.strip()
+        if not desc:
+            reasons.append('description is empty')
+        elif desc in BAD_DESCRIPTIONS:
+            reasons.append(f'description is placeholder: {repr(desc)}')
+        elif desc.startswith('#'):
+            reasons.append(f'description starts with #: {repr(desc)}')
+        elif len(desc) < 5:
+            reasons.append(f'description too short: {repr(desc)}')
+
         registered_cmds = {c for _, c in self.commands_registered}
         declared_cmds = set(self.declared_commands)
-        cmds_ok = registered_cmds >= declared_cmds
+        missing_in_declared = sorted(registered_cmds - declared_cmds)
+        extra_in_declared = sorted(declared_cmds - registered_cmds)
+        if missing_in_declared:
+            reasons.append(f'__commands__ missing {len(missing_in_declared)}: {missing_in_declared}')
+        if extra_in_declared:
+            reasons.append(f'__commands__ has {len(extra_in_declared)} unregistered: {extra_in_declared}')
+
         registered_menus = set(self.menus_registered)
         declared_menus = set(self.declared_menus)
-        menus_ok = registered_menus >= declared_menus
-        return cmds_ok and menus_ok
+        missing_in_menus_decl = sorted(registered_menus - declared_menus)
+        extra_in_menus_decl = sorted(declared_menus - registered_menus)
+        if missing_in_menus_decl:
+            reasons.append(f'__menus__ missing {len(missing_in_menus_decl)}: {missing_in_menus_decl}')
+        if extra_in_menus_decl:
+            reasons.append(f'__menus__ has {len(extra_in_menus_decl)} unregistered: {extra_in_menus_decl}')
+
+        return reasons
+
+    @property
+    def is_complete(self) -> bool:
+        return len(self.incomplete_reasons) == 0
 
     @property
     def display_status(self) -> str:
@@ -432,6 +458,7 @@ class FeaturesSheet(Sheet):
         Column('menus', width=6, getter=lambda c,r: len(r.menus_registered)),
         Column('load_time_ms', width=10, type=float, fmtstr='%.1f', getter=lambda c,r: r.load_time_ms),
         ItemColumn('error', width=40),
+        Column('incomplete_reasons', width=60, getter=lambda c,r: '; '.join(r.incomplete_reasons) if r.incomplete_reasons else ''),
     ]
     _ordering = [('name', True)]
     nKeys = 1
@@ -450,6 +477,7 @@ class FeaturesSheet(Sheet):
                 status=spec.status,
                 display_status=spec.display_status,
                 is_complete=spec.is_complete,
+                incomplete_reasons=spec.incomplete_reasons,
                 error=spec.error,
                 commands_registered=spec.commands_registered,
                 menus_registered=spec.menus_registered,

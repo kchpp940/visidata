@@ -1,5 +1,4 @@
-"""
-# Usage
+"""Detect and remove duplicate rows.
 
 Duplicates are determined by the sheet's key columns.
 
@@ -19,7 +18,7 @@ values in just those columns.
   active sheet are included.
 """
 
-__description__ = "# Usage"
+__description__ = "detect and remove duplicate rows based on key columns or all visible columns"
 __commands__ = ["select-duplicate-rows", "dedupe-rows"]
 __menus__ = ["Row > Select > duplicate rows > select-duplicate-rows", "Data > Deduplicate rows > dedupe-rows"]
 

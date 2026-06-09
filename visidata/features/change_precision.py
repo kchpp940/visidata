@@ -1,3 +1,4 @@
+__description__ = "adjust column display precision for float, currency, and date types"
 __commands__ = ["setcol-precision-less", "setcol-precision-more"]
 __menus__ = ["Column > Set precision > more > setcol-precision-more", "Column > Set precision > less > setcol-precision-less"]
 __author__ = 'Andy Craig, andycraig (https://github.com/andycraig)'

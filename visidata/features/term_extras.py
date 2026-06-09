@@ -1,3 +1,4 @@
+__description__ = "enhanced terminal features: bracketed paste, focus events, mouse support"
 import os
 
 from visidata import VisiData

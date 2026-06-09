@@ -1,5 +1,4 @@
-"""
-# Usage
+"""Normalize column names to valid Python identifiers.
 
 This plugin normalizes column names in any given sheet, so that the names are:
 
@@ -39,7 +38,7 @@ For instance, a sheet with the following columns names:
 
 """
 
-__description__ = "# Usage"
+__description__ = "normalize column names to lowercase Python identifiers with uniqueness guarantees"
 __commands__ = ["normalize-col-names"]
 __menus__ = ["Column > Rename > normalize all > normalize-col-names"]
 

@@ -1,3 +1,4 @@
+__description__ = "open current sheet or file in external $EDITOR and reload changes"
 __commands__ = ["sysedit-cell", "sysedit-selected"]
 from copy import copy
 from visidata import vd, asyncthread, Path, Sheet, IndexSheet, TableSheet

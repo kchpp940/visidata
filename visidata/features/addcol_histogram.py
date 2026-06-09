@@ -1,3 +1,4 @@
+__description__ = "add ASCII histogram column showing value distribution"
 __commands__ = ["addcol-histogram"]
 __menus__ = ["Column > Add column > histogram > addcol-histogram"]
 from visidata import vd, Column, Sheet, asyncthread, Progress

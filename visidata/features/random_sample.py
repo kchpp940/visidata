@@ -1,3 +1,4 @@
+__description__ = "select random sample of rows with configurable size"
 __commands__ = ["random-rows", "select-random"]
 __menus__ = ["Row > Select > random sample > select-random"]
 from visidata import vd, Sheet

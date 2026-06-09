@@ -1,3 +1,4 @@
+__description__ = "select rows around selected rows (N context rows), and add rolling window calculation columns"
 __commands__ = ["addcol-window", "select-around-n"]
 __menus__ = ["Row > Select > N rows around each selected row > select-around-n"]
 import itertools

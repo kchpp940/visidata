@@ -1,3 +1,4 @@
+__description__ = "add rank columns based on numeric column values (rank, dense rank, percent rank)"
 __commands__ = ["addcol-rank-sheet"]
 import itertools
 

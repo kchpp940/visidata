@@ -1,3 +1,4 @@
+__description__ = "open and edit VisiData configuration files (.visidatarc)"
 __commands__ = ["open-config"]
 __menus__ = ["File > Options > edit config file > open-config"]
 from visidata import vd, BaseSheet

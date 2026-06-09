@@ -1,3 +1,4 @@
+__description__ = "explore installed Python packages, their modules, and metadata"
 __commands__ = ["open-python-packages"]
 __menus__ = ["System > Python > installed packages > open-python-packages"]
 from visidata import vd, BaseSheet, Column

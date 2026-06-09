@@ -1,3 +1,4 @@
+__description__ = "transpose rows and columns of the current sheet"
 __commands__ = ["transpose"]
 __menus__ = ["Data > Transpose > transpose"]
 from visidata import vd, VisiData, Sheet, asyncthread, Progress, Column

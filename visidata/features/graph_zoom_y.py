@@ -1,6 +1,8 @@
 # contributed by Ram Rachum (@cool-RR) via ChatGPT  #2751
 
 
+
+__description__ = "zoom into a specific Y-axis range on graph sheets"
 __commands__ = ["zoom-all-y"]
 from visidata import GraphSheet
 

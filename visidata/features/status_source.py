@@ -1,3 +1,4 @@
+__description__ = "display source file location in status bar for errors and commands"
 import inspect
 
 import visidata

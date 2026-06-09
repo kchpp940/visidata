@@ -1,5 +1,6 @@
-__commands__ = ["join-selected", "join-sheets-top2", "join-sheets-all", "join-sheets-cols"]
-__menus__ = ["Data > Join > Selected Sheets > choose jointype > join-selected", "Data > Join > Top Two Sheets > choose jointype > join-sheets-top2", "Data > Join > All Sheets > choose jointype > join-sheets-all"]
+__description__ = "join/merge multiple sheets by key columns with various join types (inner, outer, full, diff, append, concat, extend, merge)"
+__commands__ = ["join-selected", "join-sheets-top2", "join-sheets-all", "join-sheets-cols", "join-cols-inner", "join-selected-inner", "join-sheets-top2-inner", "join-sheets-all-inner", "join-cols-outer", "join-selected-outer", "join-sheets-top2-outer", "join-sheets-all-outer", "join-cols-full", "join-selected-full", "join-sheets-top2-full", "join-sheets-all-full", "join-cols-diff", "join-selected-diff", "join-sheets-top2-diff", "join-sheets-all-diff", "join-cols-append", "join-selected-append", "join-sheets-top2-append", "join-sheets-all-append", "join-cols-concat", "join-selected-concat", "join-sheets-top2-concat", "join-sheets-all-concat", "join-cols-extend", "join-selected-extend", "join-sheets-top2-extend", "join-sheets-all-extend", "join-cols-merge", "join-selected-merge", "join-sheets-top2-merge", "join-sheets-all-merge"]
+__menus__ = ["Data > Join > Selected Sheets > choose jointype > join-selected", "Data > Join > Top Two Sheets > choose jointype > join-sheets-top2", "Data > Join > All Sheets > choose jointype > join-sheets-all", "Data > Join > Selected Sheets > inner > join-selected-inner", "Data > Join > Selected Sheets > outer > join-selected-outer", "Data > Join > Selected Sheets > full > join-selected-full", "Data > Join > Selected Sheets > diff > join-selected-diff", "Data > Join > Selected Sheets > append > join-selected-append", "Data > Join > Selected Sheets > concat > join-selected-concat", "Data > Join > Selected Sheets > extend > join-selected-extend", "Data > Join > Selected Sheets > merge > join-selected-merge", "Data > Join > Top Two Sheets > inner > join-sheets-top2-inner", "Data > Join > Top Two Sheets > outer > join-sheets-top2-outer", "Data > Join > Top Two Sheets > full > join-sheets-top2-full", "Data > Join > Top Two Sheets > diff > join-sheets-top2-diff", "Data > Join > Top Two Sheets > append > join-sheets-top2-append", "Data > Join > Top Two Sheets > concat > join-sheets-top2-concat", "Data > Join > Top Two Sheets > extend > join-sheets-top2-extend", "Data > Join > Top Two Sheets > merge > join-sheets-top2-merge", "Data > Join > All Sheets > inner > join-sheets-all-inner", "Data > Join > All Sheets > outer > join-sheets-all-outer", "Data > Join > All Sheets > full > join-sheets-all-full", "Data > Join > All Sheets > diff > join-sheets-all-diff", "Data > Join > All Sheets > append > join-sheets-all-append", "Data > Join > All Sheets > concat > join-sheets-all-concat", "Data > Join > All Sheets > extend > join-sheets-all-extend", "Data > Join > All Sheets > merge > join-sheets-all-merge"]
 import collections
 import itertools
 import functools
@@ -422,7 +423,7 @@ for d in vd.jointypes:
 
     vd.addMenuItems(f'''Data > Join > Selected Sheets > {jointype} > join-selected-{jointype}''')
     vd.addMenuItems(f'''Data > Join > Top Two Sheets > {jointype} > join-sheets-top2-{jointype}''')
-    vd.addMenuItems(f'''Data > Join > All Sheets > {jointype} > join-selected-{jointype}''')
+    vd.addMenuItems(f'''Data > Join > All Sheets > {jointype} > join-sheets-all-{jointype}''')
 
 IndexSheet.guide += '''
     - `&` to join the selected sheets together

@@ -1,5 +1,7 @@
 # ailevel 6
 
+
+__description__ = "HTTP/Unix socket server for remote control and screen capture"
 import io
 import json
 import os

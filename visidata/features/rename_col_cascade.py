@@ -1,3 +1,4 @@
+__description__ = "rename columns with cascading find-replace across all sheets"
 import ast
 
 from visidata import vd, Column, ExprColumn, Sheet

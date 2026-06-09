@@ -1,3 +1,4 @@
+__description__ = "auto-increment numeric column values with configurable step"
 __commands__ = ["addcol-incr", "setcol-incr", "addcol-incr-step", "setcol-incr-step"]
 __menus__ = ["Column > Add column > increment > addcol-incr", "Edit > Modify > selected cells > increment > setcol-incr"]
 from visidata import VisiData, Sheet, vd

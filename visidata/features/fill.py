@@ -1,3 +1,4 @@
+__description__ = "fill empty cells with values from above or below"
 __commands__ = ["setcol-fill"]
 __menus__ = ["Column > Fill > setcol-fill"]
 from visidata import vd, VisiData, asyncthread, Sheet, Progress

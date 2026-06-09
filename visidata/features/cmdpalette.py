@@ -1,3 +1,4 @@
+__description__ = "interactive command palette with fuzzy search and suggestions"
 __commands__ = ["exec-longname", "exec-longname-simple"]
 import collections
 import math

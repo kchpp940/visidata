@@ -1,3 +1,4 @@
+__description__ = "melt (unpivot) wide-format data into long/tidy format, optionally by regex"
 __commands__ = ["melt", "melt-regex"]
 __menus__ = ["Data > Melt > nonkey columns > melt", "Data > Melt > nonkey columns by regex > melt-regex"]
 import collections

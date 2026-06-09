@@ -1,3 +1,4 @@
+__description__ = "parse dates with custom strptime format strings"
 __commands__ = ["type-customdate", "type-customdate-selected"]
 __menus__ = ["Column > Type as > custom date format > type-customdate"]
 import time

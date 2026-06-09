@@ -1,3 +1,4 @@
+__description__ = "auto-detect and suggest column types based on content patterns"
 from visidata import Sheet, anytype
 
 @Sheet.api

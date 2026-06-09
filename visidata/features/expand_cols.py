@@ -1,3 +1,4 @@
+__description__ = "expand nested/structured columns into separate columns and contract them back"
 __commands__ = ["expand-col", "expand-cols", "expand-col-depth", "expand-cols-depth", "contract-col", "contract-cols", "contract-col-depth", "contract-cols-depth", "contract-source-cols"]
 __menus__ = ["Column > Expand > one level > expand-col", "Column > Expand > to depth N > expand-col-depth", "Column > Expand > all columns one level > expand-cols", "Column > Expand > all columns to depth > expand-cols-depth", "Column > Contract > one level > contract-col", "Column > Contract > N levels > contract-col-depth", "Column > Contract > all columns one level > contract-cols", "Column > Contract > all columns N levels > contract-cols-depth", "Column > Contract > selected columns on source sheet > contract-source-cols"]
 import math
