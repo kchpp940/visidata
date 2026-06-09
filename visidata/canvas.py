@@ -917,31 +917,72 @@ class Canvas(Plotter):
         self.unselectBbox(bboxstr)
 
     def saveNamedSelection(self, name):
-        'Save current cursor bounding box as a named selection.'
+        'Save current brush selection as a named selection, storing source rowids for accurate replay.'
         if not self.cursorBox:
             vd.fail('no cursor box to save')
         bb = self.cursorBox
+        rows = self.rowsWithinDataBox(bb.xmin, bb.ymin, bb.xmax, bb.ymax)
         sel = {
             'name': name,
             'sheet': self.name,
+            'source_sheet': self.source.name if self.source else '',
+            'xcols': [c.name for c in getattr(self, 'xcols', [])],
+            'ycols': [c.name for c in getattr(self, 'ycols', [])],
             'xmin': float(bb.xmin),
             'xmax': float(bb.xmax),
             'ymin': float(bb.ymin),
             'ymax': float(bb.ymax),
+            'rowids': [str(self.source.rowid(r)) for r in rows] if self.source else [],
         }
         vd.selections.append(sel)
-        vd.status('saved selection "%s" (%d points in region)' % (name,
-            len(self.rowsWithinDataBox(bb.xmin, bb.ymin, bb.xmax, bb.ymax))))
+        vd.status('saved selection "%s" (%d %s)' % (name, len(rows), self.source.rowtype if self.source else 'points'))
 
     def loadNamedSelection(self, name):
-        'Load/apply a named selection by selecting its rows on the source sheet.'
+        'Load/apply a named selection: restore cursor bbox and select rows by rowid; fall back to bbox with warning for missing rows.'
         vd.selections.reload()
         for sel in vd.selections:
             if sel.name == name:
                 bboxstr = '%s %s %s %s' % (sel.xmin, sel.xmax, sel.ymin, sel.ymax)
                 vd.setLastArgs(bboxstr)
-                self.selectBbox(bboxstr)
-                vd.status('loaded selection "%s"' % name)
+
+                if self.cursorBox:
+                    self.cursorBox.xmin = float(sel.xmin)
+                    self.cursorBox.w = float(sel.xmax) - float(sel.xmin)
+                    self.cursorBox.ymin = float(sel.ymin)
+                    self.cursorBox.h = float(sel.ymax) - float(sel.ymin)
+
+                saved_rowids = getattr(sel, 'rowids', None)
+                if saved_rowids is None:
+                    saved_rowids = []
+                saved_rowids = list(saved_rowids)
+
+                if self.source and saved_rowids:
+                    current_map = {str(self.source.rowid(r)): r for r in self.source.rows}
+                    saved_set = set(saved_rowids)
+                    found_rows = [current_map[rid] for rid in saved_rowids if rid in current_map]
+                    missing_count = len(saved_set) - len(found_rows)
+
+                    if found_rows:
+                        self.source.select(found_rows)
+
+                    if missing_count > 0:
+                        fallback_rows = self.rowsWithinDataBox(
+                            float(sel.xmin), float(sel.ymin),
+                            float(sel.xmax), float(sel.ymax))
+                        extra = [r for r in fallback_rows if str(self.source.rowid(r)) not in saved_set]
+                        if extra:
+                            self.source.select(extra)
+                        vd.warning('selection "%s": %d of %d rowids missing; recovered %d via bbox' % (
+                            name, missing_count, len(saved_rowids), len(extra)))
+                    else:
+                        vd.status('loaded selection "%s" (%d %s by rowid)' % (
+                            name, len(found_rows), self.source.rowtype))
+                else:
+                    self.selectBbox(bboxstr)
+                    if not saved_rowids:
+                        vd.warning('selection "%s" has no rowids; using bbox fallback' % name)
+                    else:
+                        vd.status('loaded selection "%s" (by bbox, no source sheet)' % name)
                 return
         vd.fail('no selection named "%s"' % name)
 
