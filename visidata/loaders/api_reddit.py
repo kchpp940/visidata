@@ -66,163 +66,218 @@ def _make_praw_builder(praw_info):
     return lambda: None
 
 
-class CachedPRAWWrapper:
-    '''Hybrid row object: snapshot data for fast column rendering + explicit live reference.
+class LiveRedditRef:
+    '''Independent reference to a live PRAW object, fully detached from snapshot rows.
 
-    Two clearly separated concerns:
-      * snapshot (fast, local, always-available): column rendering, str, id lookup —
-        these never touch the network and never fail unexpectedly.
-      * live reference (explicit, may be offline): the real PRAW object used for
-        navigation, mutation, and behaviors not captured in the snapshot.  Callers
-        should check `.offline` or call `.ensure_live()` BEFORE attempting any
-        operation that requires the live PRAW object (e.g. in sheet openRow).
+    Probes availability once at construction time (creating a lazy PRAW stub does not
+    trigger a real network call) so every consumer can inspect `.available` / `.error`
+    immediately without accidentally touching the network during column rendering,
+    str(), hasattr(), or other read-only operations.
 
-    Nested dict/list snapshot values are recursively wrapped, so that
-    `row.subreddit.display_name`, `row.replies[0].body`, etc. remain O(1) snapshot
-    lookups even when the top-level row is offline.
+    Usage::
+
+        ref = LiveRedditRef({'type': 'subreddit', 'id': 'test', 'name': 'test'})
+        if ref.available:
+            praw_obj = ref.get()
+        else:
+            print(ref.error)
     '''
 
-    __slots__ = ('_snapshot', '_praw_builder', '_praw_cache', '_offline_cache', '__dict__')
+    __slots__ = ('praw_info', '_builder', '_cached_praw', 'available', 'error')
 
-    def __init__(self, snapshot, praw_builder=None, praw_info=None):
+    def __init__(self, praw_info):
+        self.praw_info = dict(praw_info or {})
+        self._builder = _make_praw_builder(praw_info)
+        self._cached_praw = None
+
+        # One-time availability probe at construction.  _make_praw_builder returns a
+        # lambda that either produces None (no id/name) or creates a lazy PRAW stub.
+        # Creating the stub does not touch the network; real I/O happens only when
+        # attributes are read from the stub.
+        self.available = False
+        self.error = None
+        try:
+            stub = self._builder()
+        except Exception as e:
+            self.error = f'{type(e).__name__}: {e}'
+            return
+        if stub is None:
+            self.error = 'missing id or name in _praw_info'
+            return
+        self._cached_praw = stub
+        self.available = True
+
+    # ---- public API ----
+
+    def get(self, context=None):
+        '''Return the live PRAW object (lazy stub), or raise RuntimeError if unavailable.
+
+        *context* is an optional caller description (e.g. "opening submission comments")
+        embedded in the error message.  Note that returning the stub does NOT itself
+        touch the network; attribute reads on the stub may still fail later.
+        '''
+        if not self.available:
+            label = (self.praw_info.get('display_name') or self.praw_info.get('name')
+                     or self.praw_info.get('id') or self.praw_info.get('fullname')
+                     or repr(self.praw_info)[:80])
+            ctx = f' while {context}' if context else ''
+            msg = (f'Reddit row `{label}` is offline: no live PRAW object available{ctx}. '
+                   f'Cause: {self.error or "unknown"}. '
+                   'Check reddit_client_id / reddit_client_secret and network connectivity.')
+            raise RuntimeError(msg)
+        return self._cached_praw
+
+    def try_get(self):
+        '''Return the live PRAW object or None.  Never raises.'''
+        return self._cached_praw if self.available else None
+
+
+class PrawSnapshotRow:
+    '''Pure-data snapshot row — NO network access, NO live PRAW fallback.
+
+    All attribute reads come from the local snapshot dict.  Nested dicts and list
+    elements are recursively wrapped into sibling PrawSnapshotRow instances so
+    expressions like `row.subreddit.display_name` or `row.replies[0].body` remain
+    O(1) local lookups.
+
+    The (optional) associated `LiveRedditRef` is accessed explicitly via the
+    `.live_ref`, `.live_available`, and `.live_error` attributes.  Callers that
+    need a real PRAW object *must* go through `.live_ref.get()`; nothing on this
+    object ever triggers a network call on its own.
+
+    Extra runtime attributes (e.g. `_comments_ref` on submission rows) can be set
+    freely and are stored alongside the snapshot; they are visible to `getattr`
+    and `hasattr` but not part of `__getstate__` / equality / hashing.
+    '''
+
+    __slots__ = ('_snapshot', '_extras', 'live_ref')
+
+    # Names that bypass the snapshot and resolve directly to the wrapper's own state.
+    _INTERNAL_ATTRS = frozenset((
+        '_snapshot', '_extras', 'live_ref',
+        'live_available', 'live_error', 'snapshot',
+    ))
+
+    def __init__(self, snapshot, live_ref=None):
         object.__setattr__(self, '_snapshot', dict(snapshot or {}))
-        object.__setattr__(self, '_praw_builder', praw_builder or _make_praw_builder(praw_info))
-        object.__setattr__(self, '_praw_cache', None)
-        object.__setattr__(self, '_offline_cache', None)  # None = not yet probed, True/False after
+        object.__setattr__(self, '_extras', {})
+        object.__setattr__(self, 'live_ref', live_ref)
 
-    @classmethod
-    def from_snapshot(cls, snapshot):
-        '''Build wrapper from a cached snapshot dict (which may contain a `_praw_info` key).'''
-        snap = dict(snapshot or {})
-        praw_info = snap.pop('_praw_info', None)
-        return cls(snap, praw_info=praw_info)
+    # -- convenience accessors --
 
-    # ------------------------------------------------------------------ snapshot
+    @property
+    def live_available(self):
+        '''True iff this row has an associated LiveRedditRef and it is available.'''
+        ref = object.__getattribute__(self, 'live_ref')
+        return bool(ref and ref.available)
 
-    def _snapshot_get(self, name):
-        '''Read a value directly from the snapshot; wraps nested dicts/lists recursively.'''
+    @property
+    def live_error(self):
+        '''Error string from the LiveRedditRef, or None.'''
+        ref = object.__getattribute__(self, 'live_ref')
+        return ref.error if ref else None
+
+    @property
+    def snapshot(self):
+        '''Read-only view of the raw snapshot dict.'''
+        return dict(object.__getattribute__(self, '_snapshot'))
+
+    # -- attribute protocol (snapshot-only) --
+
+    def __getattr__(self, name):
+        # 1) Runtime extras (e.g. _comments_ref attached by iterload)
+        extras = object.__getattribute__(self, '_extras')
+        if name in extras:
+            val = extras[name]
+            return _wrap_value(val)
+        # 2) Snapshot dict (recursively wrapped)
         snap = object.__getattribute__(self, '_snapshot')
         if name in snap:
             val = snap[name]
-            if isinstance(val, dict):
-                return CachedPRAWWrapper.from_snapshot(val)
-            if isinstance(val, list):
-                return [CachedPRAWWrapper.from_snapshot(x) if isinstance(x, dict) else x for x in val]
-            return val
-        return _SENTINEL
-
-    # ------------------------------------------------------------------ live ref
-
-    def _live_praw(self):
-        '''Return the live PRAW object (lazily built and cached).  Returns None if unavailable.'''
-        if object.__getattribute__(self, '_praw_cache') is None:
-            builder = object.__getattribute__(self, '_praw_builder')
-            try:
-                obj = builder()
-            except Exception:
-                obj = None
-            object.__setattr__(self, '_praw_cache', obj)
-        return object.__getattribute__(self, '_praw_cache')
-
-    @property
-    def offline(self):
-        '''True if the live PRAW object is known to be unavailable.
-
-        Triggers a one-time probe of the PRAW builder on first access; subsequent
-        accesses are cached for the lifetime of the wrapper.
-        '''
-        cached = object.__getattribute__(self, '_offline_cache')
-        if cached is not None:
-            return cached
-        praw = object.__getattribute__(self, '_live_praw')()
-        result = praw is None
-        object.__setattr__(self, '_offline_cache', result)
-        return result
-
-    def ensure_live(self, context=None):
-        '''Return the live PRAW object, or raise a clear error if unavailable.
-
-        *context* is an optional caller description included in the error message
-        (e.g. "opening submission comments").  Call this at sheet-interaction boundaries
-        (openRow, openRows, addRowsFromQuery, …) so offline failures surface early
-        with actionable messages instead of bubbling up from inside __getattr__.
-        '''
-        praw = object.__getattribute__(self, '_live_praw')()
-        if praw is not None:
-            return praw
-        snap = object.__getattribute__(self, '_snapshot')
-        label = (snap.get('display_name') or snap.get('name') or snap.get('id') or snap.get('fullname')
-                 or repr(snap)[:80])
-        ctx = f' while {context}' if context else ''
-        raise RuntimeError(
-            f'Reddit row `{label}` is offline: no live PRAW object available{ctx}. '
-            'Check reddit_client_id / reddit_client_secret and network connectivity.'
-        )
-
-    # --------------------------------------------------------- attribute protocol
-
-    def __getattr__(self, name):
-        val = object.__getattribute__(self, '_snapshot_get')(name)
-        if val is not _SENTINEL:
-            return val
-        # Snapshot miss — fall back to live PRAW.  This is preserved for backward
-        # compatibility; new callers should use .ensure_live() at interaction
-        # boundaries so failures are localized and explicit.
-        praw = object.__getattribute__(self, '_live_praw')()
-        if praw is not None:
-            try:
-                return getattr(praw, name)
-            except Exception:
-                pass
+            return _wrap_value(val)
         raise AttributeError(name)
 
     def __setattr__(self, name, value):
-        snap = object.__getattribute__(self, '_snapshot')
-        snap[name] = value
+        if name in PrawSnapshotRow._INTERNAL_ATTRS:
+            object.__setattr__(self, name, value)
+            return
+        extras = object.__getattribute__(self, '_extras')
+        extras[name] = value
 
     def __delattr__(self, name):
-        snap = object.__getattribute__(self, '_snapshot')
-        snap.pop(name, None)
+        extras = object.__getattribute__(self, '_extras')
+        extras.pop(name, None)
 
     def __hasattr__(self, name):
-        snap = object.__getattribute__(self, '_snapshot')
-        if name in snap:
+        if name in PrawSnapshotRow._INTERNAL_ATTRS:
             return True
-        praw = object.__getattribute__(self, '_praw_cache')
-        if praw is not None:
-            return hasattr(praw, name)
-        return False
+        extras = object.__getattribute__(self, '_extras')
+        if name in extras:
+            return True
+        snap = object.__getattribute__(self, '_snapshot')
+        return name in snap
+
+    # -- display / serialization --
 
     def __str__(self):
         snap = object.__getattribute__(self, '_snapshot')
-        if 'display_name' in snap:
-            return str(snap['display_name'])
-        if 'name' in snap:
-            return str(snap['name'])
-        if 'id' in snap:
-            return str(snap['id'])
-        praw = object.__getattribute__(self, '_praw_cache')
-        if praw is not None:
-            return str(praw)
+        for key in ('display_name', 'name', 'id'):
+            if key in snap and snap[key] is not None:
+                return str(snap[key])
         return object.__repr__(self)
 
     def __repr__(self):
-        return f'CachedPRAWWrapper({object.__getattribute__(self, "_snapshot")})'
+        snap = object.__getattribute__(self, '_snapshot')
+        ref = object.__getattribute__(self, 'live_ref')
+        avail = f' live={ref.available}' if ref else ''
+        return f'PrawSnapshotRow({snap}{avail})'
 
     def __getstate__(self):
-        return object.__getattribute__(self, '_snapshot')
+        # Only the pure snapshot survives pickling — no live refs, no extras.
+        return dict(object.__getattribute__(self, '_snapshot'))
 
     def __eq__(self, other):
-        if isinstance(other, CachedPRAWWrapper):
-            return object.__getattribute__(self, '_snapshot') == object.__getattribute__(other, '_snapshot')
+        if isinstance(other, PrawSnapshotRow):
+            return (object.__getattribute__(self, '_snapshot')
+                    == object.__getattribute__(other, '_snapshot'))
         return NotImplemented
 
     def __hash__(self):
         snap = object.__getattribute__(self, '_snapshot')
-        return hash(tuple(sorted((k, str(v)) for k, v in snap.items() if k.startswith('_') or not callable(v))))
+        return hash(tuple(sorted(
+            (k, str(v)) for k, v in snap.items()
+            if k.startswith('_') or not callable(v)
+        )))
 
 
-_SENTINEL = object()
+def _wrap_value(val):
+    '''Recursively wrap snapshot values: dict → PrawSnapshotRow, list/dict-elts → recursed.
+
+    The nested rows do *not* get their own LiveRedditRef even if they carry
+    _praw_info — live references are attached only to top-level rows returned
+    by the loader parse_fn.  Nested objects stay pure snapshot.
+    '''
+    if isinstance(val, dict):
+        inner = dict(val)
+        inner.pop('_praw_info', None)  # nested rows stay pure, no live_ref
+        return PrawSnapshotRow(inner, live_ref=None)
+    if isinstance(val, list):
+        return [_wrap_value(x) for x in val]
+    return val
+
+
+def _build_row_from_snapshot(snap):
+    '''Build a top-level PrawSnapshotRow from a raw cache dict; attach LiveRedditRef if possible.
+
+    This is the canonical parse_fn helper.  Nested snapshot values are recursively
+    wrapped into pure (no live_ref) PrawSnapshotRow instances; the top-level row
+    gets a LiveRedditRef constructed from the `_praw_info` key (if present).
+    '''
+    data = dict(snap or {})
+    praw_info = data.pop('_praw_info', None)
+    ref = LiveRedditRef(praw_info) if praw_info else None
+    row = PrawSnapshotRow(data, live_ref=ref)
+    return row
 
 
 def _fallback_attrs_for(v):
@@ -311,7 +366,13 @@ def _reddit_source_params(operation, params):
 
 def _reddit_fetch_rows(operation, params, fetch_fn, attrs_str=None,
                        status_online=None, error_msg=None):
-    '''Build spec, call remote_open, return list of CachedPRAWWrapper rows.'''
+    '''Build spec, call remote_open, return list of PrawSnapshotRow rows.
+
+    Each returned row has:
+      * pure snapshot data (all column reads are local)
+      * an associated LiveRedditRef at row.live_ref (None if _praw_info was missing)
+      * row.live_available / row.live_error convenience accessors
+    '''
     source_params = _reddit_source_params(operation, params)
 
     def _fetch():
@@ -319,10 +380,13 @@ def _reddit_fetch_rows(operation, params, fetch_fn, attrs_str=None,
         cacheable = [_praw_to_cacheable(o, attrs_str) for o in objs]
         return json.dumps(cacheable, ensure_ascii=False, default=str)
 
+    def _parse(raw):
+        return [_build_row_from_snapshot(d) for d in json.loads(raw)]
+
     spec = vd.make_remote_spec(
         'reddit', source_params, _fetch,
         days=0,
-        parse_fn=lambda raw: [CachedPRAWWrapper.from_snapshot(d) for d in json.loads(raw)],
+        parse_fn=_parse,
         status_online=status_online or f'fetching {operation} from reddit',
         status_offline=f'offline: using cached data for reddit `{operation}`',
         error_msg=error_msg or f'cannot fetch reddit `{operation}`',
@@ -482,12 +546,14 @@ class SubredditSheet(Sheet):
                     vd.exceptionCaught(e)
 
     def openRow(self, row):
-        row.ensure_live(context='opening subreddit submissions')
+        if row.live_ref and not row.live_available:
+            vd.fail(row.live_ref.error or 'Reddit subreddit row is offline')
         return RedditSubmissions(row.display_name_prefixed, source=_SubredditRef(row.display_name))
 
     def openRows(self, rows):
         for row in rows:
-            row.ensure_live(context='opening subreddit submissions')
+            if row.live_ref and not row.live_available:
+                vd.fail(row.live_ref.error or 'Reddit subreddit row is offline')
         comboname = '+'.join(row.display_name for row in rows)
         return RedditSubmissions(comboname, source=_SubredditRef(comboname))
 
@@ -561,12 +627,14 @@ class RedditorsSheet(Sheet):
                 yield from results
 
     def openRow(self, row):
-        row.ensure_live(context='opening redditor submissions')
+        if row.live_ref and not row.live_available:
+            vd.fail(row.live_ref.error or 'Reddit redditor row is offline')
         return RedditSubmissions(row.fullname, source=_RedditorRef(row.name))
 
     def openRows(self, rows):
         for row in rows:
-            row.ensure_live(context='opening redditor submissions')
+            if row.live_ref and not row.live_available:
+                vd.fail(row.live_ref.error or 'Reddit redditor row is offline')
         comboname = '+'.join(row.name for row in rows)
         return RedditSubmissions(comboname, source=_RedditorRef(comboname).submissions)
 
@@ -627,7 +695,8 @@ class RedditSubmissions(Sheet):
                 yield row
 
     def openRow(self, row):
-        row.ensure_live(context='opening submission comments')
+        if row.live_ref and not row.live_available:
+            vd.fail(row.live_ref.error or 'Reddit submission row is offline')
         return RedditComments(row.id, source=getattr(row, '_comments_ref', _SubmissionCommentsRef(row.id)))
 
 
@@ -681,7 +750,8 @@ class RedditComments(Sheet):
         yield from results
 
     def openRow(self, row):
-        row.ensure_live(context='opening nested comment replies')
+        if row.live_ref and not row.live_available:
+            vd.fail(row.live_ref.error or 'Reddit comment row is offline')
         return RedditComments(row.id, source=row.replies if hasattr(row, 'replies') else [])
 
 
@@ -718,10 +788,8 @@ def addRowsFromQuery(sheet, q):
         error_msg=f'cannot search subreddits matching `{q}`',
     )
     for r in results:
-        try:
-            r.ensure_live(context=f'adding subreddit from search `{q}`')
-        except RuntimeError as e:
-            vd.warning(str(e))
+        if r.live_ref and not r.live_available:
+            vd.warning(r.live_ref.error or f'Reddit search result `{r.display_name}` is offline')
         sheet.addRow(r, index=sheet.cursorRowIndex+1)
 
 
@@ -740,10 +808,8 @@ def addRowsFromQuery(sheet, q):
         error_msg=f'cannot search submissions matching `{q}`',
     )
     for r in results:
-        try:
-            r.ensure_live(context=f'adding submission from search `{q}`')
-        except RuntimeError as e:
-            vd.warning(str(e))
+        if r.live_ref and not r.live_available:
+            vd.warning(r.live_ref.error or f'Reddit search result `{r.title}` is offline')
         try:
             r._comments_ref = _SubmissionCommentsRef(r.id)
         except Exception:
