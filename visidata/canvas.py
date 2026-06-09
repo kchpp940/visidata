@@ -179,11 +179,20 @@ class PlotDataset:
     def __iter__(self):
         '''Yield legacy ``(vertexes, attr, row)`` tuples for backward compatibility.
 
-        Internal consumers should iterate ``self._elements`` directly to get
+        Internal consumers should use :meth:`iterElements` to get
         :class:`PlotElement` namedtuples with the ``kind`` field.
         '''
         for elt in self._elements:
             yield (elt.vertexes, elt.attr, elt.row)
+
+    def iterElements(self):
+        '''Yield :class:`PlotElement` namedtuples with typed ``kind`` field.
+
+        This is the public, supported entry point for Canvas's render loop.
+        External modules should keep using the default iterator (which returns
+        the legacy ``(vertexes, attr, row)`` tuple shape).
+        '''
+        return iter(self._elements)
 
     def __bool__(self):
         return bool(self._elements)
@@ -1273,8 +1282,8 @@ class Canvas(BrushSelectorMixin, Plotter):
         '''
         self.resetBounds(refresh=False)
 
-        # Iterate _elements directly to get PlotElement namedtuples with kind field.
-        for plot_elem in Progress(self.plotData._elements, 'rendering'):
+        # Use the public iterElements() API to get typed PlotElement namedtuples.
+        for plot_elem in Progress(self.plotData.iterElements(), 'rendering'):
             render_elem = self._coord.projectElement(plot_elem)
             if render_elem is None:
                 continue
