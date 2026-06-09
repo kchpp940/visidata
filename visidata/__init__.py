@@ -71,6 +71,7 @@ import visidata.guide
 
 import visidata.session_state
 import visidata.stored_list
+import visidata.snapshot
 import visidata._input
 import visidata.tuiwin
 import visidata.mouse

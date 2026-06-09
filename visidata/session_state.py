@@ -428,10 +428,47 @@ VisiData.init('_state_stores', dict)       # legacy alias, kept for compat
 
 
 @VisiData.api
+def ensureAllDescriptorsRegistered(vd):
+    '''Force every standard lazy_property descriptor / store to be evaluated
+    and registered.  Safe to call multiple times.
+
+    All public orchestration APIs (``describeAllState``, ``restoreAllState``,
+    ``persistAllState``, and ``saveSnapshot`` / ``loadSnapshot``) call this
+    internally so that callers do not have to worry about lazy-property
+    timing.
+    '''
+    _ = vd.optionsState
+    _ = vd.profilesState
+    _ = vd.cmdlogState
+    _ = vd.optionsStore
+    _ = vd.profilesStore
+    _ = vd.cmdlogStore
+    _ = vd.cacheManifest
+    _ = vd.graphStateStore
+    # These use StoredList (not lazy_property) but are assigned at module
+    # import time in macros.py, canvas.py, input_history.py.  Accessing them
+    # here is a no-op in normal operation but guards against import-order
+    # surprises in tests and scripts.
+    try:
+        vd.macros.register()
+    except Exception:
+        pass
+    try:
+        vd.selections.register()
+    except Exception:
+        pass
+    try:
+        vd._inputHistoryList.register()
+    except Exception:
+        pass
+
+
+@VisiData.api
 def describeAllState(vd) -> list:
     '''Return a list of ``describe()`` dicts for every registered state
     descriptor, sorted by phase.  Useful for debugging and UI.
     '''
+    vd.ensureAllDescriptorsRegistered()
     out = []
     for phase in sorted(vd._state_descriptors.keys()):
         for desc in vd._state_descriptors[phase]:
@@ -451,6 +488,7 @@ def restoreAllState(vd, phases=None) -> None:
     If *phases* is given, only descriptors whose phase is in the set/list
     are restored.  Called automatically from the ``run`` startup hook.
     '''
+    vd.ensureAllDescriptorsRegistered()
     if phases is None:
         phases = StatePhase.all_phases()
     phases = set(phases)
@@ -464,6 +502,7 @@ def restoreAllState(vd, phases=None) -> None:
 @VisiData.api
 def persistAllState(vd, phases=None) -> None:
     '''Call ``persist()`` on every registered state descriptor, in phase order.'''
+    vd.ensureAllDescriptorsRegistered()
     if phases is None:
         phases = StatePhase.all_phases()
     phases = set(phases)
@@ -713,6 +752,118 @@ def cmdlogState(vd):
 
 
 # ---------------------------------------------------------------------------
+# ProfileState -- manages cProfile profile persistence
+# ---------------------------------------------------------------------------
+
+class ProfileState(StateDescriptor):
+    '''StateDescriptor for cProfile profiling data.
+
+    Captures the output of ``cProfile.Profile.getstats()`` (or dumped .prof
+    files) into ``profilesStore`` as serialisable records.  Profiles are
+    restored as raw data (since we cannot rehydrate a live ``cProfile.Profile``
+    from disk) and can be loaded into ``ProfileSheet`` for inspection.
+    '''
+
+    name = 'profiles'
+    phase = StatePhase.PROFILES
+    kind = 'profiles'
+
+    def describe(self) -> dict:
+        return {
+            'name': self.name,
+            'phase': self.phase,
+            'phase_name': StatePhase.phase_name(self.phase),
+            'kind': self.kind,
+            'store_path': str(vd.profilesStore.path) if vd.profilesStore.path else None,
+            'store_records': len(vd.profilesStore.all()),
+            'live_profiles': self._count_live_profiles(),
+        }
+
+    def restore(self) -> None:
+        '''Reload persisted profile stats from the store.  Live cProfile
+        objects cannot be rehydrated; data is left in the store and can be
+        loaded into ProfileSheet via ``load-profile``.
+        '''
+        vd.profilesStore.restore()
+
+    def persist(self) -> None:
+        '''Snapshot every live ``cProfile.Profile`` attached to VisiData
+        threads into the profiles store.
+        '''
+        store = vd.profilesStore
+        try:
+            import cProfile
+            import threading
+            for t in threading.enumerate():
+                prof = getattr(t, 'profile', None)
+                if not isinstance(prof, cProfile.Profile):
+                    continue
+                self._capture_profile(store, t.name, prof)
+            main_prof = getattr(vd.mainThread, 'profile', None)
+            if isinstance(main_prof, cProfile.Profile):
+                self._capture_profile(store, 'main', main_prof)
+        except Exception as e:
+            vd.debug(f'profiles.persist: {e}')
+        store.save()
+
+    def get_state(self):
+        return vd.profilesStore.get_state()
+
+    def set_state(self, state) -> None:
+        vd.profilesStore.set_state(state)
+
+    # -- helpers ----------------------------------------------------------
+
+    def _count_live_profiles(self) -> int:
+        try:
+            import cProfile
+            import threading
+            n = 0
+            for t in threading.enumerate():
+                if isinstance(getattr(t, 'profile', None), cProfile.Profile):
+                    n += 1
+            return n
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _capture_profile(store, thread_name: str, prof) -> None:
+        '''Serialize a live cProfile.Profile's stats into a record.'''
+        try:
+            stats = prof.getstats()
+            serialised = []
+            for entry in stats:
+                code = entry.code
+                serialised.append({
+                    'func': repr(code),
+                    'filename': getattr(code, 'co_filename', None),
+                    'lineno': getattr(code, 'co_firstlineno', None),
+                    'callcount': entry.callcount,
+                    'reccallcount': getattr(entry, 'reccallcount', 0),
+                    'inlinetime': entry.inlinetime,
+                    'totaltime': entry.totaltime,
+                })
+            rec_id = f'profile_{thread_name}_{int(time.time())}'
+            store.add({
+                '_id': rec_id,
+                '_scope': thread_name,
+                'thread': thread_name,
+                'captured_at': _now_iso(),
+                'num_entries': len(serialised),
+                'entries': serialised,
+            })
+        except Exception as e:
+            vd.debug(f'capture profile {thread_name}: {e}')
+
+
+@VisiData.lazy_property
+def profilesState(vd):
+    desc = ProfileState()
+    desc.register()
+    return desc
+
+
+# ---------------------------------------------------------------------------
 # Standard stores (wired through the descriptor registry)
 # ---------------------------------------------------------------------------
 
@@ -752,8 +903,8 @@ def graphStateStore(vd):
 @asyncthread
 def run(vd, *args, **kwargs):
     '''Restore every registered StateDescriptor on startup, in phase order.'''
-    # Accessing these lazy_properties ensures they are registered.
     vd.optionsState
+    vd.profilesState
     vd.cmdlogState
     vd.optionsStore
     vd.profilesStore
@@ -771,6 +922,7 @@ VisiData.StateStore = StateStore
 VisiData.StatePhase = StatePhase
 VisiData.OptionsState = OptionsState
 VisiData.CmdlogState = CmdlogState
+VisiData.ProfileState = ProfileState
 
 vd.addGlobals(
     StateDescriptor=StateDescriptor,
@@ -778,4 +930,5 @@ vd.addGlobals(
     StatePhase=StatePhase,
     OptionsState=OptionsState,
     CmdlogState=CmdlogState,
+    ProfileState=ProfileState,
 )
