@@ -1,4 +1,4 @@
-name: vdsql-testing
+name: vdsql-ci
 on:
   pull_request:
     branches:
@@ -10,29 +10,31 @@ on:
       - develop
 
 jobs:
-  run-tests:
+  tests:
 
     strategy:
       matrix:
-        python-version: ["3.10", "3.14"]
+        python-version: ["3.10", "3.13"]
 
     runs-on: ubuntu-slim
+    timeout-minutes: 20
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
 
-    - name: Set up Python ${{ matrix.pythonversion }}
-      uses: actions/setup-python@v2
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
       with:
         python-version: ${{ matrix.python-version }}
+        cache: 'pip'
 
-    - name: Install VisiData
-      run: make install
+    - name: Install en_US.UTF-8 locale
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y locales
+        sudo locale-gen en_US.UTF-8
 
-    - name: Install vdsql
-      run: pip3 install visidata/apps/vdsql/
+    - name: Install VisiData with all optional dependencies
+      run: python3 -m visidata.dev_cli install all
 
-    - name: Ensure it starts up
-      run: vdsql --version
-
-    - name: Run tests
-      run: make test-vdsql
+    - name: Run vdsql tests
+      run: python3 -m visidata.dev_cli test vdsql

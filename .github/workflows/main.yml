@@ -6,8 +6,8 @@ on:
       - develop
   push:
     branches:
-    - stable
-    - develop
+      - stable
+      - develop
 
 jobs:
   full-tests:
@@ -34,10 +34,10 @@ jobs:
         sudo locale-gen en_US.UTF-8
 
     - name: Install VisiData with test dependencies
-      run: make install-test
+      run: python3 -m visidata.dev_cli install test
 
     - name: Run tests
-      run: make test
+      run: python3 -m visidata.dev_cli test all
 
   unit-tests:
 
@@ -63,7 +63,7 @@ jobs:
         sudo locale-gen en_US.UTF-8
 
     - name: Install VisiData with test dependencies
-      run: make install-test
+      run: python3 -m visidata.dev_cli install test
 
     - name: Run unit tests
-      run: make test
+      run: python3 -m visidata.dev_cli test unit
