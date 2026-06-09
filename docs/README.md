@@ -33,7 +33,6 @@ Guide to what each file covers, so it's clear which files to update when user-fa
 - mouse.md: Mouse interaction options
 - pipes.md: Using VisiData in stdin/stdout pipelines
 - dirsheet.md: Directory Sheet (DirSheet): browsing, editing, previewing files
-- cache.md: Remote Data Cache management for HTTP/S3/API sources
 - split.md: Split screen, viewing two sheets simultaneously
 - save-restore.md: Saving and replaying sessions
 - plugins.md: Installing plugins (builtin, pip, ~/.visidata/plugins/)

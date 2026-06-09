@@ -115,28 +115,6 @@ To load files from within a VisiData session, press `o` and enter a filepath.
 
 ---
 
-## Remote Data Cache
-
-Remote data sources (HTTP, HTTPS, S3) are automatically cached locally for faster reloading and offline access.
-
-### Managing the cache
-
-Open the Cache Sheet via `File > Cache > Open cache sheet` to view all cached resources. From there you can:
-
-- Refresh individual cache entries with `Ctrl+R`
-- Open cached local files with `Enter` (offline-safe)
-- Reload the original URL with `z Enter`
-- Delete entries with `d`
-- Adjust the invalidation policy per entry with `e`
-
-### Offline mode
-
-Enable `cache_offline` (via `File > Cache > Toggle offline mode`) to prevent all network requests and use only locally cached files.
-
-See the [Remote Data Cache](/docs/cache) documentation for full details.
-
----
-
 ## [How to convert a dataset from one supported filetype into another](#convert) {#convert}
 
 ~~~

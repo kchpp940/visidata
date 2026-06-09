@@ -10,13 +10,12 @@
 '''
 
 import visidata
-from visidata import vd, VisiData, Sheet, AttrColumn, asyncthread, anytype, date, CacheEntry
+from visidata import vd, VisiData, Sheet, AttrColumn, asyncthread, anytype, date
 
 
 vd.option('reddit_client_id', '', 'client_id for reddit API')
 vd.option('reddit_client_secret', '', 'client_secret for reddit API')
 vd.option('reddit_user_agent', visidata.__version_info__, 'user_agent for reddit API')
-vd.option('reddit_use_cache', True, 'cache reddit API responses locally via cache_manager', replay=True)
 
 
 @VisiData.api
@@ -41,51 +40,6 @@ vd.new_reddit = vd.open_reddit
 def reddit(vd):
     import praw
     return praw.Reddit(check_for_updates=False, **vd.options.getall('reddit_'))
-
-
-def _reddit_cache_key(kind, names, search=False):
-    return f'reddit://{kind}/{"+".join(names)}?search={"1" if search else "0"}'
-
-
-def _reddit_refresh_entry(entry: CacheEntry):
-    '''Refresh a Reddit cache entry using *only* the stored CacheEntry metadata.'''
-    import json
-    from urllib.parse import urlparse, parse_qs
-    cfg = entry.source_config or {}
-    params = entry.request_params or {}
-    kind = cfg.get('kind') or urlparse(entry.cache_key).netloc
-    names = cfg.get('names') or params.get('names') or [n for n in urlparse(entry.cache_key).path.strip('/').split('+') if n]
-    search = cfg.get('search', False)
-    results = []
-    if kind == 'subreddits':
-        for name in names:
-            if search:
-                for sr in vd.reddit.subreddits.search(name):
-                    results.append({'display_name': sr.display_name, 'fullname': sr.fullname})
-            else:
-                sr = vd.reddit.subreddit(name)
-                sr.display_name_prefixed
-                results.append({'display_name': sr.display_name, 'fullname': sr.fullname})
-
-    data = json.dumps(results).encode('utf-8')
-    cached_path = vd.cache_manager._cache_path_for(entry.cache_key)
-    with cached_path.open_bytes(mode='w') as fpout:
-        fpout.write(data)
-
-    return vd.cache_manager.put(
-        entry.cache_key, cached_path,
-        source_type='reddit',
-        content_type='application/json',
-        cache_policy=entry.cache_policy,
-        source_config=entry.source_config or {'kind': kind, 'names': names, 'search': bool(search)},
-        request_params=entry.request_params or {},
-        response_format={'filetype': 'json', 'encoding': 'utf-8'},
-        auth_hint='option:reddit_client_id / option:reddit_client_secret',
-        descr=entry.descr or f'Reddit {kind}: {", ".join(names)[:60]}',
-    )
-
-
-vd.cache_manager.register_source_handler('reddit', _reddit_refresh_entry)
 
 
 subreddit_hidden_attrs='''
