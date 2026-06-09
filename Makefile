@@ -3,7 +3,7 @@
        test test-all test-vgit test-vdsql \
        build man zsh-completion docker \
        setup-hooks setup-vscode lint \
-       diff-test clean preflight preflight-checks preflight-fix
+       diff-test clean preflight preflight-checks preflight-fix preflight-build preflight-package
 
 help:
 	@echo "Install:"
@@ -21,8 +21,10 @@ help:
 	@echo "  make docker            build docker images"
 	@echo ""
 	@echo "Release:"
-	@echo "  make preflight-fix     auto-fix version/date/docs, then run preflight checks"
-	@echo "  make preflight         build manpages then run all preflight release checks"
+	@echo "  make preflight-fix     auto-fix version/date/docs, then run source-level checks"
+	@echo "  make preflight         build manpages then run all source-level preflight checks"
+	@echo "  make preflight-build   build wheel + sdist into dist/ (needs: pip install build)"
+	@echo "  make preflight-package full release gate: build dist + package inspection + venv install smoke"
 	@echo "  make preflight-checks  list available preflight checks and fixers"
 	@echo ""
 	@echo "Setup:"
@@ -98,6 +100,12 @@ preflight-fix:
 
 preflight: man
 	python3 dev/preflight_check.py
+
+preflight-build:
+	python3 dev/preflight_check.py --build
+
+preflight-package:
+	python3 dev/preflight_check.py --package
 
 preflight-checks:
 	python3 dev/preflight_check.py --list

@@ -9,11 +9,14 @@ before manual release steps.
 ### Quick Start
 
 ```bash
-# Recommended: auto-fix what can be auto-fixed, then validate
+# Recommended full release gate: auto-fix everything, build wheel/sdist, then run ALL checks
+make preflight-package
+
+# Lightweight: auto-fix version/date/docs, then run only source-level checks
 make preflight-fix
 
-# Or: just rebuild docs and run checks (no file mutations beyond manpage generation)
-make preflight
+# Build wheel + sdist only (no checks)
+make preflight-build
 ```
 
 ### What It Does
@@ -25,6 +28,7 @@ make preflight
 | `--fix-version` | Syncs version numbers from the **canonical source** `visidata/__init__.py`. Display version (e.g. `3.4dev`) goes to `visidata/main.py` and `README.md`; PEP 440 mapped version (e.g. `3.4.dev0`) goes to `setup.py`. See "Version Mapping" below. |
 | `--fix-date`    | Updates the `.Dd` date line in `visidata/man/vd.inc` to today |
 | `--fix-docs`    | Rebuilds manpages (`vd.1`, `visidata.1`, `vd.txt`, `docs/man.md`) via `dev/mkman.sh` (requires `soelim`, `preconv` from groff; optionally `man`, `aha`). Missing tools produce a **WARN** (non-fatal) so version/date fixes still apply; the docs check will flag missing artifacts explicitly. |
+| `--fix-build`   | Clears `dist/` and builds both wheel (`*.whl`) and sdist (`*.tar.gz`) via `python3 -m build`. Requires `pip install build`. Produces **WARN** if `build` package is missing so other checks can still run. Triggered by `--build` or `--package` flags. |
 
 **Version Mapping Rules** (display version ↔ PEP 440 package version):
 
@@ -53,6 +57,8 @@ Only `visidata/__init__.py` is the canonical source of truth. Never edit `setup.
 | `formats`   | Every internal format in `docs/internal_formats.md` has a matching `open_<ext>()` function somewhere in the package |
 | `metadata`  | All paths referenced by `MANIFEST.in`, `setup.py package_data`, and `setup.py data_files` exist |
 | `changelog` | `CHANGELOG.md` contains a `# vX.Y` heading for the current version |
+| `package`   | Built wheel and sdist contain expected files: METADATA Name/Version, entry_points.txt for `vd`/`visidata`, core modules, package_data (ddw, desktop, icons), sdist top-level files (setup.py, README.md, etc.) |
+| `smoke`     | Installs the wheel in a throwaway venv under `/tmp`, then runs `vd --version` and imports core modules (`visidata`, `visidata.features.describe`, `visidata.loaders.vdx`, …) to confirm the installed package works. Venvs are cleaned up automatically. |
 
 ### Diagnostics
 
@@ -64,11 +70,18 @@ python3 dev/preflight_check.py --list
 
 # Run only specific checks
 python3 dev/preflight_check.py version imports metadata
+python3 dev/preflight_check.py package smoke   # package-level only (needs dist/)
 
 # Run only a specific fixer
 python3 dev/preflight_check.py --fix-version       # just sync version numbers
 python3 dev/preflight_check.py --fix-date          # just update manpage date
 python3 dev/preflight_check.py --fix-docs          # just rebuild manpages
+python3 dev/preflight_check.py --build             # just build wheel + sdist
+
+# Full release gate: build dist AND run all checks
+python3 dev/preflight_check.py --package
+# or:
+make preflight-package
 ```
 
 ### Manpage Build Dependencies
@@ -119,7 +132,20 @@ brew install aha      # provides aha (ANSI->HTML for man.txt)
 6. **(auto)** `python3 dev/preflight_check.py --fix-docs` runs dev/mkman.sh to build the manpage and updated website
     - Run ./mkmanhtml.sh, and move that to visidata.org:site/docs/man, and to visidata:docs/man.md
 
-7. Run `make preflight` one final time to confirm everything is green before merging.
+7. **(auto)** Run the full release gate — builds dist, validates package contents, smoke-tests in a throwaway venv:
+
+   ```bash
+   make preflight-package
+   ```
+
+   This is equivalent to:
+   - `python3 dev/preflight_check.py --fix --build` (fix version/date/docs, build wheel+sdist)
+   - then ALL 9 checks (including `package` and `smoke`)
+
+   If you only want source-level validation (no dist build):
+   ```bash
+   make preflight-fix
+   ```
 
 8. Merge `develop` to stable
 

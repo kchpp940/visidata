@@ -342,10 +342,66 @@ def fix_docs() -> FixResult:
                         skipped=["Manpage build raised exception (non-fatal); docs check will flag missing artifacts"])
 
 
+def fix_build() -> FixResult:
+    """Build wheel and sdist into dist/ via `python3 -m build`.
+
+    Clears any pre-existing dist/ artifacts first.
+    Requires the `build` package (`pip install build`).
+    """
+    changed: List[str] = []
+    skipped: List[str] = []
+
+    dist_dir = ROOT / "dist"
+    if dist_dir.exists():
+        import shutil as _shutil
+        for old in dist_dir.iterdir():
+            if old.is_file():
+                old.unlink()
+        skipped.append("Cleared pre-existing dist/ contents")
+
+    if not _find_system_tool("python3"):
+        return FixResult("fix-build", FixResult.FAIL, "python3 not found on PATH")
+
+    try:
+        import build  # noqa: F401
+    except ImportError:
+        return FixResult(
+            "fix-build", FixResult.WARN,
+            "Package `build` not installed; skipping dist build",
+            skipped=["Install with:  pip install build",
+                     "Smoke/package checks will be skipped if dist/ is empty"]
+        )
+
+    try:
+        result = subprocess.run(
+            ["python3", "-m", "build", "--outdir", str(dist_dir)],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "").strip()
+            last_lines = err.splitlines()[-10:] if err else []
+            return FixResult("fix-build", FixResult.FAIL,
+                           f"`python3 -m build` exited {result.returncode}",
+                           skipped=last_lines)
+        for artifact in sorted(dist_dir.glob("*.whl")) + sorted(dist_dir.glob("*.tar.gz")):
+            changed.append(f"Built {artifact.name} ({artifact.stat().st_size} bytes)")
+        if not changed:
+            return FixResult("fix-build", FixResult.FAIL,
+                           "Build succeeded but no .whl / .tar.gz found in dist/")
+        return FixResult("fix-build", FixResult.DONE,
+                       f"Built {len(changed)} artifact(s) in dist/",
+                       changed=changed, skipped=skipped)
+    except Exception as e:
+        return FixResult("fix-build", FixResult.FAIL, str(e))
+
+
 FIXERS: Dict[str, Callable[[], FixResult]] = {
     "fix-version": fix_version_numbers,
     "fix-date": fix_manpage_date,
     "fix-docs": fix_docs,
+    "fix-build": fix_build,
 }
 
 
@@ -765,6 +821,235 @@ def check_changelog() -> CheckResult:
     )
 
 
+def _find_latest_artifact(pattern: str) -> Optional[Path]:
+    """Return the most recently modified file matching pattern in dist/."""
+    dist = ROOT / "dist"
+    if not dist.exists():
+        return None
+    candidates = sorted(dist.glob(pattern))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+_WHEEL_WHITELIST: List[str] = [
+    "visidata/__init__.py",
+    "visidata/main.py",
+    "visidata/features/__init__.py",
+    "visidata/loaders/__init__.py",
+    "visidata/themes/__init__.py",
+    "visidata/ddw/input.ddw",
+    "visidata/ddw/regex.ddw",
+    "visidata/desktop/visidata.desktop",
+    "visidata/desktop/org.visidata.VisiData.metainfo.xml",
+    "visidata/desktop/icons/32x32/visidata.png",
+    "visidata/desktop/icons/48x48/visidata.png",
+]
+
+
+def check_package_contents() -> CheckResult:
+    """Inspect the built wheel and sdist for expected files and metadata.
+
+    Verifies:
+      - wheel METADATA Name/Version correct
+      - wheel entry_points.txt references vd=visidata.main:vd_cli
+      - core modules + package_data are present in the wheel
+      - sdist contains expected top-level files (setup.py, README.md, visidata/)
+    """
+    details: List[str] = []
+    errors: List[str] = []
+
+    import zipfile
+    import tarfile
+
+    dist_dir = ROOT / "dist"
+    if not dist_dir.exists() or not any(dist_dir.glob("*.whl")):
+        return CheckResult(
+            "package", False,
+            "dist/ has no .whl artifacts — run --build first"
+        )
+
+    # --- Wheel inspection ---
+    wheel = _find_latest_artifact("*.whl")
+    if not wheel:
+        return CheckResult(
+            "package", False,
+            "No .whl artifacts in dist/ — run --build first",
+        )
+
+    try:
+        with zipfile.ZipFile(wheel) as zf:
+            names = set(zf.namelist())
+
+        # Check core modules / package_data
+        for rel in _WHEEL_WHITELIST:
+            matched = any(n.endswith(rel) or n.endswith("/" + rel) for n in names)
+            if not matched:
+                errors.append(f"Wheel missing: {rel}")
+
+        # Check METADATA
+        metadata_files = [n for n in names if n.endswith(".dist-info/METADATA")]
+        if not metadata_files:
+            errors.append("Wheel missing .dist-info/METADATA")
+        else:
+            with zipfile.ZipFile(wheel) as zf:
+                meta_raw = zf.read(metadata_files[0]).decode("utf-8", errors="replace")
+            for line in meta_raw.splitlines():
+                if line.startswith("Name:"):
+                    details.append(f"Wheel METADATA Name: {line.split(':', 1)[1].strip()}")
+                if line.startswith("Version:"):
+                    details.append(f"Wheel METADATA Version: {line.split(':', 1)[1].strip()}")
+
+        # Check entry_points.txt
+        ep_files = [n for n in names if n.endswith(".dist-info/entry_points.txt")]
+        if not ep_files:
+            errors.append("Wheel missing .dist-info/entry_points.txt")
+        else:
+            with zipfile.ZipFile(wheel) as zf:
+                ep_raw = zf.read(ep_files[0]).decode("utf-8", errors="replace")
+            ep_flat = ep_raw.replace(" ", "")
+            if "vd=visidata.main:vd_cli" not in ep_flat:
+                errors.append("entry_points.txt missing vd=visidata.main:vd_cli")
+            if "visidata=visidata.main:vd_cli" not in ep_flat:
+                errors.append("entry_points.txt missing visidata=visidata.main:vd_cli")
+            details.append("Wheel entry_points.txt verified")
+    except Exception as e:
+        errors.append(f"Failed to inspect wheel {wheel.name}: {e}")
+
+    # --- sdist inspection ---
+    sdist = _find_latest_artifact("*.tar.gz")
+    if not sdist:
+        details.append("No .tar.gz sdist found — wheel only")
+    else:
+        try:
+            with tarfile.open(sdist) as tf:
+                sdist_names = set(tf.getnames())
+            for top in ["setup.py", "README.md", "CHANGELOG.md",
+                         "requirements.txt", "visidata/__init__.py"]:
+                found = any(n.endswith(top) for n in sdist_names)
+                if not found:
+                    errors.append(f"Sdist missing top-level: {top}")
+            details.append(f"Sdist contains {len(sdist_names)} files")
+        except Exception as e:
+            errors.append(f"Failed to inspect sdist {sdist.name}: {e}")
+
+    if errors:
+        return CheckResult("package", False,
+                           f"{len(errors)} package content issue(s)",
+                           errors + details)
+    return CheckResult("package", True,
+                       "Wheel + sdist contents verified",
+                       details)
+
+
+_SMOKE_IMPORTS: List[str] = [
+    "visidata",
+    "visidata.main",
+    "visidata.features.describe",
+    "visidata.features.slide",
+    "visidata.loaders.vdx",
+    "visidata.loaders.tsv",
+]
+
+
+def check_install_smoke() -> CheckResult:
+    """Install the built wheel in a temporary venv and smoke-test CLI + imports.
+
+    Creates a throwaway venv under /tmp, pip install -q <wheel>, then:
+      - `vd --version` returns the expected version string
+      - each module in _SMOKE_IMPORTS imports cleanly
+    """
+    details: List[str] = []
+    errors: List[str] = []
+
+    import tempfile
+    import venv as _venv
+
+    wheel = _find_latest_artifact("*.whl")
+    if not wheel:
+        return CheckResult(
+            "smoke", False,
+            "No .whl in dist/ — run --build first"
+        )
+
+    expected_display = _read_version_from_file(
+        VD / "__init__.py",
+        r"__version__\s*=\s*['\"]([^'\"]+)['\"]"
+    )
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="vd_preflight_smoke_"))
+    venv_dir = tmpdir / "venv"
+
+    try:
+        _venv.create(venv_dir, with_pip=True, clear=True)
+        details.append(f"Created temp venv at {venv_dir}")
+
+        py = venv_dir / "bin" / "python3"
+        if not py.exists():
+            py = venv_dir / "Scripts" / "python.exe"
+
+        # Install the wheel
+        result = subprocess.run(
+            [str(py), "-m", "pip", "install", "--quiet", str(wheel)],
+            capture_output=True, text=True)
+        if result.returncode != 0:
+            err = ((result.stderr or result.stdout) or "").strip()[-300:]
+            errors.append(f"pip install failed: {err}")
+            return CheckResult("smoke", False,
+                               "Failed to install wheel in venv",
+                               errors + details)
+        details.append(f"Installed {wheel.name} in venv")
+
+        # --- Run `vd --version` ---
+        vd_bin = venv_dir / "bin" / "vd"
+        if not vd_bin.exists():
+            vd_bin = venv_dir / "Scripts" / "vd.exe"
+        result = subprocess.run(
+            [str(vd_bin), "--version"],
+            capture_output=True, text=True)
+        out = (result.stdout + result.stderr).strip()
+        if result.returncode != 0:
+            errors.append(f"`vd --version` exited {result.returncode}: {out[:300]}")
+        else:
+            details.append(f"`vd --version` output: {out}")
+            if expected_display and expected_display not in out:
+                errors.append(
+                    f"`vd --version` output does not contain expected version '{expected_display}'"
+                )
+
+        # --- Feature imports ---
+        for mod in _SMOKE_IMPORTS:
+            result = subprocess.run(
+                [str(py), "-c", f"import {mod}; print(repr({mod}) + ' imported OK')"],
+                capture_output=True, text=True)
+            if result.returncode != 0:
+                errors.append(f"Import failed: {mod}")
+            else:
+                details.append(f"import {mod}: OK")
+
+        # --- vd object import ---
+        result = subprocess.run(
+            [str(py), "-c",
+             "from visidata import vd; print('vd.version=' + str(vd.version))"],
+            capture_output=True, text=True)
+        if result.returncode != 0:
+            errors.append("from visidata import vd failed")
+        else:
+            details.append(f"vd.version = {result.stdout.strip()}")
+
+    finally:
+        import shutil as _shutil
+        _shutil.rmtree(tmpdir, ignore_errors=True)
+
+    if errors:
+        return CheckResult("smoke", False,
+                           f"{len(errors)} smoke test failure(s)",
+                           errors + details)
+    return CheckResult("smoke", True,
+                       "Install + CLI + feature imports all OK",
+                       details)
+
+
 CHECKS: Dict[str, Callable[[], CheckResult]] = {
     "version": check_version_consistency,
     "imports": check_module_imports,
@@ -773,6 +1058,8 @@ CHECKS: Dict[str, Callable[[], CheckResult]] = {
     "formats": check_internal_formats,
     "metadata": check_packaging_metadata,
     "changelog": check_changelog,
+    "package": check_package_contents,
+    "smoke": check_install_smoke,
 }
 
 
@@ -786,27 +1073,34 @@ def main(argv: Optional[List[str]] = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
-  %(prog)s                     run all checks
-  %(prog)s --list              list available check names
-  %(prog)s version imports      run only version and imports checks
-  %(prog)s --fix              run all auto-fix steps then check
-  %(prog)s --fix-version      sync version numbers only
-  %(prog)s --fix-date         update manpage date only
-  %(prog)s --fix-docs         rebuild manpages only
+  %(prog)s                           run all checks (source-level only)
+  %(prog)s --package                 build wheel/sdist, then run ALL checks
+  %(prog)s package smoke             run only package + smoke checks (needs dist/)
+  %(prog)s --list                    list available check names and fixers
+  %(prog)s --fix                     auto-fix version/date/docs, then check
+  %(prog)s --fix --build             auto-fix everything AND build dist, then check all
+  %(prog)s --fix-version             sync version numbers only
+  %(prog)s --fix-date                update manpage date only
+  %(prog)s --fix-docs                rebuild manpages only
+  %(prog)s --build                   build wheel + sdist into dist/ (slow)
 """,
     )
     parser.add_argument("--list", action="store_true",
-                        help="list available check names and exit")
+                        help="list available check names and fixers, then exit")
     parser.add_argument("--fix", action="store_true",
-                        help="run all auto-fix steps, then run checks")
+                        help="run fast auto-fix steps (version, date, docs), then run checks")
+    parser.add_argument("--build", action="store_true",
+                        help="build wheel and sdist into dist/ (runs fix-build)")
+    parser.add_argument("--package", action="store_true",
+                        help="build dist and run package-level checks (package + smoke + all others)")
     parser.add_argument("--fix-version", action="store_true",
-                        help=f"sync version numbers across files from canonical source")
+                        help="sync version numbers from canonical visidata/__init__.py")
     parser.add_argument("--fix-date", action="store_true",
                         help="update manpage date in visidata/man/vd.inc to today")
     parser.add_argument("--fix-docs", action="store_true",
                         help="rebuild manpages via dev/mkman.sh")
     parser.add_argument("checks", nargs="*",
-                        help="specific check(s) to run (default: all)")
+                        help="specific check(s) to run (default: all, or all+package/smoke with --package)")
 
     args = parser.parse_args(argv)
 
@@ -825,11 +1119,13 @@ Examples:
         return 0
 
     # --- Fix phase ---
-    any_fix = args.fix or args.fix_version or args.fix_date or args.fix_docs
+    any_fix = (args.fix or args.build or args.fix_version or args.fix_date
+               or args.fix_docs or args.package)
     fixers_to_run: List[str] = []
 
+    # --fix runs fast fixers only; --build adds the slow dist builder
     if args.fix:
-        fixers_to_run = list(FIXERS.keys())
+        fixers_to_run.extend(["fix-version", "fix-date", "fix-docs"])
     else:
         if args.fix_version:
             fixers_to_run.append("fix-version")
@@ -837,6 +1133,10 @@ Examples:
             fixers_to_run.append("fix-date")
         if args.fix_docs:
             fixers_to_run.append("fix-docs")
+
+    # --build or --package triggers the wheel/sdist build
+    if args.build or args.package:
+        fixers_to_run.append("fix-build")
 
     if fixers_to_run:
         print("=" * 60)
@@ -854,15 +1154,22 @@ Examples:
             print(str(fr))
             print()
 
-        fix_ok = all(r.ok for r in fix_results)
-        if not fix_ok:
+        # Only hard FAIL (not WARN) should abort the fix phase.
+        # WARN (e.g. missing manpage tools) allows checks to proceed so the
+        # underlying problem is surfaced explicitly by the check stage.
+        hard_fails = [r for r in fix_results if r.status == FixResult.FAIL]
+        if hard_fails:
             print("=" * 60)
-            print("Some fix steps failed. See details above.")
+            print(f"{len(hard_fails)} fix step(s) failed hard. Aborting.")
             print("=" * 60)
             return 1
 
     # --- Check phase ---
-    selected = args.checks or list(CHECKS.keys())
+    # --package or explicit "package"/"smoke" implies running the dist-based checks.
+    if args.package and not args.checks:
+        selected = list(CHECKS.keys())
+    else:
+        selected = args.checks or list(CHECKS.keys())
 
     invalid = [n for n in selected if n not in CHECKS]
     if invalid:
@@ -896,10 +1203,12 @@ Examples:
             print("Remaining issues after auto-fix:")
         else:
             print("Issues found. Try:  python3 dev/preflight_check.py --fix")
+            print("For dist-level validation:  python3 dev/preflight_check.py --package")
             print("Or run individual fixers:")
             print("  --fix-version   sync version numbers")
             print("  --fix-date      update manpage date")
             print("  --fix-docs      rebuild manpages")
+            print("  --build         build wheel + sdist into dist/")
         return 1
 
     return 0
