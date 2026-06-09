@@ -849,12 +849,21 @@ class Canvas(Plotter):
                                 self.formatY(ymin), self.formatY(ymax))
 
     def _resolveRowsFromContext(self, ctxstr):
-        '''Resolve rows from a brush context string (JSON with rowkeys+bbox, or plain bbox).
+        '''Resolve rows from a brush context string (prefixed JSON with rowkeys+bbox, bare JSON, or plain bbox).
+        Validates source sheet, x/y columns, and coordinate types first; mismatches produce warnings and may skip rowkey matching.
         Returns (rows, used_rowkeys_count, missing_count) where rows is the final list of rows.'''
-        bboxstr, saved_rowkeys = self._parseBrushContext(ctxstr)
+        bboxstr, saved_rowkeys, ctx = self._parseBrushContext(ctxstr)
+
+        if ctx:
+            warns = self._validateBrushContext(ctx)
+            for w in warns:
+                vd.warning('brush context: %s' % w)
+            if warns:
+                saved_rowkeys = None
+
         xmin, xmax, ymin, ymax = self.parseBbox(bboxstr)
 
-        if saved_rowkeys and self.source:
+        if saved_rowkeys and self.source and self._hasStableRowkeys():
             found_rows, missing_count = self._matchRowsByRowkeys(saved_rowkeys)
             if missing_count > 0:
                 fallback_rows = self.rowsWithinDataBox(xmin, ymin, xmax, ymax)
@@ -947,6 +956,17 @@ class Canvas(Plotter):
         vd.setLastArgs(ctxstr)
         self.unselectBbox(ctxstr)
 
+    VD_BRUSH_CONTEXT_PREFIX = '_vdbc:'
+
+    def _hasStableRowkeys(self):
+        'Return True if source sheet has key columns defined, meaning rowkeys are stable across sessions.'
+        if not self.source:
+            return False
+        try:
+            return bool(self.source.keyCols)
+        except Exception:
+            return False
+
     def _rowkeyStr(self, row):
         'Return JSON-safe string representation of the row key for persistent storage.'
         if not self.source:
@@ -995,28 +1015,72 @@ class Canvas(Plotter):
         return found_rows, missing_count
 
     def _makeBrushContext(self, rows, bbox):
-        '''Build a JSON string encoding the full brush context for cmdlog replay:
-        bbox coordinates, source sheet, x/y columns, and rowkeys of selected rows.'''
+        '''Build a VDX-safe prefixed JSON string encoding the full brush context for cmdlog replay:
+        bbox coordinates, source sheet, x/y columns, stable-rowkeys flag, and rowkeys of selected rows.'''
         ctx = {
             'bbox': self.formatBbox(bbox),
             'source_sheet': self.source.name if self.source else '',
             'xcols': [c.name for c in getattr(self, 'xcols', [])],
             'ycols': [c.name for c in getattr(self, 'ycols', [])],
+            'stable_rowkeys': self._hasStableRowkeys(),
         }
-        if self.source and rows:
+        if self.source and rows and self._hasStableRowkeys():
             ctx['rowkeys'] = [self._rowkeyStr(r) for r in rows]
-        return json.dumps(ctx, ensure_ascii=False)
+        jsonstr = json.dumps(ctx, ensure_ascii=False)
+        return self.VD_BRUSH_CONTEXT_PREFIX + jsonstr
 
     def _parseBrushContext(self, ctxstr):
-        '''Parse either an old-format bbox string or a new-format JSON brush context.
-        Returns (bboxstr, rowkeys_list_or_None).'''
-        if ctxstr and ctxstr.startswith('{'):
+        '''Parse a brush context string.
+        Accepts: (1) "_vdbc:{...}" prefixed JSON, (2) bare "{...}" JSON, (3) plain "xmin xmax ymin ymax" bbox string.
+        Strips surrounding whitespace for VDX runvdx compatibility.
+        Returns (bboxstr, rowkeys_list_or_None, ctx_dict_or_None).'''
+        if not ctxstr:
+            return '', None, None
+        s = ctxstr.strip()
+        ctx = None
+        if s.startswith(self.VD_BRUSH_CONTEXT_PREFIX):
             try:
-                ctx = json.loads(ctxstr)
-                return ctx.get('bbox', ''), ctx.get('rowkeys')
+                ctx = json.loads(s[len(self.VD_BRUSH_CONTEXT_PREFIX):])
+                return ctx.get('bbox', ''), ctx.get('rowkeys'), ctx
             except Exception:
                 pass
-        return ctxstr, None
+        elif s.startswith('{'):
+            try:
+                ctx = json.loads(s)
+                return ctx.get('bbox', ''), ctx.get('rowkeys'), ctx
+            except Exception:
+                pass
+        return s, None, None
+
+    def _validateBrushContext(self, ctx):
+        '''Check whether the saved brush context matches the current canvas/source configuration.
+        Returns list of human-readable warning strings (empty list if everything matches).'''
+        warnings = []
+        if not ctx:
+            return warnings
+
+        saved_source = ctx.get('source_sheet', '')
+        if saved_source and self.source and saved_source != self.source.name:
+            warnings.append('source sheet mismatch: saved "%s", current "%s"' % (saved_source, self.source.name))
+
+        saved_xcols = ctx.get('xcols', []) or []
+        cur_xcols = [c.name for c in getattr(self, 'xcols', [])]
+        if saved_xcols and cur_xcols and list(saved_xcols) != list(cur_xcols):
+            warnings.append('x columns mismatch: saved %s, current %s' % (saved_xcols, cur_xcols))
+
+        saved_ycols = ctx.get('ycols', []) or []
+        cur_ycols = [c.name for c in getattr(self, 'ycols', [])]
+        if saved_ycols and cur_ycols and list(saved_ycols) != list(cur_ycols):
+            warnings.append('y columns mismatch: saved %s, current %s' % (saved_ycols, cur_ycols))
+
+        bboxstr = ctx.get('bbox', '')
+        if bboxstr:
+            try:
+                self.parseBbox(bboxstr)
+            except Exception as e:
+                warnings.append('bbox parse error: %s' % e)
+
+        return warnings
 
     def saveNamedSelection(self, name):
         'Save current brush selection as a named selection, storing source rowkeys (key column values) for stable cross-session replay.'
@@ -1024,6 +1088,9 @@ class Canvas(Plotter):
             vd.fail('no cursor box to save')
         bb = self.cursorBox
         rows = self.rowsWithinDataBox(bb.xmin, bb.ymin, bb.xmax, bb.ymax)
+        has_stable = self._hasStableRowkeys()
+        if not has_stable:
+            vd.warning('source sheet has no key columns; selection will use bbox only and may not match correctly after data reload or reordering')
         sel = {
             'name': name,
             'sheet': self.name,
@@ -1034,16 +1101,19 @@ class Canvas(Plotter):
             'xmax': float(bb.xmax),
             'ymin': float(bb.ymin),
             'ymax': float(bb.ymax),
+            'stable_rowkeys': has_stable,
         }
-        if self.source and rows:
+        if self.source and rows and has_stable:
             sel['rowkeys'] = [self._rowkeyStr(r) for r in rows]
         vd.selections.append(sel)
         nkeys = len(sel.get('rowkeys', []))
-        label = 'rowkeys' if nkeys else 'points'
-        vd.status('saved selection "%s" (%d %s)' % (name, nkeys or len(rows), label))
+        if has_stable:
+            vd.status('saved selection "%s" (%d rowkeys)' % (name, nkeys or len(rows)))
+        else:
+            vd.status('saved selection "%s" (%d points, bbox-only, no stable keys)' % (name, len(rows)))
 
     def loadNamedSelection(self, name):
-        'Load/apply a named selection: restore cursor bbox and select rows by stable rowkey; fall back to bbox with warning for missing rows.'
+        'Load/apply a named selection: validate source sheet/columns first, restore cursor bbox, prefer stable rowkeys; fall back to bbox with warning for mismatches or missing rows.'
         vd.selections.reload()
         for sel in vd.selections:
             if sel.name == name:
@@ -1056,6 +1126,16 @@ class Canvas(Plotter):
                     self.cursorBox.ymin = float(sel.ymin)
                     self.cursorBox.h = float(sel.ymax) - float(sel.ymin)
 
+                ctx_for_validate = {
+                    'source_sheet': getattr(sel, 'source_sheet', ''),
+                    'xcols': list(getattr(sel, 'xcols', []) or []),
+                    'ycols': list(getattr(sel, 'ycols', []) or []),
+                    'bbox': bboxstr,
+                }
+                warns = self._validateBrushContext(ctx_for_validate)
+                for w in warns:
+                    vd.warning('selection "%s": %s' % (name, w))
+
                 saved_rowkeys = getattr(sel, 'rowkeys', None)
                 if saved_rowkeys is None:
                     saved_rowkeys = getattr(sel, 'rowids', None)
@@ -1063,7 +1143,11 @@ class Canvas(Plotter):
                     saved_rowkeys = []
                 saved_rowkeys = list(saved_rowkeys)
 
-                if self.source and saved_rowkeys:
+                sel_stable = bool(getattr(sel, 'stable_rowkeys', False))
+                cur_stable = self._hasStableRowkeys()
+                can_use_rowkeys = (not warns) and saved_rowkeys and self.source and sel_stable and cur_stable
+
+                if can_use_rowkeys:
                     found_rows, missing_count = self._matchRowsByRowkeys(saved_rowkeys)
 
                     if found_rows:
@@ -1084,8 +1168,12 @@ class Canvas(Plotter):
                             name, len(found_rows), self.source.rowtype))
                 else:
                     self.selectBbox(bboxstr)
-                    if not saved_rowkeys:
-                        vd.warning('selection "%s" has no rowkeys; using bbox fallback' % name)
+                    if warns:
+                        vd.warning('selection "%s": using bbox only due to validation mismatches above' % name)
+                    elif not sel_stable or not saved_rowkeys:
+                        vd.warning('selection "%s" has no stable rowkeys; using bbox fallback' % name)
+                    elif not cur_stable:
+                        vd.warning('current source sheet has no key columns; using bbox fallback for selection "%s"' % name)
                     else:
                         vd.status('loaded selection "%s" (by bbox, no source sheet)' % name)
                 return

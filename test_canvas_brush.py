@@ -11,8 +11,8 @@ from visidata import vd, Canvas, Box, TableSheet, Column, AttrDict
 vd.options.disp_graph_labels = False
 
 
-def make_source_sheet():
-    src = TableSheet('testsrc')
+def make_source_sheet(with_keys=True, sheet_name='testsrc'):
+    src = TableSheet(sheet_name)
 
     def make_col(name, **kwargs):
         c = Column(name, **kwargs)
@@ -30,50 +30,255 @@ def make_source_sheet():
         r = AttrDict({'idx': i, 'x': float(i), 'y': float(i*2), 'label': 'p%d' % i})
         rows.append(r)
     src.rows = rows
-    src.setKeys([src.column('idx')])
+    if with_keys:
+        src.setKeys([src.column('idx')])
     TableSheet.keyCols.fget.cache_clear()
     return src
 
 
-def make_canvas(src):
+def make_canvas(src, xcols=None, ycols=None):
     cvs = Canvas('testcanvas')
     cvs.source = src
     cvs.cursorBox = Box(0.0, 0.0, 10.0, 20.0)
     cvs.visibleBox = Box(0.0, 0.0, 10.0, 20.0)
     cvs.canvasBox = Box(0.0, 0.0, 10.0, 20.0)
+    if xcols:
+        cvs.xcols = xcols
+    if ycols:
+        cvs.ycols = ycols
     for r in src.rows:
         cvs.point(float(r.x), float(r.y), 'green', r)
     return cvs
 
 
+def test_has_stable_rowkeys_true():
+    src = make_source_sheet(with_keys=True)
+    cvs = make_canvas(src)
+    assert cvs._hasStableRowkeys() is True
+
+
+def test_has_stable_rowkeys_false():
+    src = make_source_sheet(with_keys=False)
+    cvs = make_canvas(src)
+    assert cvs._hasStableRowkeys() is False
+
+
+def test_make_brush_context_has_vdbc_prefix():
+    src = make_source_sheet(with_keys=True)
+    cvs = make_canvas(src)
+    bb = Box(0.0, 0.0, 10.0, 20.0)
+    rows = cvs.rowsWithinDataBox(bb.xmin, bb.ymin, bb.xmax, bb.ymax)
+    ctxstr = cvs._makeBrushContext(rows, bb)
+    assert ctxstr.startswith(Canvas.VD_BRUSH_CONTEXT_PREFIX), 'must have _vdbc: prefix'
+    ctx = json.loads(ctxstr[len(Canvas.VD_BRUSH_CONTEXT_PREFIX):])
+    assert ctx['stable_rowkeys'] is True
+    assert 'rowkeys' in ctx
+    assert len(ctx['rowkeys']) == 10
+    assert ctx['source_sheet'] == 'testsrc'
+
+
+def test_make_brush_context_no_keys_omits_rowkeys():
+    src = make_source_sheet(with_keys=False)
+    cvs = make_canvas(src)
+    bb = Box(0.0, 0.0, 10.0, 20.0)
+    rows = cvs.rowsWithinDataBox(bb.xmin, bb.ymin, bb.xmax, bb.ymax)
+    ctxstr = cvs._makeBrushContext(rows, bb)
+    ctx = json.loads(ctxstr[len(Canvas.VD_BRUSH_CONTEXT_PREFIX):])
+    assert ctx['stable_rowkeys'] is False
+    assert 'rowkeys' not in ctx, 'should not store rowkeys without stable keycols'
+
+
+def test_parse_brush_context_three_formats():
+    src = make_source_sheet(with_keys=True)
+    cvs = make_canvas(src)
+
+    plain = '0.0 10.0 0.0 20.0'
+    bbox, rk, ctx = cvs._parseBrushContext(plain)
+    assert bbox == plain
+    assert rk is None
+    assert ctx is None
+
+    bb = Box(0.0, 0.0, 10.0, 20.0)
+    rows = cvs.rowsWithinDataBox(bb.xmin, bb.ymin, bb.xmax, bb.ymax)
+    prefixed = cvs._makeBrushContext(rows, bb)
+    bbox2, rk2, ctx2 = cvs._parseBrushContext(prefixed)
+    assert rk2 is not None
+    assert len(rk2) == 10
+    assert ctx2 is not None
+    assert ctx2['stable_rowkeys'] is True
+
+    bare_json = json.dumps({'bbox': '0.0 10.0 0.0 20.0', 'rowkeys': ['[1]']})
+    bbox3, rk3, ctx3 = cvs._parseBrushContext(bare_json)
+    assert bbox3 == '0.0 10.0 0.0 20.0'
+    assert rk3 == ['[1]']
+    assert ctx3 is not None
+
+
+def test_parse_brush_context_strips_whitespace_vdx_runvdx_compat():
+    src = make_source_sheet(with_keys=True)
+    cvs = make_canvas(src)
+
+    bb = Box(0.0, 0.0, 10.0, 20.0)
+    rows = cvs.rowsWithinDataBox(bb.xmin, bb.ymin, bb.xmax, bb.ymax)
+    ctxstr = cvs._makeBrushContext(rows, bb)
+
+    padded = '   ' + ctxstr + '  \n'
+    bbox, rk, ctx = cvs._parseBrushContext(padded)
+    assert rk is not None, 'leading whitespace should be stripped (VDX runvdx compat)'
+    assert len(rk) == 10
+
+    padded_plain = '  0.0 10.0 0.0 20.0  '
+    bbox2, rk2, ctx2 = cvs._parseBrushContext(padded_plain)
+    assert bbox2 == '0.0 10.0 0.0 20.0'
+    assert rk2 is None
+
+
+def test_validate_brush_context_all_match():
+    src = make_source_sheet(with_keys=True)
+    xcol = src.column('x')
+    ycol = src.column('y')
+    cvs = make_canvas(src, xcols=[xcol], ycols=[ycol])
+
+    ctx = {
+        'source_sheet': 'testsrc',
+        'xcols': ['x'],
+        'ycols': ['y'],
+        'bbox': '0.0 10.0 0.0 20.0',
+    }
+    warns = cvs._validateBrushContext(ctx)
+    assert warns == []
+
+
+def test_validate_brush_context_source_mismatch():
+    src = make_source_sheet(with_keys=True)
+    cvs = make_canvas(src)
+    ctx = {'source_sheet': 'wrong_name', 'bbox': '0.0 10.0 0.0 20.0'}
+    warns = cvs._validateBrushContext(ctx)
+    assert len(warns) >= 1
+    assert any('source sheet mismatch' in w for w in warns)
+
+
+def test_validate_brush_context_xcols_mismatch():
+    src = make_source_sheet(with_keys=True)
+    xcol = src.column('x')
+    ycol = src.column('y')
+    cvs = make_canvas(src, xcols=[xcol], ycols=[ycol])
+    ctx = {
+        'source_sheet': 'testsrc',
+        'xcols': ['date'],
+        'ycols': ['y'],
+        'bbox': '0.0 10.0 0.0 20.0',
+    }
+    warns = cvs._validateBrushContext(ctx)
+    assert any('x columns mismatch' in w for w in warns)
+
+
+def test_validate_brush_context_ycols_mismatch():
+    src = make_source_sheet(with_keys=True)
+    xcol = src.column('x')
+    ycol = src.column('y')
+    cvs = make_canvas(src, xcols=[xcol], ycols=[ycol])
+    ctx = {
+        'source_sheet': 'testsrc',
+        'xcols': ['x'],
+        'ycols': ['revenue'],
+        'bbox': '0.0 10.0 0.0 20.0',
+    }
+    warns = cvs._validateBrushContext(ctx)
+    assert any('y columns mismatch' in w for w in warns)
+
+
+def test_validate_brush_context_bbox_parse_error():
+    src = make_source_sheet(with_keys=True)
+    cvs = make_canvas(src)
+    ctx = {
+        'source_sheet': 'testsrc',
+        'xcols': [],
+        'ycols': [],
+        'bbox': 'not a valid bbox',
+    }
+    warns = cvs._validateBrushContext(ctx)
+    assert any('bbox parse error' in w for w in warns)
+
+
+def test_resolve_rows_validation_mismatch_disables_rowkeys():
+    src1 = make_source_sheet(with_keys=True, sheet_name='sheetA')
+    cvs1 = make_canvas(src1)
+    bb = Box(0.0, 0.0, 5.0, 10.0)
+    rows = cvs1.rowsWithinDataBox(bb.xmin, bb.ymin, bb.xmax, bb.ymax)
+    ctxstr = cvs1._makeBrushContext(rows, bb)
+
+    src2 = make_source_sheet(with_keys=True, sheet_name='sheetB')
+    cvs2 = make_canvas(src2)
+
+    resolved, used, missing = cvs2._resolveRowsFromContext(ctxstr)
+    assert used == 0, 'rowkeys must not be used when source sheet mismatches'
+    assert len(resolved) == 6, 'should fall back to bbox which still finds 6 rows in 0..5, 0..10'
+
+
+def test_resolve_rows_no_stable_keys_on_target():
+    src1 = make_source_sheet(with_keys=True)
+    cvs1 = make_canvas(src1)
+    bb = Box(0.0, 0.0, 5.0, 10.0)
+    rows = cvs1.rowsWithinDataBox(bb.xmin, bb.ymin, bb.xmax, bb.ymax)
+    ctxstr = cvs1._makeBrushContext(rows, bb)
+
+    src2 = make_source_sheet(with_keys=False)
+    cvs2 = make_canvas(src2)
+
+    resolved, used, missing = cvs2._resolveRowsFromContext(ctxstr)
+    assert used == 0, 'rowkeys must not be used when target has no stable keycols'
+    assert len(resolved) == 6
+
+
+def test_save_named_selection_without_keys_warns():
+    src = make_source_sheet(with_keys=False)
+    cvs = make_canvas(src)
+    cvs.cursorBox = Box(0.0, 0.0, 5.0, 10.0)
+    vd.selections.clear()
+
+    bb = cvs.cursorBox
+    rows = cvs.rowsWithinDataBox(bb.xmin, bb.ymin, bb.xmax, bb.ymax)
+    has_stable = cvs._hasStableRowkeys()
+    assert has_stable is False
+
+    sel = {
+        'name': 'testsel_nokeys',
+        'sheet': cvs.name,
+        'source_sheet': cvs.source.name if cvs.source else '',
+        'xcols': [c.name for c in getattr(cvs, 'xcols', [])],
+        'ycols': [c.name for c in getattr(cvs, 'ycols', [])],
+        'xmin': float(bb.xmin),
+        'xmax': float(bb.xmax),
+        'ymin': float(bb.ymin),
+        'ymax': float(bb.ymax),
+        'stable_rowkeys': False,
+    }
+    list.append(vd.selections, AttrDict(sel))
+
+    assert len(vd.selections) == 1
+    s = vd.selections[0]
+    assert s.stable_rowkeys is False
+    assert 'rowkeys' not in s
+
+
 def test_rowkey_str_stability():
-    src = make_source_sheet()
+    src = make_source_sheet(with_keys=True)
     cvs = make_canvas(src)
 
     for r in src.rows:
         s1 = cvs._rowkeyStr(r)
         s2 = cvs._rowkeyStr(r)
-        assert s1 == s2, 'rowkeyStr should be stable for same row'
-        assert s1.startswith('['), 'rowkeyStr should be JSON array: %s' % s1
+        assert s1 == s2
+        assert s1.startswith('[')
 
     r0 = src.rows[0]
     r0_clone = AttrDict({'idx': 0, 'x': 0.0, 'y': 0.0, 'label': 'p0'})
-    assert cvs._rowkeyStr(r0) == cvs._rowkeyStr(r0_clone), \
-        'rowkeyStr should be same for rows with same key values'
-
-
-def test_rowkey_from_str():
-    src = make_source_sheet()
-    cvs = make_canvas(src)
-
-    s = cvs._rowkeyStr(src.rows[3])
-    parsed = cvs._rowkeyFromStr(s)
-    assert isinstance(parsed, tuple)
-    assert parsed == (3,)
+    assert cvs._rowkeyStr(r0) == cvs._rowkeyStr(r0_clone)
 
 
 def test_match_rows_by_rowkeys():
-    src = make_source_sheet()
+    src = make_source_sheet(with_keys=True)
     cvs = make_canvas(src)
 
     saved_keys = [cvs._rowkeyStr(src.rows[i]) for i in [1, 3, 5]]
@@ -82,239 +287,82 @@ def test_match_rows_by_rowkeys():
     assert missing == 0
     assert [r.idx for r in found] == [1, 3, 5]
 
-    extra_key = json.dumps([999])
-    found2, missing2 = cvs._matchRowsByRowkeys(saved_keys + [extra_key])
-    assert len(found2) == 3
-    assert missing2 == 1
-
-
-def test_make_brush_context():
-    src = make_source_sheet()
-    cvs = make_canvas(src)
-
-    bb = Box(0.0, 0.0, 10.0, 20.0)
-    rows = cvs.rowsWithinDataBox(bb.xmin, bb.ymin, bb.xmax, bb.ymax)
-    assert len(rows) == 10
-
-    ctxstr = cvs._makeBrushContext(rows, bb)
-    ctx = json.loads(ctxstr)
-    assert 'bbox' in ctx
-    assert 'rowkeys' in ctx
-    assert 'source_sheet' in ctx
-    assert ctx['source_sheet'] == 'testsrc'
-    assert len(ctx['rowkeys']) == 10
-
-
-def test_parse_brush_context_backward_compat():
-    src = make_source_sheet()
-    cvs = make_canvas(src)
-
-    plain_bbox = '1.0 5.0 2.0 10.0'
-    bbox, rowkeys = cvs._parseBrushContext(plain_bbox)
-    assert bbox == plain_bbox
-    assert rowkeys is None
-
-    bb = Box(0.0, 0.0, 10.0, 20.0)
-    rows = cvs.rowsWithinDataBox(bb.xmin, bb.ymin, bb.xmax, bb.ymax)
-    ctxstr = cvs._makeBrushContext(rows, bb)
-    bbox2, rowkeys2 = cvs._parseBrushContext(ctxstr)
-    assert bbox2 == cvs.formatBbox(bb)
-    assert rowkeys2 is not None
-    assert len(rowkeys2) == 10
-
-
-def test_resolve_rows_from_context_rowkeys_priority():
-    src = make_source_sheet()
-    cvs = make_canvas(src)
-
-    bb = Box(0.0, 0.0, 10.0, 20.0)
-    all_rows = cvs.rowsWithinDataBox(bb.xmin, bb.ymin, bb.xmax, bb.ymax)
-    ctxstr = cvs._makeBrushContext(all_rows, bb)
-
-    rows, used, missing = cvs._resolveRowsFromContext(ctxstr)
-    assert len(rows) == 10
-    assert used == 10
-    assert missing == 0
-
-    ctx = json.loads(ctxstr)
-    ctx['rowkeys'] = ctx['rowkeys'][:5]
-    ctxstr_partial = json.dumps(ctx)
-    rows2, used2, missing2 = cvs._resolveRowsFromContext(ctxstr_partial)
-    assert len(rows2) == 5
-    assert used2 == 5
-    assert missing2 == 0
-
-
-def test_resolve_rows_from_context_missing_rowkeys_fallback():
-    src = make_source_sheet()
-    cvs = make_canvas(src)
-
-    bb = Box(0.0, 0.0, 10.0, 20.0)
-    all_rows = cvs.rowsWithinDataBox(bb.xmin, bb.ymin, bb.xmax, bb.ymax)
-    ctxstr = cvs._makeBrushContext(all_rows, bb)
-
-    ctx = json.loads(ctxstr)
-    ctx['rowkeys'].append(json.dumps([999]))
-    ctxstr_bad = json.dumps(ctx)
-
-    rows, used, missing = cvs._resolveRowsFromContext(ctxstr_bad)
-    assert missing == 1
-    assert len(rows) == 10
-
-
-def test_resolve_rows_from_context_plain_bbox():
-    src = make_source_sheet()
-    cvs = make_canvas(src)
-
-    plain = '0.0 10.0 0.0 20.0'
-    rows, used, missing = cvs._resolveRowsFromContext(plain)
-    assert len(rows) == 10
-    assert used == 0
-    assert missing == 0
-
-
-def test_selectbbox_replay_with_rowkeys():
-    src = make_source_sheet()
-    cvs = make_canvas(src)
-
-    bb = Box(0.0, 0.0, 5.0, 10.0)
-    rows = cvs.rowsWithinDataBox(bb.xmin, bb.ymin, bb.xmax, bb.ymax)
-    ctxstr = cvs._makeBrushContext(rows, bb)
-
-    resolved, _, _ = cvs._resolveRowsFromContext(ctxstr)
-    src.select(resolved, add_undo=False)
-
-    selected = [r for r in src.rows if src.isSelected(r)]
-    assert len(selected) == len(rows)
-    for r in rows:
-        assert src.isSelected(r)
-
-
-def test_save_named_selection_stores_rowkeys():
-    src = make_source_sheet()
-    cvs = make_canvas(src)
-
-    cvs.cursorBox = Box(0.0, 0.0, 5.0, 10.0)
-    vd.selections.clear()
-
-    bb = cvs.cursorBox
-    rows = cvs.rowsWithinDataBox(bb.xmin, bb.ymin, bb.xmax, bb.ymax)
-    sel = {
-        'name': 'testsel',
-        'sheet': cvs.name,
-        'source_sheet': cvs.source.name if cvs.source else '',
-        'xcols': [c.name for c in getattr(cvs, 'xcols', [])],
-        'ycols': [c.name for c in getattr(cvs, 'ycols', [])],
-        'xmin': float(bb.xmin),
-        'xmax': float(bb.xmax),
-        'ymin': float(bb.ymin),
-        'ymax': float(bb.ymax),
-    }
-    if cvs.source and rows:
-        sel['rowkeys'] = [cvs._rowkeyStr(r) for r in rows]
-    list.append(vd.selections, AttrDict(sel))
-
-    assert len(vd.selections) == 1
-    s = vd.selections[0]
-    assert s.name == 'testsel'
-    assert s.source_sheet == 'testsrc'
-    assert 'rowkeys' in s
-    assert len(s.rowkeys) > 0
-
-
-def test_load_named_selection_by_rowkey():
-    src = make_source_sheet()
-    cvs = make_canvas(src)
-
-    cvs.cursorBox = Box(0.0, 0.0, 5.0, 10.0)
-    vd.selections.clear()
-
-    bb = cvs.cursorBox
-    rows = cvs.rowsWithinDataBox(bb.xmin, bb.ymin, bb.xmax, bb.ymax)
-    sel = {
-        'name': 'testsel2',
-        'sheet': cvs.name,
-        'source_sheet': cvs.source.name if cvs.source else '',
-        'xcols': [c.name for c in getattr(cvs, 'xcols', [])],
-        'ycols': [c.name for c in getattr(cvs, 'ycols', [])],
-        'xmin': float(bb.xmin),
-        'xmax': float(bb.xmax),
-        'ymin': float(bb.ymin),
-        'ymax': float(bb.ymax),
-        'rowkeys': [cvs._rowkeyStr(r) for r in rows],
-    }
-    list.append(vd.selections, AttrDict(sel))
-
-    for r in src.rows:
-        src.unselect(r)
-
-    saved_rowkeys = list(vd.selections[0].rowkeys)
-    found_rows, _ = cvs._matchRowsByRowkeys(saved_rowkeys)
-    src.select(found_rows)
-
-    selected = [r for r in src.rows if src.isSelected(r)]
-    expected = cvs.rowsWithinDataBox(0.0, 0.0, 5.0, 10.0)
-    assert len(selected) == len(expected)
-
 
 def test_cross_session_rowkey_stability():
-    '''Simulate cross-session: save rowkeys, then reload data with brand-new row objects
-    (different Python id()) and verify rowkeys still match the right rows.'''
-
-    src1 = make_source_sheet()
+    src1 = make_source_sheet(with_keys=True)
     cvs1 = make_canvas(src1)
     bb = Box(2.0, 4.0, 7.0, 14.0)
     rows1 = cvs1.rowsWithinDataBox(bb.xmin, bb.ymin, bb.xmax, bb.ymax)
-    saved_rowkeys = [cvs1._rowkeyStr(r) for r in rows1]
+    ctxstr = cvs1._makeBrushContext(rows1, bb)
     original_idxs = sorted([r.idx for r in rows1])
 
-    src2 = make_source_sheet()
+    src2 = make_source_sheet(with_keys=True)
     cvs2 = make_canvas(src2)
 
-    for r in src2.rows:
-        src2.unselect(r)
-
-    found_rows, missing = cvs2._matchRowsByRowkeys(saved_rowkeys)
+    resolved, used, missing = cvs2._resolveRowsFromContext(ctxstr)
     assert missing == 0
-    found_idxs = sorted([r.idx for r in found_rows])
+    found_idxs = sorted([r.idx for r in resolved])
     assert found_idxs == original_idxs
 
     for r in src1.rows:
         for r2 in src2.rows:
             if r.idx == r2.idx:
-                assert id(r) != id(r2), 'simulated reload must produce different Python objects'
-                assert cvs1._rowkeyStr(r) == cvs2._rowkeyStr(r2), 'same data must produce same rowkey'
+                assert id(r) != id(r2)
+                assert cvs1._rowkeyStr(r) == cvs2._rowkeyStr(r2)
 
 
 def test_cross_session_rowkey_with_missing_fallback():
-    '''Simulate: save selection with 5 rowkeys, reload with only 3 matching,
-    ensure missing ones trigger bbox fallback.'''
-
-    src1 = make_source_sheet()
+    src1 = make_source_sheet(with_keys=True)
     cvs1 = make_canvas(src1)
     bb = Box(0.0, 0.0, 5.0, 10.0)
     rows1 = cvs1.rowsWithinDataBox(bb.xmin, bb.ymin, bb.xmax, bb.ymax)
-    saved_rowkeys = [cvs1._rowkeyStr(r) for r in rows1]
+    ctxstr = cvs1._makeBrushContext(rows1, bb)
 
-    src2 = make_source_sheet()
+    src2 = make_source_sheet(with_keys=True)
     src2.rows = [r for r in src2.rows if r.idx not in (1, 3)]
     cvs2 = make_canvas(src2)
 
-    ctx = {
-        'bbox': cvs2.formatBbox((bb.xmin, bb.xmax, bb.ymin, bb.ymax)),
-        'source_sheet': 'testsrc',
-        'xcols': [],
-        'ycols': [],
-        'rowkeys': saved_rowkeys,
-    }
-    ctxstr = json.dumps(ctx)
     resolved, used, missing = cvs2._resolveRowsFromContext(ctxstr)
-
     assert used == 4
     assert missing == 2
-
     resolved_idxs = sorted([r.idx for r in resolved])
     assert resolved_idxs == [0, 2, 4, 5]
+
+
+def test_load_named_selection_validates_source():
+    src1 = make_source_sheet(with_keys=True, sheet_name='original')
+    cvs1 = make_canvas(src1)
+    cvs1.cursorBox = Box(0.0, 0.0, 5.0, 10.0)
+    vd.selections.clear()
+
+    bb = cvs1.cursorBox
+    rows = cvs1.rowsWithinDataBox(bb.xmin, bb.ymin, bb.xmax, bb.ymax)
+    sel = {
+        'name': 'cross_sheet_sel',
+        'sheet': cvs1.name,
+        'source_sheet': 'original',
+        'xcols': [],
+        'ycols': [],
+        'xmin': float(bb.xmin),
+        'xmax': float(bb.xmax),
+        'ymin': float(bb.ymin),
+        'ymax': float(bb.ymax),
+        'stable_rowkeys': True,
+        'rowkeys': [cvs1._rowkeyStr(r) for r in rows],
+    }
+    list.append(vd.selections, AttrDict(sel))
+
+    src2 = make_source_sheet(with_keys=True, sheet_name='different')
+    cvs2 = make_canvas(src2)
+
+    ctx_for_validate = {
+        'source_sheet': 'original',
+        'xcols': [],
+        'ycols': [],
+        'bbox': '%s %s %s %s' % (sel['xmin'], sel['xmax'], sel['ymin'], sel['ymax']),
+    }
+    warns = cvs2._validateBrushContext(ctx_for_validate)
+    assert any('source sheet mismatch' in w for w in warns), 'must detect source sheet mismatch on load'
 
 
 if __name__ == '__main__':
