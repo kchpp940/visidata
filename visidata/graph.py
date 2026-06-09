@@ -420,6 +420,52 @@ def reload(sheet):
         sheet.resetCanvasDimensions(25, 80)
         sheet.resetBounds(refresh=False)
         sheet.plot_elements(invert_y=True)
+    sheet.restoreGraphState()
+
+
+@GraphSheet.api
+def saveGraphState(sheet):
+    '''Persist the current graph view state (reflines, viewport) to the unified store.'''
+    try:
+        store = vd.graphStateStore
+        rec_id = f'graph_{sheet.name}'
+        store.add({
+            '_id': rec_id,
+            '_scope': sheet.name,
+            'sheet': sheet.name,
+            'reflines_x': list(sheet.reflines_x),
+            'reflines_y': list(sheet.reflines_y),
+            'xmin': sheet.visibleBox.xmin,
+            'xmax': sheet.visibleBox.xmax,
+            'ymin': sheet.visibleBox.ymin,
+            'ymax': sheet.visibleBox.ymax,
+        })
+        store.save()
+    except Exception as e:
+        vd.debug(f'failed to save graph state for {sheet.name}: {e}')
+
+
+@GraphSheet.api
+def restoreGraphState(sheet):
+    '''Restore graph view state (reflines, viewport) from the unified store if available.'''
+    try:
+        store = vd.graphStateStore
+        rec_id = f'graph_{sheet.name}'
+        rec = store.get(rec_id)
+        if not rec:
+            return
+        sheet.reflines_x = list(rec.get('reflines_x', []))
+        sheet.reflines_y = list(rec.get('reflines_y', []))
+        xmin, xmax = rec.get('xmin'), rec.get('xmax')
+        ymin, ymax = rec.get('ymin'), rec.get('ymax')
+        if all(v is not None for v in (xmin, xmax, ymin, ymax)):
+            sheet.zoomTo(BoundingBox(xmin, ymin, xmax, ymax))
+        sheet.refresh()
+    except Exception as e:
+        vd.debug(f'failed to restore graph state for {sheet.name}: {e}')
+
+
+GraphSheet.addCommand('gs', 'save-graph-state', 'sheet.saveGraphState()', 'save current graph reflines and viewport')
 
 vd.addGlobals({
     'GraphSheet': GraphSheet,

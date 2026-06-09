@@ -18,7 +18,8 @@ vd.theme_option('color_graph_selected', 'bold', 'color of selected graph points'
 
 vd.option('auto_brush_select', True, 'automatically select source rows when brushing a region on canvas/graph', replay=True)
 
-vd.selections = vd.StoredList(name='selections')
+vd.selections = vd.StoredList(name='selections', phase=vd.StatePhase.SELECTIONS)
+vd.selections.register_for_restore()
 
 
 class Point:

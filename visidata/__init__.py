@@ -69,6 +69,7 @@ import visidata.threads
 import visidata.path
 import visidata.guide
 
+import visidata.session_state
 import visidata.stored_list
 import visidata._input
 import visidata.tuiwin

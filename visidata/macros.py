@@ -12,7 +12,8 @@ vd.macrobindings = {}
 MACRO_PARAM_RE = re.compile(r'\{(\w+)(?:=([^}]*))?\}')
 
 
-vd.macros = vd.StoredList(name='macros')
+vd.macros = vd.StoredList(name='macros', phase=vd.StatePhase.MACROS)
+vd.macros.register_for_restore()
 
 
 class MacroSheet(IndexSheet):

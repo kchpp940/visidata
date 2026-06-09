@@ -1,7 +1,8 @@
 from visidata import vd, VisiData, Sheet, ItemColumn, asyncthread
 
 
-vd._inputHistoryList = vd.StoredList(name='input_history')
+vd._inputHistoryList = vd.StoredList(name='input_history', phase=vd.StatePhase.LAYOUT)
+vd._inputHistoryList.register_for_restore()
 vd.inputHistory = {}   # [input_type][input] -> anything
 
 
