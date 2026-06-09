@@ -36,6 +36,50 @@ vd.option('describe_aggrs', 'mean stdev', 'numeric aggregators to calculate on D
 
 
 # =============================================================================
+# Sheet-level Unified Interface — the single entry point for invalidation
+# =============================================================================
+
+
+@Sheet.api
+def diagnosticCacheKey(sheet):
+    """Tuple summarising the diagnostic inputs for *sheet*.
+
+    Components: sheet identity, visible column ids, key column ids, row ids.
+    Used by the runner to decide whether cached results are still valid.
+    """
+    try:
+        visible_ids = tuple(id(c) for c in getattr(sheet, 'visibleCols', []))
+    except Exception:
+        visible_ids = ()
+    try:
+        key_ids = tuple(id(c) for c in getattr(sheet, 'keyCols', []))
+    except Exception:
+        key_ids = ()
+    try:
+        row_ids = tuple(id(r) for r in sheet.rows)
+    except Exception:
+        row_ids = ()
+    return (id(sheet), visible_ids, key_ids, row_ids)
+
+
+@Sheet.api
+def markDiagnosticsDirty(sheet):
+    """Mark *sheet*'s diagnostics as needing recomputation.
+
+    This is the **only** entry point for invalidation.  Every mutation hook
+    (rows, columns, keys, type, reload, derived views, filter state, …)
+    should call this method — and nothing else.  The runner is the sole
+    authority for acting on the dirty flag / cache key.
+    """
+    if isinstance(sheet, ExplodingMock):
+        return
+    sheet._diagnostics_dirty = True
+
+
+Sheet.init('_diagnostics_dirty', lambda: True, copy=False)
+
+
+# =============================================================================
 # Layer 1 — Rule Registry
 # =============================================================================
 
@@ -147,11 +191,17 @@ def diagnostic_rules(vd, scope=None):
 
 
 class DiagnosticRunner:
-    """Executes rules, caches results, and tracks staleness via cache keys.
+    """Executes rules, caches results, and tracks staleness.
 
-    The runner is the single authority for *when* diagnostics run.  Hooks on
-    the source sheet / columns only ever call ``invalidate``; the runner
-    decides on its own when to re-execute (via ``ensure``).
+    The runner consults **only** two sources for lifecycle decisions:
+
+    1. ``sheet._diagnostics_dirty`` — a boolean flag set exclusively by
+       ``sheet.markDiagnosticsDirty()`` (the single invalidation entry point).
+    2. ``sheet.diagnosticCacheKey`` — a tuple produced by the sheet itself
+       summarising visible columns, key columns, and rows.
+
+    Hooks, panels, and rules never decide staleness; they either call
+    ``markDiagnosticsDirty`` (on mutation) or ``ensure`` (on read).
     """
 
     def __init__(self):
@@ -160,49 +210,13 @@ class DiagnosticRunner:
         self._cache_keys = {}     # { sheet_id: cache_key_tuple }
         self._extra_aggrs = {}    # { sheet_id: tuple_of_aggrnames }
 
-    # -- cache key ----------------------------------------------------------
-
-    @staticmethod
-    def _make_cache_key(sheet):
-        """Return a tuple summarising the diagnostic inputs for *sheet*.
-
-        Components:
-        - sheet object identity
-        - visible column ids (order matters — display order affects panel)
-        - key column ids
-        - row identity (``id(row)`` for each row; changes when rows are
-          replaced, sorted, or filtered)
-        """
-        try:
-            visible_ids = tuple(id(c) for c in getattr(sheet, 'visibleCols', []))
-        except Exception:
-            visible_ids = ()
-        try:
-            key_ids = tuple(id(c) for c in getattr(sheet, 'keyCols', []))
-        except Exception:
-            key_ids = ()
-        try:
-            row_ids = tuple(id(r) for r in sheet.rows)
-        except Exception:
-            row_ids = ()
-        return (id(sheet), visible_ids, key_ids, row_ids)
-
     # -- lifecycle ----------------------------------------------------------
 
-    def invalidate(self, sheet):
-        """Drop cached results and recorded cache key for *sheet*.
-
-        Called by mutation hooks; never triggers execution.
-        """
-        key = id(sheet)
-        self._cache.pop(key, None)
-        self._target_map.pop(key, None)
-        self._cache_keys.pop(key, None)
-        self._extra_aggrs.pop(key, None)
-
     def is_stale(self, sheet, extra_aggrs=()):
-        """Return True if *sheet*'s cache key has changed or extra_aggrs differ."""
-        cur = self._make_cache_key(sheet)
+        """Return True if *sheet* is dirty or its cache key / aggrs changed."""
+        if getattr(sheet, '_diagnostics_dirty', True):
+            return True
+        cur = sheet.diagnosticCacheKey()
         stored = self._cache_keys.get(id(sheet))
         if stored is None or cur != stored:
             return True
@@ -210,14 +224,23 @@ class DiagnosticRunner:
             return True
         return False
 
+    def _drop(self, sheet):
+        """Clear cached results for *sheet* (internal; call ensure externally)."""
+        key = id(sheet)
+        self._cache.pop(key, None)
+        self._target_map.pop(key, None)
+        self._cache_keys.pop(key, None)
+        self._extra_aggrs.pop(key, None)
+
     def ensure(self, sheet, extra_aggrs=()):
         """Re-run rules if *sheet* is stale; otherwise no-op.
 
         This is the only public entry point that may trigger execution.
         """
         if self.is_stale(sheet, extra_aggrs):
-            self.invalidate(sheet)
+            self._drop(sheet)
             self._run(sheet, extra_aggrs)
+            sheet._diagnostics_dirty = False
 
     # -- execution (private; call ensure() from outside) -------------------
 
@@ -254,7 +277,7 @@ class DiagnosticRunner:
                     self._store(per_sheet, target_index, srccol, sentinel,
                                 DiagnosticResult(rule=sentinel, target=srccol, value=val))
 
-        self._cache_keys[sid] = self._make_cache_key(sheet)
+        self._cache_keys[sid] = sheet.diagnosticCacheKey()
         self._extra_aggrs[sid] = tuple(extra_aggrs)
 
     # -- query API ----------------------------------------------------------
@@ -296,12 +319,17 @@ class DiagnosticRunner:
 vd.diagnosticRunner = DiagnosticRunner()
 
 
-# -- invalidation hooks  (ONLY touch the runner — NEVER the views) ------------
+# -- invalidation hooks  (ONLY call sheet.markDiagnosticsDirty()) -------------
+#
+# Every hook below does exactly one thing: locate the owning sheet and invoke
+# its single invalidation entry point.  No hook touches the runner, the
+# panel, or any cached result directly.
 
 
 @TableSheet.after
 def reload(sheet):
-    vd.diagnosticRunner.invalidate(sheet)
+    if not isinstance(sheet, ExplodingMock) and hasattr(sheet, 'markDiagnosticsDirty'):
+        sheet.markDiagnosticsDirty()
 
 
 _orig_set_type = Column.type.fset
@@ -312,8 +340,8 @@ def _patched_type_setter(col, t):
     _orig_set_type(col, t)
     if col._type != old_type:
         sheet = getattr(col, 'sheet', None)
-        if sheet is not None and not isinstance(sheet, ExplodingMock):
-            vd.diagnosticRunner.invalidate(sheet)
+        if sheet is not None and not isinstance(sheet, ExplodingMock) and hasattr(sheet, 'markDiagnosticsDirty'):
+            sheet.markDiagnosticsDirty()
 
 
 Column.type = Column.type.setter(_patched_type_setter)
@@ -324,8 +352,8 @@ _orig_set_rows = BaseSheet.rows.fset
 
 def _patched_rows_setter(sheet, rows):
     _orig_set_rows(sheet, rows)
-    if not isinstance(sheet, ExplodingMock):
-        vd.diagnosticRunner.invalidate(sheet)
+    if not isinstance(sheet, ExplodingMock) and hasattr(sheet, 'markDiagnosticsDirty'):
+        sheet.markDiagnosticsDirty()
 
 
 BaseSheet.rows = BaseSheet.rows.setter(_patched_rows_setter)
@@ -341,8 +369,8 @@ try:
             new_hidden = col.hidden
             if old_hidden != new_hidden:
                 sheet = getattr(col, 'sheet', None)
-                if sheet is not None and not isinstance(sheet, ExplodingMock):
-                    vd.diagnosticRunner.invalidate(sheet)
+                if sheet is not None and not isinstance(sheet, ExplodingMock) and hasattr(sheet, 'markDiagnosticsDirty'):
+                    sheet.markDiagnosticsDirty()
 
         Column.setWidth = _patched_setWidth
 except Exception:
@@ -358,8 +386,8 @@ try:
         new_hidden = col.hidden
         if old_hidden != new_hidden:
             sheet = getattr(col, 'sheet', None)
-            if sheet is not None and not isinstance(sheet, ExplodingMock):
-                vd.diagnosticRunner.invalidate(sheet)
+            if sheet is not None and not isinstance(sheet, ExplodingMock) and hasattr(sheet, 'markDiagnosticsDirty'):
+                sheet.markDiagnosticsDirty()
 
     Column.width = Column.width.setter(_patched_width_setter)
 except Exception:
@@ -369,8 +397,8 @@ except Exception:
 @Column.after
 def hide(col, *args, **kwargs):
     sheet = getattr(col, 'sheet', None)
-    if sheet is not None and not isinstance(sheet, ExplodingMock):
-        vd.diagnosticRunner.invalidate(sheet)
+    if sheet is not None and not isinstance(sheet, ExplodingMock) and hasattr(sheet, 'markDiagnosticsDirty'):
+        sheet.markDiagnosticsDirty()
 
 
 try:
@@ -382,8 +410,8 @@ try:
             _orig_col_setattr(col, name, value)
             if int(old_keycol or 0) != int(value or 0):
                 sheet = getattr(col, 'sheet', None)
-                if sheet is not None and not isinstance(sheet, ExplodingMock):
-                    vd.diagnosticRunner.invalidate(sheet)
+                if sheet is not None and not isinstance(sheet, ExplodingMock) and hasattr(sheet, 'markDiagnosticsDirty'):
+                    sheet.markDiagnosticsDirty()
         else:
             _orig_col_setattr(col, name, value)
 
@@ -394,7 +422,8 @@ except Exception:
 
 @TableSheet.after
 def setKeys(sheet, cols):
-    vd.diagnosticRunner.invalidate(sheet)
+    if not isinstance(sheet, ExplodingMock) and hasattr(sheet, 'markDiagnosticsDirty'):
+        sheet.markDiagnosticsDirty()
 
 
 # =============================================================================
