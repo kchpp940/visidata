@@ -2,14 +2,20 @@ import json
 import re
 
 import visidata
-from visidata import VisiData, CommandLogBase, BaseSheet, Sheet, AttrDict, Progress
+from visidata import VisiData, CommandLogBase, BaseSheet, Sheet, AttrDict, Progress, Path
 
 VDX_VD_COLUMNS = ['sheet', 'col', 'row', 'longname', 'input', 'keystrokes', 'comment']
 
 
 @VisiData.api
 def open_vdx(vd, p):
-    return CommandLogSimple(p.base_stem, source=p, precious=True)
+    if not isinstance(p, Path):
+        p = Path(p)
+    snap = vd.read_snapshot(p, fmt='vdx')
+    has_manifest = (snap.get('sheets') or snap.get('global_options') or snap.get('macros'))
+    if has_manifest:
+        vd.load_snapshot(snap, apply_cmdlog=False)
+    return vd.cmdlog_sheet_from_snapshot(snap, p.base_stem, source=p)
 
 
 VDX_CONTEXT_COMMANDS = {'sheet', 'col', 'row'}
@@ -59,6 +65,8 @@ class CommandLogSimple(CommandLogBase, Sheet):
 
 @VisiData.api
 def save_vdx(vd, p, *vsheets):
+    if not isinstance(p, Path):
+        p = Path(p)
     snap = {
         'version': visidata.__version_info__,
         'cmdlog': [],

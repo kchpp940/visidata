@@ -374,6 +374,8 @@ def write_snapshot(vd, path, fmt, snap, **kwargs):
 
     Available formats: vds, vdj, vd, vdx, macro, manifest, delivery
     """
+    if not isinstance(path, Path):
+        path = Path(path)
     writer = _snapshot_writers.get(fmt)
     if writer is None:
         vd.fail(f'no snapshot writer for format `{fmt}`')
@@ -386,12 +388,10 @@ def read_snapshot(vd, path, fmt=None, **kwargs):
 
     If *fmt* is None, it is inferred from the file extension.
     """
+    if not isinstance(path, Path):
+        path = Path(path)
     if fmt is None:
-        if isinstance(path, Path):
-            fmt = path.ext
-        else:
-            ext = os.path.splitext(str(path))[1].lstrip('.').lower()
-            fmt = ext
+        fmt = path.ext
     reader = _snapshot_readers.get(fmt)
     if reader is None:
         vd.fail(f'no snapshot reader for format `{fmt}`')
@@ -454,14 +454,26 @@ def read_snapshot_vds(path, **kwargs):
 
 
 # ---------------------------------------------------------------------------
-# Format:  vdj   (JSONL command log)
+# Format:  vdj   (JSONL command log, optionally with embedded snapshot manifest)
 # ---------------------------------------------------------------------------
+
+VDJ_MANIFEST_MARKER = '#snapshot-manifest:'
+
 
 @register_snapshot_format('vdj')
 def write_snapshot_vdj(path, snap, encoding='utf-8', **kwargs):
     with Path(path).open(mode='w', encoding=encoding) as fp:
         fp.write("#!/usr/bin/env -S vd -p\n")
         fp.write(f"# {visidata.__version_info__}\n")
+        manifest_only = {k: v for k, v in snap.items()
+                         if k in (SNAPSHOT_VERSION_KEY, SNAPSHOT_ORDER_KEY,
+                                  SNAPSHOT_SHEETS_KEY, SNAPSHOT_GLOBAL_OPTIONS_KEY,
+                                  SNAPSHOT_MACROS_KEY)}
+        has_manifest = (manifest_only.get(SNAPSHOT_SHEETS_KEY)
+                        or manifest_only.get(SNAPSHOT_GLOBAL_OPTIONS_KEY)
+                        or manifest_only.get(SNAPSHOT_MACROS_KEY))
+        if has_manifest:
+            fp.write(VDJ_MANIFEST_MARKER + json.dumps(manifest_only, default=str) + '\n')
         for r in snap.get(SNAPSHOT_CMDLOG_KEY, []) or []:
             fp.write(json.dumps(r, default=str) + '\n')
 
@@ -469,28 +481,56 @@ def write_snapshot_vdj(path, snap, encoding='utf-8', **kwargs):
 @register_snapshot_format('vdj')
 def read_snapshot_vdj(path, **kwargs):
     rows = []
+    manifest = None
+    version = visidata.__version_info__
     with Path(path).open(encoding='utf-8') as fp:
         for line in fp:
-            if not line or line.startswith('#'):
+            if not line:
                 continue
-            rows.append(json.loads(line))
-    return {SNAPSHOT_VERSION_KEY: visidata.__version_info__,
+            stripped = line.rstrip('\n\r')
+            if stripped.startswith(VDJ_MANIFEST_MARKER):
+                manifest = json.loads(stripped[len(VDJ_MANIFEST_MARKER):])
+                continue
+            if stripped.startswith('#!/') or stripped.startswith('# '):
+                if stripped.startswith('# ') and not manifest:
+                    version = stripped[2:].strip() or version
+                continue
+            if stripped.startswith('#'):
+                continue
+            rows.append(json.loads(stripped))
+    if manifest:
+        snap = dict(manifest)
+        snap.setdefault(SNAPSHOT_VERSION_KEY, version)
+        snap[SNAPSHOT_CMDLOG_KEY] = rows
+        return snap
+    return {SNAPSHOT_VERSION_KEY: version,
             SNAPSHOT_CMDLOG_KEY: rows,
             SNAPSHOT_ORDER_KEY: [],
             SNAPSHOT_SHEETS_KEY: {}}
 
 
 # ---------------------------------------------------------------------------
-# Format:  vd    (TSV command log)
+# Format:  vd    (TSV command log, optionally with embedded snapshot manifest)
 # ---------------------------------------------------------------------------
 
 VD_VDJ_COLUMNS = ['sheet', 'col', 'row', 'longname', 'input', 'keystrokes', 'comment']
+VD_MANIFEST_MARKER = '#snapshot-manifest:'
 
 
 @register_snapshot_format('vd')
 def write_snapshot_vd(path, snap, encoding='utf-8', **kwargs):
     import csv
     with Path(path).open(mode='w', encoding=encoding, newline='') as fp:
+        fp.write(f"# {visidata.__version_info__}\n")
+        manifest_only = {k: v for k, v in snap.items()
+                         if k in (SNAPSHOT_VERSION_KEY, SNAPSHOT_ORDER_KEY,
+                                  SNAPSHOT_SHEETS_KEY, SNAPSHOT_GLOBAL_OPTIONS_KEY,
+                                  SNAPSHOT_MACROS_KEY)}
+        has_manifest = (manifest_only.get(SNAPSHOT_SHEETS_KEY)
+                        or manifest_only.get(SNAPSHOT_GLOBAL_OPTIONS_KEY)
+                        or manifest_only.get(SNAPSHOT_MACROS_KEY))
+        if has_manifest:
+            fp.write(VD_MANIFEST_MARKER + json.dumps(manifest_only, default=str) + '\n')
         writer = csv.writer(fp, delimiter='\t')
         writer.writerow(VD_VDJ_COLUMNS)
         for r in snap.get(SNAPSHOT_CMDLOG_KEY, []) or []:
@@ -501,21 +541,46 @@ def write_snapshot_vd(path, snap, encoding='utf-8', **kwargs):
 def read_snapshot_vd(path, **kwargs):
     import csv
     rows = []
+    manifest = None
+    version = visidata.__version_info__
+    header_row = None
     with Path(path).open(encoding='utf-8', newline='') as fp:
-        reader = csv.DictReader(fp, delimiter='\t')
-        for r in reader:
-            rows.append(r)
-    return {SNAPSHOT_VERSION_KEY: visidata.__version_info__,
+        for raw in fp:
+            line = raw.rstrip('\n\r')
+            if line.startswith(VD_MANIFEST_MARKER):
+                manifest = json.loads(line[len(VD_MANIFEST_MARKER):])
+                continue
+            if line.startswith('# '):
+                if not manifest:
+                    version = line[2:].strip() or version
+                continue
+            if line.startswith('#') or not line:
+                continue
+            header_row = line
+            break
+        if header_row is not None:
+            fieldnames = header_row.split('\t')
+            reader = csv.DictReader(fp, fieldnames=fieldnames, delimiter='\t')
+            for r in reader:
+                if r and any(v for v in r.values()):
+                    rows.append(r)
+    if manifest:
+        snap = dict(manifest)
+        snap.setdefault(SNAPSHOT_VERSION_KEY, version)
+        snap[SNAPSHOT_CMDLOG_KEY] = rows
+        return snap
+    return {SNAPSHOT_VERSION_KEY: version,
             SNAPSHOT_CMDLOG_KEY: rows,
             SNAPSHOT_ORDER_KEY: [],
             SNAPSHOT_SHEETS_KEY: {}}
 
 
 # ---------------------------------------------------------------------------
-# Format:  vdx   (minimal command log)
+# Format:  vdx   (minimal command log, optionally with embedded snapshot manifest)
 # ---------------------------------------------------------------------------
 
 VDX_CONTEXT_COMMANDS = {'sheet', 'col', 'row'}
+VDX_MANIFEST_MARKER = '#snapshot-manifest:'
 
 
 @register_snapshot_format('vdx')
@@ -523,6 +588,15 @@ def write_snapshot_vdx(path, snap, encoding='utf-8', **kwargs):
     with Path(path).open(mode='w', encoding=encoding) as fp:
         fp.write("#!/usr/bin/env -S vd -p\n")
         fp.write(f"# {visidata.__version_info__}\n")
+        manifest_only = {k: v for k, v in snap.items()
+                         if k in (SNAPSHOT_VERSION_KEY, SNAPSHOT_ORDER_KEY,
+                                  SNAPSHOT_SHEETS_KEY, SNAPSHOT_GLOBAL_OPTIONS_KEY,
+                                  SNAPSHOT_MACROS_KEY)}
+        has_manifest = (manifest_only.get(SNAPSHOT_SHEETS_KEY)
+                        or manifest_only.get(SNAPSHOT_GLOBAL_OPTIONS_KEY)
+                        or manifest_only.get(SNAPSHOT_MACROS_KEY))
+        if has_manifest:
+            fp.write(VDX_MANIFEST_MARKER + json.dumps(manifest_only, default=str) + '\n')
         prevrow = None
         for r in snap.get(SNAPSHOT_CMDLOG_KEY, []) or []:
             if prevrow is not None and r.get('sheet') and prevrow.get('sheet') != r.get('sheet'):
@@ -541,11 +615,24 @@ def write_snapshot_vdx(path, snap, encoding='utf-8', **kwargs):
 @register_snapshot_format('vdx')
 def read_snapshot_vdx(path, **kwargs):
     rows = []
+    manifest = None
+    version = visidata.__version_info__
     context = {}
     with Path(path).open(encoding='utf-8') as fp:
         for line in fp:
             line = line.rstrip('\n\r')
-            if not line or line[0] == '#':
+            if not line:
+                continue
+            if line.startswith(VDX_MANIFEST_MARKER):
+                manifest = json.loads(line[len(VDX_MANIFEST_MARKER):])
+                continue
+            if line.startswith('#!/'):
+                continue
+            if line.startswith('# '):
+                if not manifest:
+                    version = line[2:].strip() or version
+                continue
+            if line[0] == '#':
                 continue
             if line[0] == '{':
                 rows.append(json.loads(line))
@@ -576,7 +663,12 @@ def read_snapshot_vdx(path, **kwargs):
                 d.update(context)
                 rows.append(d)
                 context = {}
-    return {SNAPSHOT_VERSION_KEY: visidata.__version_info__,
+    if manifest:
+        snap = dict(manifest)
+        snap.setdefault(SNAPSHOT_VERSION_KEY, version)
+        snap[SNAPSHOT_CMDLOG_KEY] = rows
+        return snap
+    return {SNAPSHOT_VERSION_KEY: version,
             SNAPSHOT_CMDLOG_KEY: rows,
             SNAPSHOT_ORDER_KEY: [],
             SNAPSHOT_SHEETS_KEY: {}}
@@ -932,7 +1024,7 @@ def _read_delivery_dir(pkgdir):
 
 
 # ---------------------------------------------------------------------------
-# Convenience helpers
+# Convenience helpers and unified open_* entry points
 # ---------------------------------------------------------------------------
 
 @VisiData.api
@@ -945,11 +1037,99 @@ def snapshot_from_json(vd, text):
     return json.loads(text)
 
 
+def _cmdlog_sheet_from_snapshot(snap, sheet_cls, name, source=None, precious=True):
+    """Create a CommandLog-style sheet from a snapshot's cmdlog rows."""
+    from visidata import AttrDict
+    rows = [AttrDict(r) for r in (snap.get(SNAPSHOT_CMDLOG_KEY, []) or [])]
+    vs = sheet_cls(name, source=source, rows=rows, precious=precious)
+    return vs
+
+
 @VisiData.api
 def open_snapshot(vd, path, fmt=None, **kwargs):
     """Read a snapshot from *path* and restore it into the active workspace."""
+    if not isinstance(path, Path):
+        path = Path(path)
     snap = vd.read_snapshot(path, fmt=fmt, **kwargs)
     return vd.load_snapshot(snap)
+
+
+@VisiData.api
+def open_manifest(vd, p):
+    """Open a manifest.json (or any snapshot JSON) as a workspace, restoring sheets/options/macros."""
+    if not isinstance(p, Path):
+        p = Path(p)
+    snap = vd.read_snapshot(p, fmt='manifest')
+    vd.load_snapshot(snap)
+    from visidata import PyobjSheet
+    return PyobjSheet(p.base_stem, source=snap)
+
+
+@VisiData.api
+def open_delivery(vd, p):
+    """Open a delivery package (directory or .zip): unpack and restore full workspace."""
+    if not isinstance(p, Path):
+        p = Path(p)
+    snap = vd.read_snapshot(p, fmt='delivery')
+    vd.load_snapshot(snap)
+    from visidata import SheetsSheet
+    return SheetsSheet(p.base_stem, rows=list(vd.stackedSheets))
+
+
+@VisiData.api
+def cmdlog_sheet_from_snapshot(vd, snap, name, source=None):
+    """Build a CommandLogJsonl sheet from the cmdlog rows embedded in *snap*."""
+    from visidata.cmdlog import CommandLogJsonl
+    return _cmdlog_sheet_from_snapshot(snap, CommandLogJsonl, name, source=source)
+
+
+# ---------------------------------------------------------------------------
+# Auto-detection hooks (for vd.guessFiletype / openPath dispatch)
+# ---------------------------------------------------------------------------
+
+@VisiData.api
+def guess_snapshot(vd, p):
+    """Detect snapshot/manifest/delivery formats by content."""
+    try:
+        if not p.exists():
+            return None
+
+        # 1. Directory with manifest.json -> delivery package
+        if p.is_dir():
+            mf = p / 'manifest.json'
+            if mf.exists() and mf.is_file():
+                return dict(filetype='delivery', _likelihood=10)
+
+        # 2. .json file that looks like a snapshot manifest
+        if p.ext == 'json' and p.is_file():
+            try:
+                with p.open(encoding='utf-8') as fp:
+                    head = fp.read(4096)
+                    if any(k in head for k in ('"sheets"', '"order"', '"global_options"', '"macros"')):
+                        return dict(filetype='manifest', _likelihood=8)
+            except Exception:
+                pass
+
+        # 3. .zip / .vdz file that contains manifest.json -> delivery package
+        if p.ext in ('zip', 'vdz') and p.is_file():
+            import zipfile
+            try:
+                with zipfile.ZipFile(str(p), 'r') as zfp:
+                    if 'manifest.json' in zfp.namelist():
+                        return dict(filetype='delivery', _likelihood=9)
+            except Exception:
+                pass
+
+    except Exception:
+        pass
+    return None
+
+
+# register .vdz as a shorthand for delivery zip
+@VisiData.api
+def open_vdz(vd, p):
+    'Open a .vdz (VisiData delivery zip) package and restore the workspace.'
+    return vd.open_delivery(p)
 
 
 vd.addGlobals({
@@ -958,10 +1138,15 @@ vd.addGlobals({
     'write_snapshot': write_snapshot,
     'read_snapshot': read_snapshot,
     'open_snapshot': open_snapshot,
+    'open_manifest': open_manifest,
+    'open_delivery': open_delivery,
+    'open_vdz': open_vdz,
+    'cmdlog_sheet_from_snapshot': cmdlog_sheet_from_snapshot,
     'snapshot_to_json': snapshot_to_json,
     'snapshot_from_json': snapshot_from_json,
     '_collect_derived_sheets': _collect_derived_sheets,
     '_sheet_snapshot_columns': _sheet_snapshot_columns,
     '_restore_columns': _restore_columns,
     'register_snapshot_format': register_snapshot_format,
+    'guess_snapshot': guess_snapshot,
 })

@@ -31,17 +31,44 @@ def queueCommand(vd, longname, input=None, sheet=None, col=None, row=None):
 
 @VisiData.api
 def open_vd(vd, p):
-    return CommandLog(p.base_stem, source=p, precious=True)
+    if not isinstance(p, Path):
+        p = Path(p)
+    snap = vd.read_snapshot(p, fmt='vd')
+    has_manifest = (snap.get('sheets') or snap.get('global_options') or snap.get('macros'))
+    if has_manifest:
+        vd.load_snapshot(snap, apply_cmdlog=False)
+    return vd.cmdlog_sheet_from_snapshot(snap, p.base_stem, source=p)
+
 
 @VisiData.api
 def open_vdj(vd, p):
-    return CommandLogJsonl(p.base_stem, source=p, precious=True)
+    if not isinstance(p, Path):
+        p = Path(p)
+    snap = vd.read_snapshot(p, fmt='vdj')
+    has_manifest = (snap.get('sheets') or snap.get('global_options') or snap.get('macros'))
+    if has_manifest:
+        vd.load_snapshot(snap, apply_cmdlog=False)
+    return vd.cmdlog_sheet_from_snapshot(snap, p.base_stem, source=p)
 
-VisiData.save_vd = VisiData.save_tsv
+
+@VisiData.api
+def save_vd(vd, p, *vsheets):
+    if not isinstance(p, Path):
+        p = Path(p)
+    snap = {
+        'version': visidata.__version_info__,
+        'cmdlog': [],
+    }
+    for vs in vsheets:
+        for r in vs.rows:
+            snap['cmdlog'].append({k: getattr(r, k, '') for k in ('sheet', 'col', 'row', 'longname', 'input', 'keystrokes', 'comment')})
+    vd.write_snapshot(p, 'vd', snap, encoding=vsheets[0].options.save_encoding if vsheets else 'utf-8')
 
 
 @VisiData.api
 def save_vdj(vd, p, *vsheets):
+    if not isinstance(p, Path):
+        p = Path(p)
     snap = {
         'version': visidata.__version_info__,
         'cmdlog': [],

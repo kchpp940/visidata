@@ -77,6 +77,8 @@ def macrosheet(vd):
 
 @VisiData.api
 def loadMacro(vd, p:Path):
+    if not isinstance(p, Path):
+        p = Path(p)
     if p.exists():
         snap = vd.read_snapshot(p, fmt='macro', binding=p.stem)
         if snap.get('macros'):

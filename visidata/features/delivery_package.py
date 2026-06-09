@@ -26,6 +26,8 @@ def exportDeliveryPackage(vd, path, scope='current', data_format='vds'):
     *data_format*
         Extension for the per-sheet data files (``vds``, ``tsv``, ``jsonl``, …).
     """
+    if not isinstance(path, Path):
+        path = Path(path)
     snap = vd.generate_snapshot(scope=scope, include_cmdlog=True, include_macros=True, include_data=False)
 
     data_sheets = {}

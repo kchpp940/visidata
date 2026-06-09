@@ -5,6 +5,8 @@ from visidata import vd, TableSheet, ItemColumn
 
 @pytest.fixture(autouse=True)
 def reset_vd():
+    import visidata.snapshot
+    import visidata.features.delivery_package
     vd.resetVisiData()
     yield
     vd.resetVisiData()
@@ -136,3 +138,141 @@ def test_load_snapshot_macros():
     vd.resetVisiData()
     vd.load_snapshot(snap, apply_cmdlog=False, apply_macros=True)
     assert 'test-macro' in vd.macrobindings
+
+
+def test_vdj_embedded_manifest_roundtrip(tmp_path):
+    vs = TableSheet('people')
+    vs.addColumn(ItemColumn('name', 0))
+    vs.addColumn(ItemColumn('age', 1))
+    vs.columns[0].type = str
+    vs.columns[1].type = int
+    vs.rows = [('Alice', 30), ('Bob', 25)]
+    vd.push(vs)
+    vd.sync(vs.ensureLoaded())
+
+    snap = vd.generate_snapshot(scope='current', include_cmdlog=True, include_macros=True, include_data=True)
+    cmdlog_rows = [{'sheet': 'people', 'col': '', 'row': '', 'longname': 'open-file',
+                    'input': '', 'keystrokes': '', 'comment': ''}]
+    snap['cmdlog'] = cmdlog_rows
+
+    p = tmp_path / 'workspace.vdj'
+    vd.write_snapshot(str(p), 'vdj', snap)
+
+    text = p.read_text()
+    assert '#snapshot-manifest:' in text
+    assert '"sheets"' in text
+
+    vd.resetVisiData()
+    read_back = vd.read_snapshot(str(p), fmt='vdj')
+    assert 'people' in read_back['sheets']
+    assert read_back['sheets']['people']['columns'][0]['typestr'] == 'str'
+    assert read_back['cmdlog'][0]['longname'] == 'open-file'
+
+
+def test_vdx_embedded_manifest_roundtrip(tmp_path):
+    vs = TableSheet('people')
+    vs.addColumn(ItemColumn('name', 0))
+    vs.columns[0].type = str
+    vs.rows = [('Alice',)]
+    vd.push(vs)
+    vd.sync(vs.ensureLoaded())
+
+    snap = vd.generate_snapshot(scope='current', include_cmdlog=True, include_macros=True, include_data=True)
+    snap['cmdlog'] = [{'sheet': 'people', 'col': '', 'row': '', 'longname': 'open-file',
+                       'input': '', 'keystrokes': '', 'comment': ''}]
+
+    p = tmp_path / 'workspace.vdx'
+    vd.write_snapshot(str(p), 'vdx', snap)
+
+    text = p.read_text()
+    assert '#snapshot-manifest:' in text
+
+    vd.resetVisiData()
+    read_back = vd.read_snapshot(str(p), fmt='vdx')
+    assert 'people' in read_back['sheets']
+    assert read_back['cmdlog'][0]['longname'] == 'open-file'
+
+
+def test_vds_roundtrip_preserves_types(tmp_path):
+    vs = TableSheet('nums')
+    vs.addColumn(ItemColumn('val', 0))
+    vs.columns[0].type = int
+    vs.rows = [(42,), (99,)]
+    vd.push(vs)
+    vd.sync(vs.ensureLoaded())
+
+    p = tmp_path / 'data.vds'
+    vd.save_vds(str(p), vs)
+
+    vd.resetVisiData()
+    idx = vd.open_vds(str(p))
+    vd.sync(idx.ensureLoaded())
+    sheet = idx.rows[0]
+    vd.sync(sheet.ensureLoaded())
+    assert [c.name for c in sheet.columns] == ['val']
+    assert sheet.columns[0].type == int
+
+
+def test_delivery_vdz_roundtrip(tmp_path):
+    vs = TableSheet('fruits')
+    vs.addColumn(ItemColumn('name', 0))
+    vs.rows = [('apple',), ('banana',)]
+    vd.push(vs)
+    vd.sync(vs.ensureLoaded())
+
+    p = tmp_path / 'pkg.vdz'
+    vd.write_snapshot(str(p), 'delivery',
+                       vd.generate_snapshot(scope='current', include_cmdlog=True, include_macros=False),
+                       data_format='vds', data_sheets={'fruits': vs})
+
+    assert p.exists()
+    vd.resetVisiData()
+    restored = vd.open_vdz(str(p))
+    fruit_names = {s.name for s in restored.rows}
+    assert 'fruits' in fruit_names
+
+
+def test_guess_snapshot_detects_delivery_directory(tmp_path):
+    from visidata import Path
+    pkgdir = tmp_path / 'mypkg'
+    pkgdir.mkdir()
+    (pkgdir / 'manifest.json').write_text('{"sheets": {}, "order": []}')
+    (pkgdir / 'data').mkdir()
+
+    guess = vd.guess_snapshot(Path(str(pkgdir)))
+    assert guess is not None
+    assert guess['filetype'] == 'delivery'
+    assert guess['_likelihood'] == 10
+
+
+def test_guess_snapshot_detects_vdz(tmp_path):
+    from visidata import Path
+    vs = TableSheet('x')
+    vs.rows = [(1,)]
+    vd.push(vs)
+
+    p = tmp_path / 'test.vdz'
+    vd.write_snapshot(str(p), 'delivery',
+                       vd.generate_snapshot(scope='current'),
+                       data_format='vds', data_sheets={'x': vs})
+
+    guess = vd.guess_snapshot(Path(str(p)))
+    assert guess is not None
+    assert guess['filetype'] == 'delivery'
+
+
+def test_write_snapshot_dispatch_all_formats(tmp_path):
+    snap = {
+        'version': 'test',
+        'order': [],
+        'sheets': {},
+        'cmdlog': [{'sheet': '', 'col': '', 'row': '', 'longname': 'noop',
+                    'input': '', 'keystrokes': '', 'comment': ''}],
+    }
+    for fmt in ('vd', 'vdj', 'vdx'):
+        p = tmp_path / f'out.{fmt}'
+        vd.write_snapshot(str(p), fmt, snap)
+        assert p.exists()
+        back = vd.read_snapshot(str(p), fmt=fmt)
+        assert back['cmdlog'][0]['longname'] == 'noop'
+
