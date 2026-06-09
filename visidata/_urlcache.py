@@ -1,7 +1,6 @@
 import os
 import os.path
 import time
-import hashlib
 
 from visidata import vd, VisiData, Path, modtime
 
@@ -33,23 +32,6 @@ def urlcache(vd, url, days=1, text=True, headers={}):
         else:
             with p.open_bytes(mode='w') as fpout:
                 fpout.write(ret)
-
-    try:
-        store = vd.cacheManifest
-        urlhash = hashlib.md5(url.encode('utf-8')).hexdigest()[:16]
-        store.add({
-            '_id': f'cache_{urlhash}',
-            '_scope': 'global',
-            'url': url,
-            'local_path': str(p),
-            'cached_at': time.time(),
-            'expires_at': time.time() + days*24*60*60,
-            'text': text,
-            'size': len(ret),
-        })
-        store.save()
-    except Exception:
-        pass
 
     return p
 

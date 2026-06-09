@@ -1,5 +1,28 @@
 # Release process for the next `stable` version
 
+## Preflight Checks (Automated)
+
+Before starting the manual release steps, run the automated consistency checks:
+
+```bash
+make preflight
+# or directly:
+python3 dev/preflight_check.py
+```
+
+This validates:
+- **version**: version numbers in `setup.py`, `visidata/__init__.py`, `visidata/main.py`, and `README.md` all match
+- **imports**: all submodules under `features/`, `loaders/`, `themes/` have valid Python syntax and are listed in `setup.py` packages
+- **cli**: `console_scripts` entry points in `setup.py` resolve to real callable functions; `bin/vd` and `visidata/__main__.py` reference the same entry
+- **docs**: manpage artifacts (`vd.1`, `visidata.1`, `vd.txt`, `docs/man.md`) exist (run `make man` to regenerate)
+- **formats**: every internal format documented in `docs/internal_formats.md` has a corresponding `open_<ext>()` loader function in the codebase
+- **metadata**: all files referenced by `MANIFEST.in`, `setup.py package_data`, and `setup.py data_files` actually exist on disk
+- **changelog**: `CHANGELOG.md` has a heading for the current version
+
+To list individual checks: `make preflight-checks`
+
+---
+
 1. Merge `stable` to `develop` (if necessary)
 
 2. Verify that documentation/docstrings are up-to-date on features and functionality

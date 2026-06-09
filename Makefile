@@ -3,7 +3,7 @@
        test test-all test-vgit test-vdsql \
        build man zsh-completion docker \
        setup-hooks setup-vscode lint \
-       diff-test clean
+       diff-test clean preflight preflight-checks
 
 help:
 	@echo "Install:"
@@ -19,6 +19,9 @@ help:
 	@echo "  make man               generate man pages (requires soelim, preconv, aha)"
 	@echo "  make zsh-completion    generate zsh completion script"
 	@echo "  make docker            build docker images"
+	@echo ""
+	@echo "Release:"
+	@echo "  make preflight         run preflight release checks (version, imports, CLI, docs, formats, metadata, changelog)"
 	@echo ""
 	@echo "Setup:"
 	@echo "  make setup-hooks       configure git to use dev/hooks"
@@ -85,3 +88,11 @@ diff-test:
 clean:
 	rm -f visidata/man/vd.1 visidata/man/visidata.1 visidata/man/vd.txt
 	rm -f docs/man.md
+
+# Release Engineering
+
+preflight:
+	python3 dev/preflight_check.py
+
+preflight-checks:
+	python3 dev/preflight_check.py --list
