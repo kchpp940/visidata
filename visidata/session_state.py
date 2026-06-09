@@ -429,26 +429,21 @@ VisiData.init('_state_stores', dict)       # legacy alias, kept for compat
 
 @VisiData.api
 def ensureAllDescriptorsRegistered(vd):
-    '''Force every standard lazy_property descriptor / store to be evaluated
-    and registered.  Safe to call multiple times.
+    '''Force every authoritative StateDescriptor to be evaluated and registered.
+    Safe to call multiple times.
 
-    All public orchestration APIs (``describeAllState``, ``restoreAllState``,
-    ``persistAllState``, and ``saveSnapshot`` / ``loadSnapshot``) call this
-    internally so that callers do not have to worry about lazy-property
-    timing.
+    Backing stores (``optionsStore``, ``profilesStore``, etc.) are pure
+    storage and are deliberately NOT registered; they are owned by exactly
+    one descriptor.
     '''
+    # Authoritative descriptors (each owns exactly one backing store).
     _ = vd.optionsState
     _ = vd.profilesState
     _ = vd.cmdlogState
-    _ = vd.optionsStore
-    _ = vd.profilesStore
-    _ = vd.cmdlogStore
-    _ = vd.cacheManifest
-    _ = vd.graphStateStore
-    # These use StoredList (not lazy_property) but are assigned at module
-    # import time in macros.py, canvas.py, input_history.py.  Accessing them
-    # here is a no-op in normal operation but guards against import-order
-    # surprises in tests and scripts.
+    _ = vd.cacheState
+    _ = vd.graphState
+    # StoredList-backed descriptors (macros, selections, input_history) are
+    # created in their respective modules and self-register on construction.
     try:
         vd.macros.register()
     except Exception:
@@ -864,35 +859,154 @@ def profilesState(vd):
 
 
 # ---------------------------------------------------------------------------
-# Standard stores (wired through the descriptor registry)
+# Standard backing stores (pure storage; do NOT register themselves).
+# Each store is owned by exactly one authoritative StateDescriptor which
+# handles describe / restore / persist / get_state / set_state.
 # ---------------------------------------------------------------------------
 
 @VisiData.lazy_property
 def optionsStore(vd):
-    store = StateStore(name='options', phase=StatePhase.OPTIONS)
-    store.register()
-    return store
+    '''Backing storage for option values.  Owned by OptionsState.'''
+    return StateStore(name='options', phase=StatePhase.OPTIONS)
 
 
 @VisiData.lazy_property
 def profilesStore(vd):
-    store = StateStore(name='profiles', phase=StatePhase.PROFILES)
-    store.register()
-    return store
+    '''Backing storage for cProfile stats.  Owned by ProfileState.'''
+    return StateStore(name='profiles', phase=StatePhase.PROFILES)
 
 
 @VisiData.lazy_property
-def cacheManifest(vd):
-    store = StateStore(name='cache_manifest', phase=StatePhase.CACHE)
-    store.register()
-    return store
+def cmdlogStore(vd):
+    '''Backing storage for command-log rows.  Owned by CmdlogState.'''
+    return StateStore(name='cmdlog', phase=StatePhase.LAYOUT)
+
+
+@VisiData.lazy_property
+def cacheManifestStore(vd):
+    '''Backing storage for URL cache entries.  Owned by CacheState.'''
+    return StateStore(name='cache_manifest', phase=StatePhase.CACHE)
 
 
 @VisiData.lazy_property
 def graphStateStore(vd):
-    store = StateStore(name='graph_state', phase=StatePhase.GRAPH)
-    store.register()
-    return store
+    '''Backing storage for graph view state.  Owned by GraphState.'''
+    return StateStore(name='graph_state', phase=StatePhase.GRAPH)
+
+
+# ---------------------------------------------------------------------------
+# CacheState -- URL cache manifest as a StateDescriptor
+# ---------------------------------------------------------------------------
+
+class CacheState(StateDescriptor):
+    '''StateDescriptor for the URL cache manifest.
+
+    Persists metadata about every file cached via ``vd.urlcache``: the
+    original URL, local file path, cache timestamp, expiration, size and
+    text/binary flag.  The actual cached file contents are stored on disk
+    separately; this descriptor only tracks the index.
+    '''
+
+    name = 'cache_manifest'
+    phase = StatePhase.CACHE
+    kind = 'cache'
+
+    def describe(self) -> dict:
+        store = vd.cacheManifestStore
+        return {
+            'name': self.name,
+            'phase': self.phase,
+            'phase_name': StatePhase.phase_name(self.phase),
+            'kind': self.kind,
+            'store_path': str(store.path) if store.path else None,
+            'store_records': len(store.all()),
+        }
+
+    def restore(self) -> None:
+        vd.cacheManifestStore.restore()
+
+    def persist(self) -> None:
+        vd.cacheManifestStore.save()
+
+    def get_state(self):
+        return vd.cacheManifestStore.get_state()
+
+    def set_state(self, state) -> None:
+        vd.cacheManifestStore.set_state(state)
+
+
+# legacy name alias (vd.cacheManifest was the old store handle)
+@VisiData.lazy_property
+def cacheManifest(vd):
+    '''Backward-compatible alias for ``vd.cacheManifestStore``.
+
+    Deprecated -- code should prefer to go through :class:`CacheState` or
+    call ``vd.cacheManifestStore`` directly when raw store access is needed.
+    '''
+    return vd.cacheManifestStore
+
+
+@VisiData.lazy_property
+def cacheState(vd):
+    desc = CacheState()
+    desc.register()
+    return desc
+
+
+# ---------------------------------------------------------------------------
+# GraphState -- graph view state (reflines, viewport) as a StateDescriptor
+# ---------------------------------------------------------------------------
+
+class GraphState(StateDescriptor):
+    '''StateDescriptor for per-sheet graph view state.
+
+    Persists ``reflines_x``, ``reflines_y``, and the zoomed viewport
+    bounding box for every GraphSheet.  Individual GraphSheet instances
+    call ``saveGraphState`` / ``restoreGraphState`` against the backing
+    store; this descriptor provides the unified lifecycle glue.
+    '''
+
+    name = 'graph_state'
+    phase = StatePhase.GRAPH
+    kind = 'graph'
+
+    def describe(self) -> dict:
+        store = vd.graphStateStore
+        return {
+            'name': self.name,
+            'phase': self.phase,
+            'phase_name': StatePhase.phase_name(self.phase),
+            'kind': self.kind,
+            'store_path': str(store.path) if store.path else None,
+            'store_records': len(store.all()),
+        }
+
+    def restore(self) -> None:
+        vd.graphStateStore.restore()
+
+    def persist(self) -> None:
+        # Give every live GraphSheet a chance to snapshot its current state.
+        try:
+            for vs in vd.sheets:
+                save_fn = getattr(vs, 'saveGraphState', None)
+                if callable(save_fn):
+                    vd.callNoExceptions(save_fn)
+        except Exception:
+            pass
+        vd.graphStateStore.save()
+
+    def get_state(self):
+        return vd.graphStateStore.get_state()
+
+    def set_state(self, state) -> None:
+        vd.graphStateStore.set_state(state)
+
+
+@VisiData.lazy_property
+def graphState(vd):
+    desc = GraphState()
+    desc.register()
+    return desc
 
 
 # ---------------------------------------------------------------------------
@@ -903,13 +1017,14 @@ def graphStateStore(vd):
 @asyncthread
 def run(vd, *args, **kwargs):
     '''Restore every registered StateDescriptor on startup, in phase order.'''
+    # Evaluate the authoritative descriptors (and only the authoritative
+    # descriptors).  Their backing stores are created as a side effect and
+    # are NOT registered separately.
     vd.optionsState
     vd.profilesState
     vd.cmdlogState
-    vd.optionsStore
-    vd.profilesStore
-    vd.cacheManifest
-    vd.graphStateStore
+    vd.cacheState
+    vd.graphState
     vd.restoreAllState()
 
 
@@ -923,6 +1038,8 @@ VisiData.StatePhase = StatePhase
 VisiData.OptionsState = OptionsState
 VisiData.CmdlogState = CmdlogState
 VisiData.ProfileState = ProfileState
+VisiData.CacheState = CacheState
+VisiData.GraphState = GraphState
 
 vd.addGlobals(
     StateDescriptor=StateDescriptor,
@@ -931,4 +1048,6 @@ vd.addGlobals(
     OptionsState=OptionsState,
     CmdlogState=CmdlogState,
     ProfileState=ProfileState,
+    CacheState=CacheState,
+    GraphState=GraphState,
 )
