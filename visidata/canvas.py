@@ -692,21 +692,64 @@ class Canvas(BrushSelectorMixin, Plotter):
         self.left_margin = self.leftMarginPixels
         super().__init__(*names, **kwargs)
 
-        self.canvasBox = None   # bounding box of entire canvas, in canvas units
-        self.visibleBox = None  # bounding box of visible canvas, in canvas units
         self.cursorBox = None   # bounding box of cursor, in canvas units
-
-        self.aspectRatio = 0.0
-        self.xzoomlevel = 1.0
-        self.yzoomlevel = 1.0
         self.needsRefresh = False
 
+        self._coord = CoordinateTransformer()  # screen/data coordinate conversion
         self.plotData = PlotDataset()  # chart data model with stable row identity
         self.gridlabels = []  # list of (grid_x, grid_y, label, fgcolornum, row)
 
         self.legends = OrderedDict()   # txt: attr  (visible legends only)
         self.plotAttrs = {}   # key: attr  (all keys, for speed)
         self.reset()
+
+    @property
+    def canvasBox(self):
+        return self._coord.canvasBox
+
+    @canvasBox.setter
+    def canvasBox(self, value):
+        self._coord.canvasBox = value
+
+    @property
+    def visibleBox(self):
+        return self._coord.visibleBox
+
+    @visibleBox.setter
+    def visibleBox(self, value):
+        self._coord.visibleBox = value
+
+    @property
+    def plotviewBox(self):
+        return self._coord.plotviewBox
+
+    @plotviewBox.setter
+    def plotviewBox(self, value):
+        self._coord.plotviewBox = value
+
+    @property
+    def aspectRatio(self):
+        return self._coord.aspectRatio
+
+    @aspectRatio.setter
+    def aspectRatio(self, value):
+        self._coord.aspectRatio = value
+
+    @property
+    def xzoomlevel(self):
+        return self._coord.xzoomlevel
+
+    @xzoomlevel.setter
+    def xzoomlevel(self, value):
+        self._coord.xzoomlevel = value
+
+    @property
+    def yzoomlevel(self):
+        return self._coord.yzoomlevel
+
+    @yzoomlevel.setter
+    def yzoomlevel(self, value):
+        self._coord.yzoomlevel = value
 
     @property
     def polylines(self):
@@ -895,18 +938,20 @@ class Canvas(BrushSelectorMixin, Plotter):
             return None
 
     def point(self, x, y, attr:"str|ColorAttr=''", row=None):
-        self.polylines.append(([(x, y)], attr, row))
+        'Add a point plot element.  Uses PlotDataset for stable row identity.'
+        self.plotData.append([(x, y)], attr, row)
 
     def line(self, x1, y1, x2, y2, attr:"str|ColorAttr=''", row=None):
-        self.polylines.append(([(x1, y1), (x2, y2)], attr, row))
+        'Add a line segment plot element.  Uses PlotDataset for stable row identity.'
+        self.plotData.append([(x1, y1), (x2, y2)], attr, row)
 
     def polyline(self, vertexes, attr:"str|ColorAttr=''", row=None):
-        'adds lines for (x,y) vertexes of a polygon'
-        self.polylines.append((vertexes, attr, row))
+        'Add a polyline (sequence of connected line segments).  Uses PlotDataset for stable row identity.'
+        self.plotData.append(vertexes, attr, row)
 
     def polygon(self, vertexes, attr:"str|ColorAttr=''", row=None):
-        'adds lines for (x,y) vertexes of a polygon'
-        self.polylines.append((vertexes + [vertexes[0]], attr, row))
+        'Add a closed polygon (line loop).  Uses PlotDataset for stable row identity.'
+        self.plotData.append(vertexes + [vertexes[0]], attr, row)
 
     def qcurve(self, vertexes, attr:"str|ColorAttr=''", row=None):
         'Draw quadratic curve from vertexes[0] to vertexes[2] with control point at vertexes[1]'
@@ -1014,21 +1059,11 @@ class Canvas(BrushSelectorMixin, Plotter):
 
     @property
     def xScaler(self):
-        xratio = self.plotviewBox.w/(self.canvasBox.w*self.xzoomlevel)
-        if self.aspectRatio:
-            yratio = self.plotviewBox.h/(self.canvasBox.h*self.yzoomlevel)
-            return self.aspectRatio*min(xratio, yratio)
-        else:
-            return xratio
+        return self._coord.xScaler
 
     @property
     def yScaler(self):
-        yratio = self.plotviewBox.h/(self.canvasBox.h*self.yzoomlevel)
-        if self.aspectRatio:
-            xratio = self.plotviewBox.w/(self.canvasBox.w*self.xzoomlevel)
-            return min(xratio, yratio)
-        else:
-            return yratio
+        return self._coord.yScaler
 
     def calcVisibleBoxWidth(self):
         w = self.canvasBox.w * self.xzoomlevel
@@ -1056,29 +1091,29 @@ class Canvas(BrushSelectorMixin, Plotter):
         else:
             return h
 
-    def scaleX(self, canvasX) -> int:
-        'returns a plotter x coordinate'
-        return self.plotviewBox.xmin+round((canvasX-self.visibleBox.xmin)*self.xScaler)
+    def scaleX(self, dataX) -> int:
+        'Convert data x coordinate to plotter pixel x coordinate.  Delegates to CoordinateTransformer.'
+        return self._coord.scaleX(dataX)
 
-    def scaleY(self, canvasY) -> int:
-        'returns a plotter y coordinate'
-        return self.plotviewBox.ymin+round((canvasY-self.visibleBox.ymin)*self.yScaler)
+    def scaleY(self, dataY) -> int:
+        'Convert data y coordinate to plotter pixel y coordinate.  Delegates to CoordinateTransformer.'
+        return self._coord.scaleY(dataY)
 
     def unscaleX(self, plotterX):
-        'performs the inverse of scaleX, returns a canvas x coordinate'
-        return (plotterX-self.plotviewBox.xmin)/self.xScaler + self.visibleBox.xmin
+        'Convert plotter pixel x coordinate to data x coordinate.  Delegates to CoordinateTransformer.'
+        return self._coord.unscaleX(plotterX)
 
     def unscaleY(self, plotterY):
-        'performs the inverse of scaleY, returns a canvas y coordinate'
-        return (plotterY-self.plotviewBox.ymin)/self.yScaler + self.visibleBox.ymin
+        'Convert plotter pixel y coordinate to data y coordinate.  Delegates to CoordinateTransformer.'
+        return self._coord.unscaleY(plotterY)
 
-    def canvasW(self, plotter_width):
-        'plotter X units to canvas units'
-        return plotter_width/self.xScaler
+    def canvasW(self, plotterWidth):
+        'Convert plotter pixel width to data coordinate width.  Delegates to CoordinateTransformer.'
+        return self._coord.canvasW(plotterWidth)
 
-    def canvasH(self, plotter_height):
-        'plotter Y units to canvas units'
-        return plotter_height/self.yScaler
+    def canvasH(self, plotterHeight):
+        'Convert plotter pixel height to data coordinate height.  Delegates to CoordinateTransformer.'
+        return self._coord.canvasH(plotterHeight)
 
     def refresh(self):
         'triggers render() on next draw()'
