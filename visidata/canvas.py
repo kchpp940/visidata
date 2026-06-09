@@ -1,7 +1,7 @@
 import math
 import random
 
-from collections import defaultdict, Counter, OrderedDict
+from collections import defaultdict, Counter, OrderedDict, namedtuple
 from visidata import vd, asyncthread, colors, update_attr, clipdraw, dispwidth
 from visidata import BaseSheet, Column, Progress, ColorAttr
 from visidata.bezier import bezier
@@ -139,23 +139,51 @@ def anySelected(vs, rows):
             return True
 
 
-class PlotDataset:
-    '''Stores plot elements (points, lines, polylines) with stable row identity references.
+PlotElement = namedtuple('PlotElement', ['kind', 'vertexes', 'attr', 'row'])
+'''Typed plot element stored in PlotDataset.
 
-    Each element is stored internally as (vertexes, attr, row) tuple.  External code
-    should use the typed addPoint/addLine/addPolyline/addPolygon API instead of raw
-    append().  Row identity is keyed by source.rowid() so spatial queries remain
+* ``kind``: one of ``'point'``, ``'line'``, ``'polyline'``, ``'polygon'``
+* ``vertexes``: list of ``(x, y)`` data-coordinate tuples
+* ``attr``: color/plot attribute string
+* ``row``: source row reference (or None)
+'''
+
+RenderElement = namedtuple('RenderElement', ['kind', 'pixels', 'attr', 'row'])
+'''Projected & clipped plot element ready for Canvas to draw.
+
+* ``kind``: ``'point'`` or ``'segment'``
+* ``pixels``: for ``'point'`` a single ``(px, py)`` tuple;
+  for ``'segment'`` a list of ``((px1, py1), (px2, py2))`` line segment tuples.
+* ``attr``: color/plot attribute string
+* ``row``: source row reference (or None)
+'''
+
+
+class PlotDataset:
+    '''Stores typed plot elements with stable row identity references.
+
+    Internal elements are :class:`PlotElement` namedtuples carrying a *kind*
+    (``'point'``, ``'line'``, ``'polyline'``, ``'polygon'``).  Iteration and
+    ``polylines`` compatibility shims return the legacy ``(vertexes, attr, row)``
+    tuple shape so external modules (shp.py, graph_zoom_y.py, …) keep working.
+    Row identity is keyed by ``source.rowid()`` so spatial queries remain
     stable across sort/filter/zoom on the source sheet.
     '''
 
     def __init__(self):
-        self._elements = []
+        self._elements = []  # list of PlotElement
 
     def __len__(self):
         return len(self._elements)
 
     def __iter__(self):
-        return iter(self._elements)
+        '''Yield legacy ``(vertexes, attr, row)`` tuples for backward compatibility.
+
+        Internal consumers should iterate ``self._elements`` directly to get
+        :class:`PlotElement` namedtuples with the ``kind`` field.
+        '''
+        for elt in self._elements:
+            yield (elt.vertexes, elt.attr, elt.row)
 
     def __bool__(self):
         return bool(self._elements)
@@ -164,40 +192,52 @@ class PlotDataset:
         self._elements.clear()
 
     def addPoint(self, x, y, attr='', row=None):
-        'Record a single point plot element with stable row identity.'
-        self._elements.append(([(x, y)], attr, row))
+        'Record a single point (``kind="point"``) with stable row identity.'
+        self._elements.append(PlotElement('point', [(x, y)], attr, row))
 
     def addLine(self, x1, y1, x2, y2, attr='', row=None):
-        'Record a line segment plot element with stable row identity.'
-        self._elements.append(([(x1, y1), (x2, y2)], attr, row))
+        'Record a line segment (``kind="line"``) with stable row identity.'
+        self._elements.append(PlotElement('line', [(x1, y1), (x2, y2)], attr, row))
 
     def addPolyline(self, vertexes, attr='', row=None):
-        'Record a polyline (sequence of connected line segments) with stable row identity.'
-        self._elements.append((list(vertexes), attr, row))
+        'Record a polyline (``kind="polyline"``) with stable row identity.'
+        self._elements.append(PlotElement('polyline', list(vertexes), attr, row))
 
     def addPolygon(self, vertexes, attr='', row=None):
-        'Record a closed polygon (line loop) with stable row identity.'
-        self._elements.append((list(vertexes) + [vertexes[0]], attr, row))
+        'Record a closed polygon loop (``kind="polygon"``) with stable row identity.'
+        self._elements.append(PlotElement('polygon', list(vertexes) + [vertexes[0]], attr, row))
 
     def append(self, *args):
-        '''Append a raw plot element tuple.  Backward-compatible shim.
+        '''Append a raw legacy tuple.  Backward-compatible shim.
 
-        Accepts either a single tuple ``(vertexes, attr, row)`` (list-compatible)
-        or three separate arguments ``append(vertexes, attr, row)``.
-        New code should use addPoint/addLine/addPolyline/addPolygon instead.
+        Accepts either a single tuple ``(vertexes, attr, row)`` or three separate
+        arguments.  The element kind is inferred from vertex count.  New code
+        should use :meth:`addPoint`/:meth:`addLine`/:meth:`addPolyline`/:meth:`addPolygon`.
         '''
         if len(args) == 1 and isinstance(args[0], tuple) and len(args[0]) == 3:
-            self._elements.append(args[0])
+            vertexes, attr, row = args[0]
         elif len(args) == 3:
-            self._elements.append((args[0], args[1], args[2]))
+            vertexes, attr, row = args
         else:
             raise TypeError('append expects (vertexes, attr, row) as a tuple or 3 separate args')
 
+        # Infer kind from vertex count for backward compatibility
+        vlist = list(vertexes)
+        if len(vlist) == 1:
+            kind = 'point'
+        elif len(vlist) == 2:
+            kind = 'line'
+        elif vlist and vlist[0] == vlist[-1] and len(vlist) > 2:
+            kind = 'polygon'
+        else:
+            kind = 'polyline'
+        self._elements.append(PlotElement(kind, vlist, attr, row))
+
     def bbox(self):
-        'Return (xmin, ymin, xmax, ymax) of all vertexes, or None if empty.'
+        'Return ``(xmin, ymin, xmax, ymax)`` of all vertexes, or ``None`` if empty.'
         xmin = ymin = xmax = ymax = None
-        for vertexes, attr, row in self._elements:
-            for x, y in vertexes:
+        for elt in self._elements:
+            for x, y in elt.vertexes:
                 if xmin is None or x < xmin: xmin = x
                 if ymin is None or y < ymin: ymin = y
                 if xmax is None or x > xmax: xmax = x
@@ -209,29 +249,29 @@ class PlotDataset:
     def rowsWithinDataBox(self, xmin, ymin, xmax, ymax, hiddenAttrs=None, source=None):
         '''Return rows whose plotted points fall within the given data coordinate bounding box.
 
-        Deduplicates by source.rowid(row) so the result is stable across sort/filter/zoom.
-        Works regardless of current zoom or visible region.
+        Deduplicates by ``source.rowid(row)`` so the result is stable across
+        sort/filter/zoom.  Works regardless of current zoom or visible region.
         '''
         if hiddenAttrs is None:
             hiddenAttrs = set()
         ret = {}
         x1, x2 = min(xmin, xmax), max(xmin, xmax)
         y1, y2 = min(ymin, ymax), max(ymin, ymax)
-        for vertexes, attr, row in self._elements:
-            if attr in hiddenAttrs:
+        for elt in self._elements:
+            if elt.attr in hiddenAttrs:
                 continue
-            if row is None:
+            if elt.row is None:
                 continue
-            for vx, vy in vertexes:
+            for vx, vy in elt.vertexes:
                 try:
                     fx, fy = float(vx), float(vy)
                 except (TypeError, ValueError):
                     continue
                 if x1 <= fx <= x2 and y1 <= fy <= y2:
                     if source is not None:
-                        ret[source.rowid(row)] = row
+                        ret[source.rowid(elt.row)] = elt.row
                     else:
-                        ret[id(row)] = row
+                        ret[id(elt.row)] = elt.row
                     break
         return list(ret.values())
 
@@ -245,10 +285,8 @@ class CoordinateTransformer:
 
     Usage:
         * ``scaleX/Y`` / ``unscaleX/Y``: single-coordinate conversion
-        * ``projectElement(vertexes)``: batch projection of a plot element's vertexes
-          into plotter pixel space, respecting invert_y and clipping hints
-        * ``renderContext()``: returns (xmin, ymin, xmax, ymax, xfactor, yfactor,
-          plotxmin, plotyref, invert_y) for tight inner loops
+        * ``projectElement(plot_elem)``: project & clip a typed :class:`PlotElement`
+          into a :class:`RenderElement` ready for :class:`Canvas` to draw
     '''
 
     def __init__(self, invert_y=False):
@@ -318,20 +356,6 @@ class CoordinateTransformer:
         'Convert plotter pixel height to data coordinate height.'
         return plotterHeight / self.yScaler if self.yScaler else 0.0
 
-    def renderContext(self):
-        '''Return pre-computed projection parameters for tight inner render loops.
-
-        Returns tuple ``(xmin, ymin, xmax, ymax, xfactor, yfactor, plotxmin,
-        plotyref, invert_y)`` where ``plotyref`` is either plotviewBox.ymin
-        (normal) or plotviewBox.ymax (inverted).
-        '''
-        bb = self.visibleBox
-        xmin, ymin, xmax, ymax = bb.xmin, bb.ymin, bb.xmax, bb.ymax
-        xfactor, yfactor = self.xScaler, self.yScaler
-        plotxmin = self.plotviewBox.xmin
-        plotyref = self.plotviewBox.ymax if self.invert_y else self.plotviewBox.ymin
-        return (xmin, ymin, xmax, ymax, xfactor, yfactor, plotxmin, plotyref, self.invert_y)
-
     def projectPoint(self, x, y):
         '''Project a single (x, y) data point into plotter pixel coordinates.
 
@@ -339,16 +363,60 @@ class CoordinateTransformer:
         '''
         return self.scaleX(x), self.scaleY(y)
 
-    def projectElement(self, vertexes):
-        '''Project all vertexes of a plot element into plotter pixel space.
+    def projectElement(self, plot_elem):
+        '''Project and clip a :class:`PlotElement` against the visible data box.
 
-        Returns a list of ``(px, py)`` tuples with the same length as *vertexes*.
-        No clipping is performed; use :meth:`renderContext` for clipped inner loops.
+        Returns a :class:`RenderElement` ready for :class:`Canvas` to draw, or
+        ``None`` if the element is entirely outside the visible region.
+
+        The transformer owns the clipping math and the ``invert_y`` strategy is
+        fully encapsulated here; callers never see projection formulas.
         '''
-        result = []
-        for x, y in vertexes:
-            result.append((self.scaleX(float(x)), self.scaleY(float(y))))
-        return result
+        bb = self.visibleBox
+        xmin, ymin, xmax, ymax = bb.xmin, bb.ymin, bb.xmax, bb.ymax
+        xfactor, yfactor = self.xScaler, self.yScaler
+        plotxmin = self.plotviewBox.xmin
+        if self.invert_y:
+            plotyref = self.plotviewBox.ymax
+            sign = -1.0
+        else:
+            plotyref = self.plotviewBox.ymin
+            sign = +1.0
+
+        def _px(x):
+            return plotxmin + (float(x) - xmin) * xfactor
+
+        def _py(y):
+            return plotyref + sign * (float(y) - ymin) * yfactor
+
+        def _round_p(x, y):
+            return (plotxmin + round((float(x) - xmin) * xfactor),
+                    plotyref + round(sign * ((float(y) - ymin) * yfactor)))
+
+        kind = plot_elem.kind
+        attr = plot_elem.attr
+        row = plot_elem.row
+        vxs = plot_elem.vertexes
+
+        if kind == 'point':
+            x1, y1 = vxs[0]
+            x1, y1 = float(x1), float(y1)
+            if not (xmin <= x1 <= xmax and ymin <= y1 <= ymax):
+                return None
+            return RenderElement('point', _round_p(x1, y1), attr, row)
+
+        # line / polyline / polygon — all produce 'segment' render kind
+        segments = []
+        prev_x, prev_y = vxs[0]
+        for x, y in vxs[1:]:
+            r = clipline(prev_x, prev_y, x, y, xmin, ymin, xmax, ymax)
+            if r:
+                cx1, cy1, cx2, cy2 = r
+                segments.append(((_px(cx1), _py(cy1)), (_px(cx2), _py(cy2))))
+            prev_x, prev_y = x, y
+        if not segments:
+            return None
+        return RenderElement('segment', segments, attr, row)
 
 
 class RowIdentityMixin:
@@ -1197,44 +1265,25 @@ class Canvas(BrushSelectorMixin, Plotter):
     def plot_elements(self):
         '''Plot points, lines, and labels onto the plotter.
 
-        All coordinate projection is delegated to self._coord (CoordinateTransformer).
-        This method only iterates PlotDataset elements, clips to the visible data box,
-        and dispatches projected pixel coordinates to plotpixel/plotline/plotlabel.
-        The invert_y strategy (for graphs) is determined by self._coord.invert_y.
+        All coordinate projection, clipping, and ``invert_y`` strategy handling
+        is fully delegated to ``self._coord.projectElement``.  Canvas here only
+        iterates :class:`PlotDataset`, receives :class:`RenderElement` tuples, and
+        dispatches them by kind to ``plotpixel`` / ``plotline`` / ``plotlabel``.
+        Canvas never sees projection formulas or legacy tuple shapes.
         '''
         self.resetBounds(refresh=False)
 
-        # All projection parameters come from the transformer; Canvas is strategy-agnostic.
-        xmin, ymin, xmax, ymax, xfactor, yfactor, plotxmin, plotyref, invert_y = self._coord.renderContext()
-
-        for vertexes, attr, row in Progress(self.plotData, 'rendering'):
-            if len(vertexes) == 1:  # single point
-                x1, y1 = vertexes[0]
-                x1, y1 = float(x1), float(y1)
-                if xmin <= x1 <= xmax and ymin <= y1 <= ymax:
-                    px = plotxmin + round((x1 - xmin) * xfactor)
-                    if invert_y:
-                        py = plotyref - round((y1 - ymin) * yfactor)
-                    else:
-                        py = plotyref + round((y1 - ymin) * yfactor)
-                    self.plotpixel(px, py, attr, row)
+        # Iterate _elements directly to get PlotElement namedtuples with kind field.
+        for plot_elem in Progress(self.plotData._elements, 'rendering'):
+            render_elem = self._coord.projectElement(plot_elem)
+            if render_elem is None:
                 continue
-
-            prev_x, prev_y = vertexes[0]
-            for x, y in vertexes[1:]:
-                r = clipline(prev_x, prev_y, x, y, xmin, ymin, xmax, ymax)
-                if r:
-                    cx1, cy1, cx2, cy2 = r
-                    px1 = plotxmin + float(cx1 - xmin) * xfactor
-                    px2 = plotxmin + float(cx2 - xmin) * xfactor
-                    if invert_y:
-                        py1 = plotyref - float(cy1 - ymin) * yfactor
-                        py2 = plotyref - float(cy2 - ymin) * yfactor
-                    else:
-                        py1 = plotyref + float(cy1 - ymin) * yfactor
-                        py2 = plotyref + float(cy2 - ymin) * yfactor
-                    self.plotline(px1, py1, px2, py2, attr, row)
-                prev_x, prev_y = x, y
+            if render_elem.kind == 'point':
+                px, py = render_elem.pixels
+                self.plotpixel(px, py, render_elem.attr, render_elem.row)
+            elif render_elem.kind == 'segment':
+                for (px1, py1), (px2, py2) in render_elem.pixels:
+                    self.plotline(px1, py1, px2, py2, render_elem.attr, render_elem.row)
 
         for x, y, text, attr, row in Progress(self.gridlabels, 'labeling'):
             self.plotlabel(self._coord.scaleX(x), self._coord.scaleY(y), text, attr, row)
