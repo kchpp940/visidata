@@ -1,10 +1,10 @@
 """
-Describe sheet - backward-compatible wrapper around DiagnosticsSheet.
+Describe sheet — backwards-compatible wrapper.
 
-The diagnostics framework lives in ``visidata.features.diagnostics``.  This
-module re-exports the public names and preserves the original command
-bindings (``I`` / ``gI``) and the ``describeData`` / ``reloadColumn`` API used
-by existing tests and plugins.
+Delegates execution to the shared ``vd.diagnosticRunner`` (see
+``visidata.features.diagnostics``) while preserving the original
+``describeData`` dict, ``reloadColumn`` helper, and the ``I`` / ``gI`` key
+bindings expected by tests and plugins.
 """
 
 from copy import copy
@@ -17,6 +17,8 @@ from visidata.features.diagnostics import (
     DiagnosticsSheet,
     DiagnosticResult,
     DiagnosticColumn,
+    DiagnosticRule,
+    vd as _diag_vd,
 )
 
 
@@ -40,11 +42,11 @@ class DescribeColumn(Column):
 
 # rowdef: Column from source sheet
 class DescribeSheet(DiagnosticsSheet):
-    """Backwards-compatible Describe sheet.
+    """Describe Sheet — backwards-compatible façade over DiagnosticsSheet.
 
-    Delegates to DiagnosticsSheet underneath but preserves the original
-    ``describeData`` dict layout and the ``reloadColumn`` helper so existing
-    callers keep working.
+    Preserves the original ``describeData`` layout and ``reloadColumn`` so
+    callers (tests.vd, plugins, …) that introspect ``sheet.describeData`` keep
+    working.
     """
     guide = '''
         # Describe Sheet
@@ -79,63 +81,42 @@ class DescribeSheet(DiagnosticsSheet):
         ColumnsSheet.loader(self)
         self.rows = [c for c in self.rows if not c.hidden]
         self.describeData = {col: {} for col in self.rows}
-        self.diagnosticData = {}
         self.resetCols()
 
-        for aggrname in vd.options.describe_aggrs.split():
+        extra_aggrs = tuple(vd.options.describe_aggrs.split())
+        for aggrname in extra_aggrs:
             self.addColumn(DescribeColumn(aggrname, type=float))
 
-        for srccol in Progress(self.rows, 'categorizing'):
-            if not srccol.hidden:
-                self.reloadColumn(srccol)
+        for srcsheet in self._sourceSheets():
+            if not vd.diagnosticRunner.is_cached(srcsheet):
+                vd.diagnosticRunner.run(srcsheet, extra_aggrs=extra_aggrs)
+
+        for srccol in self.rows:
+            self.reloadColumn(srccol)
 
     def reloadColumn(self, srccol):
-        """Populate ``self.describeData[srccol]`` with the classic metrics.
+        """Populate ``self.describeData[srccol]`` from the runner cache.
 
-        This method is preserved for backwards compatibility; callers can
-        still invoke it to refresh a single column's data.
+        Retained for backwards compatibility; callers can still invoke it to
+        (re)build the legacy dict layout for a single column.
         """
-        d = self.describeData[srccol]
-        isNull = srccol.sheet.isNullFunc()
+        d = self.describeData.setdefault(srccol, {})
+        runner_results = vd.diagnosticRunner.all_rules_for(srccol)
 
-        vals = []
-        d['errors'] = []
-        d['nulls'] = []
-        d['distinct'] = set()
-
-        for sr in Progress(srccol.sheet.rows, 'calculating'):
-            try:
-                v = srccol.getValue(sr)
-                if isNull(v):
-                    d['nulls'].append(sr)
-                else:
-                    v = srccol.type(v)
-                    vals.append(v)
-                d['distinct'].add(v)
-            except Exception as e:
-                d['errors'].append(sr)
-
-        d['mode'] = self.calcStatistic(d, mode, vals)
-        if vd.isNumeric(srccol):
-            for func in [min, max, sum, median]:
-                d[func.__name__] = self.calcStatistic(d, func, vals)
-            for aggrname in vd.options.describe_aggrs.split():
-                aggr = vd.aggregators[aggrname].funcValues
-                d[aggrname] = self.calcStatistic(d, aggr, vals)
-
-        diag = self.diagnosticData.setdefault(srccol, {})
-        for k, v in d.items():
-            if k == 'distinct':
-                diag[k] = DiagnosticResult(rule=None, target=srccol, value=len(v), rows=[])
-            elif isinstance(v, list):
-                diag[k] = DiagnosticResult(rule=None, target=srccol, value=len(v), rows=v)
+        for rulename, result in runner_results.items():
+            if rulename == 'errors':
+                d['errors'] = result.rows
+            elif rulename == 'nulls':
+                d['nulls'] = result.rows
+            elif rulename == 'distinct':
+                d['distinct'] = set() if result.value is None else result.value
             else:
-                diag[k] = DiagnosticResult(rule=None, target=srccol, value=v)
+                d[rulename] = result.value
 
-    def calcStatistic(self, d, func, *args, **kwargs):
-        r = wrapply(func, *args, **kwargs)
-        d[func.__name__] = r
-        return r
+        # Legacy compat – ensure errors/nulls lists and distinct set are always present
+        d.setdefault('errors', [])
+        d.setdefault('nulls', [])
+        d.setdefault('distinct', set())
 
     def openCell(self, col, row):
         'open copy of source sheet with rows described in current cell'
