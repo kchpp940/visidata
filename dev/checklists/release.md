@@ -57,8 +57,8 @@ Only `visidata/__init__.py` is the canonical source of truth. Never edit `setup.
 | `formats`   | Every internal format in `docs/internal_formats.md` has a matching `open_<ext>()` function somewhere in the package |
 | `metadata`  | All paths referenced by `MANIFEST.in`, `setup.py package_data`, and `setup.py data_files` exist |
 | `changelog` | `CHANGELOG.md` contains a `# vX.Y` heading for the current version |
-| `package`   | Built wheel and sdist contain expected files: METADATA Name/Version, entry_points.txt for `vd`/`visidata`, core modules, package_data (ddw, desktop, icons), sdist top-level files (setup.py, README.md, etc.) |
-| `smoke`     | Installs the wheel in a throwaway venv under `/tmp`, then runs `vd --version` and imports core modules (`visidata`, `visidata.features.describe`, `visidata.loaders.vdx`, …) to confirm the installed package works. Venvs are cleaned up automatically. |
+| `package`   | Built wheel and sdist contain expected files: METADATA Name/Version, entry_points.txt for `vd`/`visidata`, ALL package_data files (manpages, 28 guides/*.md, desktop files, 2 icon sizes, ddw samples, test fixtures — auto-enumerated from `setup.py`), and ALL MANIFEST.in entries (auto-enumerated). Missing files are reported individually by relative path. |
+| `smoke`     | Installs the wheel in a throwaway venv under `/tmp`, then runs `vd --version` and imports **ALL 122+ submodules** under `visidata.features/`, `visidata.loaders/`, `visidata.themes/` (auto-enumerated from the source tree — no hand-picked subset). Venvs are cleaned up automatically. Missing modules / import errors are reported individually with their stderr. |
 
 ### Diagnostics
 

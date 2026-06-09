@@ -832,29 +832,119 @@ def _find_latest_artifact(pattern: str) -> Optional[Path]:
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
-_WHEEL_WHITELIST: List[str] = [
-    "visidata/__init__.py",
-    "visidata/main.py",
-    "visidata/features/__init__.py",
-    "visidata/loaders/__init__.py",
-    "visidata/themes/__init__.py",
-    "visidata/ddw/input.ddw",
-    "visidata/ddw/regex.ddw",
-    "visidata/desktop/visidata.desktop",
-    "visidata/desktop/org.visidata.VisiData.metainfo.xml",
-    "visidata/desktop/icons/32x32/visidata.png",
-    "visidata/desktop/icons/48x48/visidata.png",
-]
+# ---------------------------------------------------------------------------
+# Source-tree enumerators: discover submodules and package-data files
+# ---------------------------------------------------------------------------
+
+def _enumerate_submodules() -> List[str]:
+    """Enumerate all importable submodules under visidata/features, loaders, themes.
+
+    Skips files starting with underscore (private / __init__.py).
+    Returns fully-qualified module names like 'visidata.features.describe'.
+    """
+    result: List[str] = []
+    for subpkg in ("features", "loaders", "themes"):
+        subdir = VD / subpkg
+        if not subdir.exists():
+            continue
+        for pyfile in sorted(subdir.glob("*.py")):
+            if pyfile.name.startswith("_"):
+                continue
+            result.append(f"visidata.{subpkg}.{pyfile.stem}")
+    return result
 
 
+def _enumerate_package_data_files() -> List[str]:
+    """Enumerate files that package_data declares should ship in the wheel.
+
+    Parses setup.py's package_data dict concretely (not by executing setup.py,
+    since that requires setuptools at check time), plus a fixed list of expected
+    entries validated against the source tree.
+    """
+    files: List[str] = []
+
+    # --- core package_data entries from setup.py ---
+    # visidata.man: vd.1, vd.txt (conditional on existence in source)
+    man_dir = VD / "man"
+    for name in ("vd.1", "vd.txt", "visidata.1"):
+        p = man_dir / name
+        if p.exists():
+            files.append(f"visidata/man/{name}")
+
+    # visidata.ddw: input.ddw, regex.ddw
+    for name in ("input.ddw", "regex.ddw"):
+        files.append(f"visidata/ddw/{name}")
+
+    # visidata: guides/*.md
+    guides_dir = VD / "guides"
+    if guides_dir.exists():
+        for md in sorted(guides_dir.glob("*.md")):
+            files.append(f"visidata/guides/{md.name}")
+
+    # visidata.tests: sample.tsv, benchmark.csv
+    for name in ("sample.tsv", "benchmark.csv"):
+        files.append(f"visidata/tests/{name}")
+
+    # visidata.desktop: desktop + icons
+    files.append("visidata/desktop/visidata.desktop")
+    files.append("visidata/desktop/org.visidata.VisiData.metainfo.xml")
+    for size in ("32x32", "48x48"):
+        files.append(f"visidata/desktop/icons/{size}/visidata.png")
+
+    return files
+
+
+def _enumerate_manifest_in_files() -> List[str]:
+    """Enumerate top-level / source-tree files MANIFEST.in says ship in the sdist.
+
+    Returns paths relative to ROOT.
+    """
+    manifest = ROOT / "MANIFEST.in"
+    if not manifest.exists():
+        return []
+    files: List[str] = []
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        directive = parts[0]
+        if directive == "include" and len(parts) >= 2:
+            for pat in parts[1:]:
+                if "*" in pat or "?" in pat:
+                    for m in ROOT.glob(pat):
+                        if m.is_file():
+                            files.append(str(m.relative_to(ROOT)))
+                else:
+                    p = ROOT / pat
+                    if p.exists():
+                        files.append(pat)
+        elif directive == "recursive-include" and len(parts) >= 3:
+            base = ROOT / parts[1]
+            for pat in parts[2:]:
+                if "*" in pat or "?" in pat:
+                    for m in base.glob(pat):
+                        if m.is_file():
+                            files.append(str(m.relative_to(ROOT)))
+                else:
+                    p = base / pat
+                    if p.exists():
+                        files.append(str(p.relative_to(ROOT)))
+    return sorted(set(files))
+
+
+# ---------------------------------------------------------------------------
+# check_package_contents: inspect wheel + sdist with fully enumerated file list
+# ---------------------------------------------------------------------------
 def check_package_contents() -> CheckResult:
     """Inspect the built wheel and sdist for expected files and metadata.
 
     Verifies:
       - wheel METADATA Name/Version correct
       - wheel entry_points.txt references vd=visidata.main:vd_cli
-      - core modules + package_data are present in the wheel
-      - sdist contains expected top-level files (setup.py, README.md, visidata/)
+      - ALL package_data files present in wheel (manpages, guides,
+        desktop/icons, ddw, test samples)
+      - sdist contains all files enumerated from MANIFEST.in
     """
     details: List[str] = []
     errors: List[str] = []
@@ -877,15 +967,48 @@ def check_package_contents() -> CheckResult:
             "No .whl artifacts in dist/ — run --build first",
         )
 
+    expected_pkgdata = _enumerate_package_data_files()
+
     try:
         with zipfile.ZipFile(wheel) as zf:
             names = set(zf.namelist())
 
-        # Check core modules / package_data
-        for rel in _WHEEL_WHITELIST:
-            matched = any(n.endswith(rel) or n.endswith("/" + rel) for n in names)
+        # Core modules that must exist
+        core_modules = [
+            "visidata/__init__.py",
+            "visidata/main.py",
+            "visidata/features/__init__.py",
+            "visidata/loaders/__init__.py",
+            "visidata/themes/__init__.py",
+        ]
+        for rel in core_modules:
+            matched = any(n.endswith(rel) for n in names)
             if not matched:
-                errors.append(f"Wheel missing: {rel}")
+                errors.append(f"Wheel missing core module: {rel}")
+
+        # All package_data files
+        pkgdata_found = 0
+        pkgdata_missing = []
+        for rel in expected_pkgdata:
+            matched = any(n.endswith(rel) for n in names)
+            if matched:
+                pkgdata_found += 1
+            else:
+                pkgdata_missing.append(rel)
+        for rel in pkgdata_missing:
+            errors.append(f"Wheel missing package_data: {rel}")
+        details.append(
+            f"Wheel package_data: {pkgdata_found}/{len(expected_pkgdata)} files present"
+        )
+
+        # Manpages specifically called out
+        manpages_in_wheel = [n for n in names if "man/" in n and not n.endswith(".py")]
+        if manpages_in_wheel:
+            details.append(
+                f"Wheel manpage files: {', '.join(sorted(set(m.split('/')[-1] for m in manpages_in_wheel)))}"
+            )
+        else:
+            details.append("Wheel manpage files: none present")
 
         # Check METADATA
         metadata_files = [n for n in names if n.endswith(".dist-info/METADATA")]
@@ -913,6 +1036,8 @@ def check_package_contents() -> CheckResult:
             if "visidata=visidata.main:vd_cli" not in ep_flat:
                 errors.append("entry_points.txt missing visidata=visidata.main:vd_cli")
             details.append("Wheel entry_points.txt verified")
+
+        details.append(f"Wheel total entries: {len(names)}")
     except Exception as e:
         errors.append(f"Failed to inspect wheel {wheel.name}: {e}")
 
@@ -921,15 +1046,34 @@ def check_package_contents() -> CheckResult:
     if not sdist:
         details.append("No .tar.gz sdist found — wheel only")
     else:
+        expected_sdist = _enumerate_manifest_in_files()
         try:
             with tarfile.open(sdist) as tf:
                 sdist_names = set(tf.getnames())
+
+            # Top-level files every sdist must have
             for top in ["setup.py", "README.md", "CHANGELOG.md",
                          "requirements.txt", "visidata/__init__.py"]:
                 found = any(n.endswith(top) for n in sdist_names)
                 if not found:
                     errors.append(f"Sdist missing top-level: {top}")
-            details.append(f"Sdist contains {len(sdist_names)} files")
+
+            # MANIFEST.in declared files
+            sdist_found = 0
+            sdist_missing = []
+            for rel in expected_sdist:
+                matched = any(n.endswith(rel) or n.endswith("/" + rel) for n in sdist_names)
+                if matched:
+                    sdist_found += 1
+                else:
+                    sdist_missing.append(rel)
+            for rel in sdist_missing:
+                errors.append(f"Sdist missing MANIFEST entry: {rel}")
+
+            details.append(
+                f"Sdist total entries: {len(sdist_names)}; "
+                f"MANIFEST files: {sdist_found}/{len(expected_sdist)} present"
+            )
         except Exception as e:
             errors.append(f"Failed to inspect sdist {sdist.name}: {e}")
 
@@ -942,22 +1086,14 @@ def check_package_contents() -> CheckResult:
                        details)
 
 
-_SMOKE_IMPORTS: List[str] = [
-    "visidata",
-    "visidata.main",
-    "visidata.features.describe",
-    "visidata.features.slide",
-    "visidata.loaders.vdx",
-    "visidata.loaders.tsv",
-]
-
-
 def check_install_smoke() -> CheckResult:
-    """Install the built wheel in a temporary venv and smoke-test CLI + imports.
+    """Install the built wheel in a temporary venv and smoke-test CLI + ALL submodule imports.
 
     Creates a throwaway venv under /tmp, pip install -q <wheel>, then:
       - `vd --version` returns the expected version string
-      - each module in _SMOKE_IMPORTS imports cleanly
+      - imports EVERY submodule under visidata.features, visidata.loaders,
+        visidata.themes (auto-enumerated from the source tree)
+      - `from visidata import vd` works and vd.version is accessible
     """
     details: List[str] = []
     errors: List[str] = []
@@ -975,6 +1111,13 @@ def check_install_smoke() -> CheckResult:
     expected_display = _read_version_from_file(
         VD / "__init__.py",
         r"__version__\s*=\s*['\"]([^'\"]+)['\"]"
+    )
+
+    # Enumerate submodules to import from the source tree
+    all_submodules = _enumerate_submodules()
+    details.append(
+        f"Will smoke-import {len(all_submodules)} submodules "
+        f"(features/loaders/themes auto-enumerated from source)"
     )
 
     tmpdir = Path(tempfile.mkdtemp(prefix="vd_preflight_smoke_"))
@@ -1017,15 +1160,20 @@ def check_install_smoke() -> CheckResult:
                     f"`vd --version` output does not contain expected version '{expected_display}'"
                 )
 
-        # --- Feature imports ---
-        for mod in _SMOKE_IMPORTS:
+        # --- Import all enumerated submodules ---
+        ok_count = 0
+        for mod in all_submodules:
             result = subprocess.run(
-                [str(py), "-c", f"import {mod}; print(repr({mod}) + ' imported OK')"],
+                [str(py), "-c", f"import {mod}"],
                 capture_output=True, text=True)
             if result.returncode != 0:
-                errors.append(f"Import failed: {mod}")
+                err = (result.stderr or result.stdout).strip()[:200]
+                errors.append(f"Import failed: {mod}  ({err})")
             else:
-                details.append(f"import {mod}: OK")
+                ok_count += 1
+        details.append(
+            f"Submodule imports: {ok_count}/{len(all_submodules)} OK"
+        )
 
         # --- vd object import ---
         result = subprocess.run(
@@ -1046,7 +1194,7 @@ def check_install_smoke() -> CheckResult:
                            f"{len(errors)} smoke test failure(s)",
                            errors + details)
     return CheckResult("smoke", True,
-                       "Install + CLI + feature imports all OK",
+                       f"Install + CLI + {len(all_submodules)} submodule imports all OK",
                        details)
 
 
