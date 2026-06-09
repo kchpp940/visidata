@@ -1,4 +1,12 @@
-"""Delivery Package feature for exporting reproducible VisiData workspaces."""
+"""Delivery Package feature for exporting reproducible VisiData workspaces.
+
+Exports a single workspace.vdx entry point that, when replayed via `vd -p workspace.vdx`,
+will:
+  1. Set saved global options
+  2. Open each data sheet (with column types preserved via .vds)
+  3. Rebuild GraphSheets with full state (xcols/ycols/reflines/visibleBox)
+  4. Replay the original command log (with conflicting open-file commands filtered)
+"""
 
 import datetime
 import json
@@ -7,8 +15,8 @@ import shutil
 import tempfile
 import zipfile
 
-from visidata import vd, VisiData, BaseSheet, GraphSheet, Path, Progress
-from visidata import globalCommand
+from visidata import vd, VisiData, BaseSheet, GraphSheet, Path, Progress, BoundingBox
+from visidata import globalCommand, Sheet, AttrDict
 import visidata
 
 
@@ -21,26 +29,27 @@ vd.option('delivery_include_config', True, 'include options/configuration in del
 
 
 def _sanitize_filename(name):
-    'Return a filesystem-safe filename from a sheet or other name.'
     keepcharacters = (' ', '.', '_', '-')
     return ''.join(c for c in name if c.isalnum() or c in keepcharacters).rstrip().replace(' ', '_')
 
 
 def _collect_derived_sheets(sheet):
-    'Collect all sheets derived from the given sheet (direct and indirect).'
     derived = []
+    seen = set()
     for vs in vd.allSheets:
+        if id(vs) in seen:
+            continue
         src = getattr(vs, 'source', None)
         while isinstance(src, BaseSheet):
             if src is sheet:
                 derived.append(vs)
+                seen.add(id(vs))
                 break
             src = getattr(src, 'source', None)
     return derived
 
 
 def _collect_graph_sheets(sheets):
-    'Collect all GraphSheet instances from the given sheets and their sources.'
     graphs = []
     seen = set()
     for vs in sheets:
@@ -60,9 +69,6 @@ def _collect_graph_sheets(sheets):
 
 
 def _collect_scope_sheets(scope):
-    '''Collect sheets based on scope string.
-    scope: 'current' | 'current_derived' | 'all' | 'stacked'
-    '''
     if scope == 'current':
         return [vd.activeSheet]
     elif scope == 'current_derived':
@@ -78,7 +84,6 @@ def _collect_scope_sheets(scope):
 
 
 def _graph_state(graph):
-    'Return a serializable dict of GraphSheet state.'
     state = {
         'name': graph.name,
         'sourceName': graph.source.name if isinstance(graph.source, BaseSheet) else str(graph.source),
@@ -100,11 +105,152 @@ def _graph_state(graph):
 
 
 @VisiData.api
+def restore_graph(vd, json_input):
+    """Replay command: restore a GraphSheet from serialized JSON state."""
+    try:
+        state = json.loads(json_input)
+    except (json.JSONDecodeError, TypeError) as e:
+        vd.fail(f'invalid graph state JSON: {e}')
+        return
+
+    src_sheet = None
+    if isinstance(vd.activeSheet, BaseSheet):
+        src_sheet = vd.activeSheet
+    else:
+        src_name = state.get('sourceName', '')
+        src_sheet = vd.getSheet(src_name)
+
+    if not src_sheet:
+        vd.warning(f'could not find source sheet for graph {state.get("name")}, skipping')
+        return
+
+    src_sheet.ensureLoaded()
+    vd.sync()
+
+    all_cols = list(getattr(src_sheet, 'columns', []))
+    xcols = [c for c in all_cols if c.name in state.get('xcols', [])]
+    ycols = [c for c in all_cols if c.name in state.get('ycols', [])]
+
+    if not ycols:
+        ycols = vd.numericCols(getattr(src_sheet, 'visibleCols', []))
+
+    try:
+        gs = GraphSheet(
+            src_sheet.name,
+            'graph',
+            source=src_sheet,
+            sourceRows=getattr(src_sheet, 'rows', []),
+            xcols=xcols,
+            ycols=ycols,
+        )
+    except Exception as e:
+        vd.warning(f'failed to create graph sheet: {e}')
+        return
+
+    gs.name = state.get('name', gs.name)
+
+    gs.reflines_x = list(state.get('reflines_x', []))
+    gs.reflines_y = list(state.get('reflines_y', []))
+
+    vbox = state.get('visibleBox')
+    if vbox:
+        try:
+            gs.zoomTo(BoundingBox(vbox['xmin'], vbox['ymin'], vbox['xmax'], vbox['ymax']))
+        except Exception:
+            pass
+
+    vd.push(gs)
+    vd.sync(gs.ensureLoaded())
+
+
+globalCommand('', 'restore-graph',
+    'vd.restore_graph(input("graph state JSON: "))',
+    'restore a GraphSheet from serialized JSON state (internal replay command)')
+
+
+@VisiData.api
+def _collect_initial_sources(vd, data_sheets):
+    """Return set of original source paths used to open the given data sheets."""
+    original_sources = set()
+    for vs in data_sheets:
+        src = getattr(vs, 'source', None)
+        if isinstance(src, BaseSheet):
+            continue
+        if src and hasattr(src, 'given'):
+            original_sources.add(str(src.given))
+        elif src:
+            original_sources.add(str(src))
+    return original_sources
+
+
+@VisiData.api
+def _write_workspace_vdx(vd, pkgdir, data_sheets, graph_sheets, manifest, data_format, original_sources):
+    """Write the unified workspace.vdx replay entry point.
+
+    Layout of workspace.vdx (mixed VDX minimal + VDJ JSON lines, as both are
+    handled by CommandLogSimple.iterload):
+
+      1. Shebang and replay-reset
+      2. option scope name value  -- restored global options
+      3. open-file data/xxx.vds   -- for each saved data sheet in order
+      4. sheet SourceName + restore-graph {...}  -- for each graph
+      5. JSON lines for the original cmdlog rows (with open-file filtered)
+    """
+    vdx_path = pkgdir / 'workspace.vdx'
+    cmdlog_nrows = 0
+
+    with open(str(vdx_path), 'w', encoding='utf-8') as fp:
+        fp.write('#!/usr/bin/env -S vd -p\n')
+        fp.write(f'# {visidata.__version_info__}\n')
+        fp.write(f'# delivery package generated at {manifest["created_at"]}\n')
+        fp.write('replay-reset\n')
+
+        if vd.options.delivery_include_config and manifest.get('config'):
+            opts_path = pkgdir / Path(manifest['config'])
+            try:
+                with open(str(opts_path), encoding='utf-8') as ofp:
+                    options_data = json.load(ofp)
+                for scope, opts in options_data.items():
+                    for oname, oval in opts.items():
+                        fp.write(f'option {scope} {oname} {oval}\n')
+            except Exception:
+                pass
+
+        fp.write('\n# -- data sheets --\n')
+        for s in manifest['sheets']:
+            fp.write(f'open-file {s["file"]}\n')
+            if data_format == 'vds':
+                fp.write('row 0\n')
+                fp.write('open-row\n')
+
+        if vd.options.delivery_include_graphs and graph_sheets:
+            fp.write('\n# -- graph sheets --\n')
+            for gs in graph_sheets:
+                state = _graph_state(gs)
+                src_name = state['sourceName']
+                fp.write(f'sheet {src_name}\n')
+                fp.write('restore-graph ' + json.dumps(state, separators=(',', ':'), default=str) + '\n')
+
+        if vd.options.delivery_include_cmdlog and vd.cmdlog and vd.cmdlog.rows:
+            fp.write('\n# -- command log --\n')
+            for r in vd.cmdlog.rows:
+                if getattr(r, 'longname', None) == 'open-file':
+                    input_val = getattr(r, 'input', '') or ''
+                    if input_val in original_sources:
+                        continue
+                row_dict = dict(r) if hasattr(r, '__iter__') and not isinstance(r, (str, bytes)) else {}
+                for f in ['sheet', 'col', 'row', 'longname', 'input', 'keystrokes', 'comment']:
+                    v = getattr(r, f, None)
+                    if v is not None:
+                        row_dict[f] = v
+                fp.write(json.dumps(row_dict, default=str) + '\n')
+                cmdlog_nrows += 1
+
+    return vdx_path, cmdlog_nrows
+
+
+@VisiData.api
 def exportDeliveryPackage(vd, outpath, scope='current_derived', data_format=None):
-    '''Export a delivery package to outpath (directory or .zip).
-    scope: 'current' | 'current_derived' | 'all' | 'stacked'
-    data_format: 'vds' | 'tsv' | 'csv' | 'json' (None -> vd.options.delivery_data_format)
-    '''
     data_format = data_format or vd.options.delivery_data_format
     if data_format not in ('vds', 'tsv', 'csv', 'json', 'jsonl'):
         vd.fail(f'unsupported data format: {data_format}')
@@ -118,8 +264,6 @@ def exportDeliveryPackage(vd, outpath, scope='current_derived', data_format=None
     else:
         pkgdir = Path(outpath)
 
-    cmdlog_nrows = len(vd.cmdlog.rows) if vd.cmdlog else 0
-
     try:
         os.makedirs(str(pkgdir), exist_ok=True)
         os.makedirs(str(pkgdir / 'data'), exist_ok=True)
@@ -127,23 +271,24 @@ def exportDeliveryPackage(vd, outpath, scope='current_derived', data_format=None
         os.makedirs(str(pkgdir / 'config' / 'macros'), exist_ok=True)
 
         sheets = _collect_scope_sheets(scope)
-
         data_sheets = [vs for vs in sheets if hasattr(vs, 'columns') and vs.precious]
 
         graph_sheets = []
         if vd.options.delivery_include_graphs:
             graph_sheets = _collect_graph_sheets(sheets)
 
+        original_sources = vd._collect_initial_sources(data_sheets)
+
         manifest = {
-            'version': '1.0',
+            'version': '2.0',
             'vd_version': visidata.__version_info__,
             'scope': scope,
             'data_format': data_format,
+            'entry_point': 'workspace.vdx',
             'sheets': [],
             'graphs': [],
             'macros': [],
-            'cmdlog': None,
-            'cmdlog_nrows': cmdlog_nrows,
+            'cmdlog_nrows': 0,
             'config': None,
             'created_at': datetime.datetime.now().isoformat(),
         }
@@ -167,22 +312,14 @@ def exportDeliveryPackage(vd, outpath, scope='current_derived', data_format=None
             else:
                 vd.warning(f'no saver for {vs.name} as {data_format}, skipping')
 
-        for gs in Progress(graph_sheets, 'saving graphs'):
-            fname = _sanitize_filename(gs.name)
-            fpath = pkgdir / 'data' / f'{fname}.graph.json'
+        for gs in graph_sheets:
             state = _graph_state(gs)
-            with open(str(fpath), 'w', encoding='utf-8') as fp:
-                json.dump(state, fp, indent=2, default=str)
             manifest['graphs'].append({
                 'name': gs.name,
-                'file': f'data/{fname}.graph.json',
                 'sourceName': state['sourceName'],
+                'xcols': state['xcols'],
+                'ycols': state['ycols'],
             })
-
-        if vd.options.delivery_include_cmdlog and vd.cmdlog and vd.cmdlog.rows:
-            cmdlog_path = pkgdir / 'replay.vdj'
-            vd.sync(vd.save_vdj(cmdlog_path, vd.cmdlog))
-            manifest['cmdlog'] = 'replay.vdj'
 
         if vd.options.delivery_include_macros:
             try:
@@ -194,7 +331,6 @@ def exportDeliveryPackage(vd, outpath, scope='current_derived', data_format=None
                         'binding': binding,
                         'file': f'config/macros/{fname}.vdj',
                         'helpstr': getattr(cmdlog, 'helpstr', ''),
-                        'keystroke': getattr(cmdlog, 'keystroke', ''),
                     })
             except Exception as e:
                 vd.warning(f'error saving macros: {e}')
@@ -212,12 +348,16 @@ def exportDeliveryPackage(vd, outpath, scope='current_derived', data_format=None
                         if opt_scope not in options_data:
                             options_data[opt_scope] = {}
                         options_data[opt_scope][name] = value
-
                 with open(str(opts_path), 'w', encoding='utf-8') as fp:
                     json.dump(options_data, fp, indent=2, default=str)
                 manifest['config'] = 'config/options.json'
             except Exception as e:
                 vd.warning(f'error saving options: {e}')
+
+        vdx_path, cmdlog_nrows = vd._write_workspace_vdx(
+            pkgdir, data_sheets, graph_sheets, manifest, data_format, original_sources
+        )
+        manifest['cmdlog_nrows'] = cmdlog_nrows
 
         with open(str(pkgdir / 'manifest.json'), 'w', encoding='utf-8') as fp:
             json.dump(manifest, fp, indent=2, default=str)
@@ -226,7 +366,7 @@ def exportDeliveryPackage(vd, outpath, scope='current_derived', data_format=None
         with open(str(pkgdir / 'README.md'), 'w', encoding='utf-8') as fp:
             fp.write(readme)
 
-        _write_start_scripts(pkgdir, manifest)
+        _write_start_scripts(pkgdir)
 
         if is_zip:
             with zipfile.ZipFile(str(outpath), 'w', zipfile.ZIP_DEFLATED, allowZip64=True, compresslevel=9) as zfp:
@@ -247,7 +387,6 @@ def exportDeliveryPackage(vd, outpath, scope='current_derived', data_format=None
 
 
 def _generate_readme(manifest, data_format, is_zip):
-    'Generate README.md content for the delivery package.'
     lines = []
     lines.append('# VisiData Delivery Package')
     lines.append('')
@@ -258,16 +397,22 @@ def _generate_readme(manifest, data_format, is_zip):
     lines.append('')
     lines.append('## Quick Start')
     lines.append('')
-    lines.append('To reproduce this workspace:')
+    lines.append('To reproduce this workspace exactly:')
     lines.append('')
     lines.append('```bash')
     lines.append('# Option 1: Use the start script')
     lines.append('./start.sh        # Linux/macOS')
     lines.append('# start.bat        # Windows')
     lines.append('')
-    lines.append('# Option 2: Replay manually')
-    lines.append('vd -p replay.vdj')
+    lines.append('# Option 2: Replay the unified workspace entry directly')
+    lines.append('vd -p workspace.vdx')
     lines.append('```')
+    lines.append('')
+    lines.append('The single `workspace.vdx` replay file orchestrates everything:')
+    lines.append('- loading saved data sheets (column types preserved)')
+    lines.append('- restoring global options')
+    lines.append('- rebuilding graph sheets with exact view state')
+    lines.append('- replaying the original command log')
     lines.append('')
 
     if manifest['sheets']:
@@ -282,10 +427,10 @@ def _generate_readme(manifest, data_format, is_zip):
     if manifest['graphs']:
         lines.append('## Graphs')
         lines.append('')
-        lines.append('| Graph | File | Source Sheet |')
-        lines.append('|-------|------|--------------|')
+        lines.append('| Graph | Source Sheet | X Cols | Y Cols |')
+        lines.append('|-------|--------------|--------|--------|')
         for g in manifest['graphs']:
-            lines.append(f"| {g['name']} | `{g['file']}` | {g['sourceName']} |")
+            lines.append(f"| {g['name']} | {g['sourceName']} | {', '.join(g['xcols'])} | {', '.join(g['ycols'])} |")
         lines.append('')
 
     if manifest['macros']:
@@ -297,8 +442,8 @@ def _generate_readme(manifest, data_format, is_zip):
             lines.append(f"| {m['binding']} | `{m['file']}` | {m.get('helpstr', '')} |")
         lines.append('')
 
-    if manifest['cmdlog']:
-        lines.append(f"## Command Log\n\nReplay file: `{manifest['cmdlog']}` ({manifest.get('cmdlog_nrows', 0)} commands)\n")
+    if manifest.get('cmdlog_nrows', 0):
+        lines.append(f"## Command Log\n\n{manifest['cmdlog_nrows']} commands embedded in `workspace.vdx`\n")
 
     if manifest['config']:
         lines.append(f"## Configuration\n\nOptions saved in: `{manifest['config']}`\n")
@@ -309,11 +454,10 @@ def _generate_readme(manifest, data_format, is_zip):
     lines.append('package/')
     lines.append('  README.md                This file')
     lines.append('  manifest.json            Machine-readable package metadata')
-    lines.append('  replay.vdj               Full command log replay file')
-    lines.append('  start.sh / start.bat     Reproduce this workspace')
+    lines.append('  workspace.vdx            **Single unified replay entry point**')
+    lines.append('  start.sh / start.bat     Reproduce this workspace (vd -p workspace.vdx)')
     lines.append('  data/')
-    lines.append('    *.vds / *.tsv / ...    Sheet data (column types preserved in .vds)')
-    lines.append('    *.graph.json           Graph sheet state (view, axes, reflines)')
+    lines.append(f'    *.{data_format}'.ljust(25) + f'Sheet data (.vds preserves exact column types)')
     lines.append('  config/')
     lines.append('    options.json           Exported option settings')
     lines.append('    macros/')
@@ -324,17 +468,14 @@ def _generate_readme(manifest, data_format, is_zip):
     lines.append('')
     lines.append('- `.vds` format preserves column types and attributes exactly.')
     lines.append('- Other formats (tsv, csv, json) preserve values but types may need re-setting.')
-    lines.append('- The replay file (`replay.vdj`) reproduces the exact workflow used.')
+    lines.append('- Graph state (xcols/ycols/reflines/visibleBox) is embedded in workspace.vdx')
+    lines.append('  and restored automatically via the `restore-graph` replay command.')
     lines.append('')
 
     return '\n'.join(lines)
 
 
-def _write_start_scripts(pkgdir, manifest):
-    'Write shell and batch scripts for reproducing the workspace.'
-    has_cmdlog = bool(manifest.get('cmdlog'))
-    first_data = manifest['sheets'][0]['file'] if manifest['sheets'] else ''
-
+def _write_start_scripts(pkgdir):
     sh_path = pkgdir / 'start.sh'
     with open(str(sh_path), 'w', encoding='utf-8') as fp:
         fp.write('#!/usr/bin/env bash\n')
@@ -342,12 +483,7 @@ def _write_start_scripts(pkgdir, manifest):
         fp.write('set -e\n\n')
         fp.write('SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n')
         fp.write('cd "$SCRIPT_DIR"\n\n')
-        if has_cmdlog:
-            fp.write('vd -p replay.vdj "$@"\n')
-        elif first_data:
-            fp.write(f'vd {first_data} "$@"\n')
-        else:
-            fp.write('vd "$@"\n')
+        fp.write('vd -p workspace.vdx "$@"\n')
     os.chmod(str(sh_path), 0o755)
 
     bat_path = pkgdir / 'start.bat'
@@ -355,12 +491,7 @@ def _write_start_scripts(pkgdir, manifest):
         fp.write('@echo off\n')
         fp.write('REM Auto-generated by VisiData delivery package\n\n')
         fp.write('cd /d "%~dp0"\n\n')
-        if has_cmdlog:
-            fp.write('vd -p replay.vdj %*\n')
-        elif first_data:
-            fp.write(f'vd {first_data} %*\n')
-        else:
-            fp.write('vd %*\n')
+        fp.write('vd -p workspace.vdx %*\n')
 
 
 globalCommand('gP', 'export-delivery-package',
@@ -368,7 +499,7 @@ globalCommand('gP', 'export-delivery-package',
         inputPath("export delivery package to (directory or .zip): ", value=vd.activeSheet.name+"_delivery"),
         scope=input("scope [current_derived|current|all|stacked]: ", value="current_derived", defaultLast=True)
     )''',
-    'export reproducible delivery package with data, cmdlog, graphs, macros, and config')
+    'export reproducible delivery package with unified workspace.vdx entry')
 
 
 vd.addMenuItems('''
