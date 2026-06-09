@@ -30,6 +30,7 @@ from visidata import (
     ColumnsSheet, IndexSheet, TypedExceptionWrapper, anytype,
     TypedWrapper, ExplodingMock, Sheet,
 )
+from visidata.settings import OptionsObject
 
 
 vd.option('describe_aggrs', 'mean stdev', 'numeric aggregators to calculate on Diagnostics sheet', help=vd.help_aggregators if hasattr(vd, 'help_aggregators') else '')
@@ -44,8 +45,13 @@ vd.option('describe_aggrs', 'mean stdev', 'numeric aggregators to calculate on D
 def diagnosticCacheKey(sheet):
     """Tuple summarising the diagnostic inputs for *sheet*.
 
-    Components: sheet identity, visible column ids, key column ids, row ids.
-    Used by the runner to decide whether cached results are still valid.
+    Components:
+    - sheet identity
+    - visible column ids (order matters — display order affects panel)
+    - key column ids
+    - row ids (changes when rows are replaced, sorted, or filtered)
+    - diagnostic rules registry version (changes when a new rule is registered)
+    - describe_aggrs option value (changes which numeric aggregators are computed)
     """
     try:
         visible_ids = tuple(id(c) for c in getattr(sheet, 'visibleCols', []))
@@ -59,7 +65,9 @@ def diagnosticCacheKey(sheet):
         row_ids = tuple(id(r) for r in sheet.rows)
     except Exception:
         row_ids = ()
-    return (id(sheet), visible_ids, key_ids, row_ids)
+    rules_version = getattr(vd, '_diagnosticRulesVersion', 0)
+    aggrs_opt = tuple(getattr(vd.options, 'describe_aggrs', '').split())
+    return (id(sheet), visible_ids, key_ids, row_ids, rules_version, aggrs_opt)
 
 
 @Sheet.api
@@ -77,6 +85,43 @@ def markDiagnosticsDirty(sheet):
 
 
 Sheet.init('_diagnostics_dirty', lambda: True, copy=False)
+
+
+vd.diagnosticRules = collections.OrderedDict()
+vd._diagnosticRulesVersion = 0
+
+
+def _markAllSheetsDiagnosticsDirty():
+    """Mark every sheet in vd.sheets as needing diagnostic recomputation.
+
+    Called when the rule registry changes (new rule registered) or when
+    global options that affect diagnostic output (e.g. ``describe_aggrs``)
+    change value.
+    """
+    for s in getattr(vd, 'sheets', []) or []:
+        if hasattr(s, 'markDiagnosticsDirty'):
+            try:
+                s.markDiagnosticsDirty()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Option change hook — mark all sheets dirty when describe_aggrs changes
+
+try:
+    _orig_options_set = OptionsObject.set
+
+    def _patched_options_set(self, optname, value, *args, **kwargs):
+        if optname == 'describe_aggrs':
+            curval = getattr(self, 'describe_aggrs', None)
+        _orig_options_set(self, optname, value, *args, **kwargs)
+        if optname == 'describe_aggrs' and curval != value:
+            _markAllSheetsDiagnosticsDirty()
+
+    OptionsObject.set = _patched_options_set
+except Exception:
+    pass
 
 
 # =============================================================================
@@ -166,14 +211,13 @@ class SheetDiagnosticRule(DiagnosticRule):
         return isinstance(sheet, TableSheet)
 
 
-vd.diagnosticRules = collections.OrderedDict()
-
-
 @VisiData.api
 def diagnostic(vd, rule):
     if not rule.name:
         raise ValueError('diagnostic rules must have a .name')
     vd.diagnosticRules[rule.name] = rule
+    vd._diagnosticRulesVersion += 1
+    _markAllSheetsDiagnosticsDirty()
     return rule
 
 
