@@ -1,4 +1,9 @@
-# requirements: mutagen
+'''
+add metadata columns for audio files (MP3, FLAC, Ogg, etc)
+'''
+
+__dependencies__ = ['mutagen']
+__commands__ = ['addcol-audiometadata']
 
 import functools
 

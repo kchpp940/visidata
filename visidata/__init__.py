@@ -137,32 +137,7 @@ for line in core_imports.splitlines():
 vd.importSubmodules('visidata.loaders')
 
 
-def _register_builtin_features():
-    vd.featureRegistry.register('addcol_audiometadata', 'visidata.features.addcol_audiometadata',
-        dependencies=['mutagen'],
-        description='add metadata columns for audio files (MP3, FLAC, Ogg, etc)')
-    vd.featureRegistry.register('canvas_save_svg', 'visidata.features.canvas_save_svg',
-        dependencies=['matplotlib'],
-        description='save canvas as SVG using matplotlib')
-    vd.featureRegistry.register('graph_seaborn', 'visidata.features.graph_seaborn',
-        dependencies=['matplotlib', 'seaborn'],
-        description='plot columns using matplotlib/seaborn')
-    vd.featureRegistry.register('ping', 'visidata.features.ping',
-        dependencies=['sh'],
-        description='ping hosts and display results')
-    vd.featureRegistry.register('procmgr', 'visidata.features.procmgr',
-        dependencies=['psutil'],
-        description='process manager sheet')
-    vd.featureRegistry.register('repl', 'visidata.features.repl',
-        dependencies=['ptpython'],
-        description='embedded Python REPL using ptpython')
-    vd.featureRegistry.register('setcol_fake', 'visidata.features.setcol_fake',
-        dependencies=['faker'],
-        description='fill column with fake data using Faker library')
-
-
 def importFeatures():
-    _register_builtin_features()
     vd.featureRegistry.load_all('visidata.features')
     vd.importSubmodules('visidata.themes')
 

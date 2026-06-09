@@ -1,6 +1,9 @@
 '''
-Add plot-column-ext and plot-numerics-ext to Sheet, and plot-ext to GraphSheet, to open current graph in new matplotlib window.
+plot columns using matplotlib/seaborn
 '''
+
+__dependencies__ = ['matplotlib', 'seaborn']
+__commands__ = ['plot-column-ext', 'plot-numerics-ext', 'plot-ext']
 
 from visidata import vd, VisiData, Sheet, GraphSheet, Progress, asyncthread
 

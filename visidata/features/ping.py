@@ -1,5 +1,9 @@
-# requires shell tools: ping traceroute
-#   these tools aren't inlined as they require root privs
+'''
+ping hosts and display results
+'''
+
+__dependencies__ = ['sh']
+__commands__ = ['open-ping']
 
 import re
 import time

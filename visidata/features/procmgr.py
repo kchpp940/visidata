@@ -1,3 +1,14 @@
+'''
+process manager sheet
+'''
+
+__dependencies__ = ['psutil']
+__commands__ = [
+    'open-cpustats', 'open-memstats', 'open-processes',
+    'term-process', 'term-selected', 'kill-process', 'kill-selected',
+    'signal-process', 'signal-selected', 'open-rlimits',
+]
+
 from visidata import *
 
 

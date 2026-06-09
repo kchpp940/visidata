@@ -1,3 +1,9 @@
+'''
+open Describe Sheet with descriptive statistics for all visible columns
+'''
+
+__commands__ = ['describe-sheet', 'describe-all', 'describe-selected', 'select-cell', 'unselect-cell']
+
 from copy import copy
 from statistics import mode, median, mean, stdev
 

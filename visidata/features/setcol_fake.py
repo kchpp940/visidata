@@ -1,4 +1,9 @@
-# to anonymize a column in vd: do "setcol-fake" with e.g. 'name' 'isbn10' or any of the functions on Faker()
+'''
+fill column with fake data using Faker library
+'''
+
+__dependencies__ = ['faker']
+__commands__ = ['setcol-fake']
 
 import json
 
