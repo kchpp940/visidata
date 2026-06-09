@@ -3,7 +3,7 @@
        test test-all test-vgit test-vdsql \
        build man zsh-completion docker \
        setup-hooks setup-vscode lint \
-       diff-test clean preflight preflight-checks
+       diff-test clean preflight preflight-checks preflight-fix
 
 help:
 	@echo "Install:"
@@ -21,7 +21,9 @@ help:
 	@echo "  make docker            build docker images"
 	@echo ""
 	@echo "Release:"
-	@echo "  make preflight         run preflight release checks (version, imports, CLI, docs, formats, metadata, changelog)"
+	@echo "  make preflight-fix     auto-fix version/date/docs, then run preflight checks"
+	@echo "  make preflight         build manpages then run all preflight release checks"
+	@echo "  make preflight-checks  list available preflight checks and fixers"
 	@echo ""
 	@echo "Setup:"
 	@echo "  make setup-hooks       configure git to use dev/hooks"
@@ -91,7 +93,10 @@ clean:
 
 # Release Engineering
 
-preflight:
+preflight-fix:
+	python3 dev/preflight_check.py --fix
+
+preflight: man
 	python3 dev/preflight_check.py
 
 preflight-checks:

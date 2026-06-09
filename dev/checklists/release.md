@@ -1,25 +1,69 @@
 # Release process for the next `stable` version
 
-## Preflight Checks (Automated)
+## Preflight: Auto-Fix + Consistency Checks (Run First)
 
-Before starting the manual release steps, run the automated consistency checks:
+The preflight toolchains version synchronization, manpage generation, and
+consistency validation into a single engineering entry point. Always run it
+before manual release steps.
+
+### Quick Start
 
 ```bash
+# Recommended: auto-fix what can be auto-fixed, then validate
+make preflight-fix
+
+# Or: just rebuild docs and run checks (no file mutations beyond manpage generation)
 make preflight
-# or directly:
-python3 dev/preflight_check.py
 ```
 
-This validates:
-- **version**: version numbers in `setup.py`, `visidata/__init__.py`, `visidata/main.py`, and `README.md` all match
-- **imports**: all submodules under `features/`, `loaders/`, `themes/` have valid Python syntax and are listed in `setup.py` packages
-- **cli**: `console_scripts` entry points in `setup.py` resolve to real callable functions; `bin/vd` and `visidata/__main__.py` reference the same entry
-- **docs**: manpage artifacts (`vd.1`, `visidata.1`, `vd.txt`, `docs/man.md`) exist (run `make man` to regenerate)
-- **formats**: every internal format documented in `docs/internal_formats.md` has a corresponding `open_<ext>()` loader function in the codebase
-- **metadata**: all files referenced by `MANIFEST.in`, `setup.py package_data`, and `setup.py data_files` actually exist on disk
-- **changelog**: `CHANGELOG.md` has a heading for the current version
+### What It Does
 
-To list individual checks: `make preflight-checks`
+**Auto-Fixers** (run by `make preflight-fix` or `python3 dev/preflight_check.py --fix`):
+
+| Fixer | What it does |
+|---|---|
+| `--fix-version` | Syncs version numbers across all files from the **canonical source** `visidata/__init__.py` → updates `setup.py`, `visidata/main.py`, `README.md` |
+| `--fix-date`    | Updates the `.Dd` date line in `visidata/man/vd.inc` to today |
+| `--fix-docs`    | Rebuilds manpages (`vd.1`, `visidata.1`, `vd.txt`, `docs/man.md`) via `dev/mkman.sh` (requires `soelim`, `preconv` from groff; optionally `man`, `aha`) |
+
+**Checkers** (always run after fixes):
+
+| Check | What it validates |
+|---|---|
+| `version`   | `setup.py`, `visidata/__init__.py`, `visidata/main.py`, `README.md` all carry the same version |
+| `imports`   | All submodules under `features/`, `loaders/`, `themes/` have valid Python syntax and are declared in `setup.py packages` |
+| `cli`       | `console_scripts` entry points resolve to real callables; `bin/vd` and `visidata/__main__.py` reference `visidata.main:vd_cli` |
+| `docs`      | Manpage artifacts (`vd.1`, `visidata.1`, `vd.txt`, `docs/man.md`) exist on disk |
+| `formats`   | Every internal format in `docs/internal_formats.md` has a matching `open_<ext>()` function somewhere in the package |
+| `metadata`  | All paths referenced by `MANIFEST.in`, `setup.py package_data`, and `setup.py data_files` exist |
+| `changelog` | `CHANGELOG.md` contains a `# vX.Y` heading for the current version |
+
+### Diagnostics
+
+```bash
+# List all available checks and fixers
+make preflight-checks
+# or:
+python3 dev/preflight_check.py --list
+
+# Run only specific checks
+python3 dev/preflight_check.py version imports metadata
+
+# Run only a specific fixer
+python3 dev/preflight_check.py --fix-version       # just sync version numbers
+python3 dev/preflight_check.py --fix-date          # just update manpage date
+python3 dev/preflight_check.py --fix-docs          # just rebuild manpages
+```
+
+### Manpage Build Dependencies
+
+If `--fix-docs` complains about missing tools:
+
+```bash
+# macOS
+brew install groff    # provides soelim, preconv
+brew install aha      # provides aha (ANSI->HTML for man.txt)
+```
 
 ---
 
@@ -50,16 +94,20 @@ To list individual checks: `make preflight-checks`
 
    a. add to front of CHANGELOG, along with the release date and bullet points of major changes;
 
-   b. update the date in the manpage;
+   b. **(auto)** `python3 dev/preflight_check.py --fix-date` updates the date in the manpage;
 
-   c. update version number on README
+   c. **(auto)** `python3 dev/preflight_check.py --fix-version` updates version number on README and setup.py and visidata/main.py;
 
-   d. bump version in `__version__` in source code (visidata/main.py, visidata/__init__.py) and setup.py;
+   d. bump version in `__version__` in the canonical source `visidata/__init__.py` (this is what the auto-fixer syncs from);
 
-6. Run dev/mkman.sh to build the manpage and updated website
+6. **(auto)** `python3 dev/preflight_check.py --fix-docs` runs dev/mkman.sh to build the manpage and updated website
     - Run ./mkmanhtml.sh, and move that to visidata.org:site/docs/man, and to visidata:docs/man.md
 
-7. Merge `develop` to stable
+7. Run `make preflight` one final time to confirm everything is green before merging.
+
+8. Merge `develop` to stable
+
+(... rest of the existing release steps continue unchanged ...)
 
 14. motd
     a. Upload new motd for new version.

@@ -1,30 +1,87 @@
 #!/usr/bin/env python3
 """
-VisiData Preflight Check - Release Engineering Entry Point
+VisiData Preflight Check & Fix - Release Engineering Entry Point
 
 Performs consistency checks across version numbers, module imports,
 CLI entry points, documentation, internal formats, and packaging metadata.
 Run before building wheels/sdists or tagging a release.
 
 Usage:
-    python3 dev/preflight_check.py          # run all checks
-    python3 dev/preflight_check.py --list   # list available check names
-    python3 dev/preflight_check.py version  # run specific check(s)
+    python3 dev/preflight_check.py              # run all checks
+    python3 dev/preflight_check.py --list     # list available check names
+    python3 dev/preflight_check.py version      # run specific check(s)
+
+Auto-fix mode (modifies files in-place:
+    python3 dev/preflight_check.py --fix                 # run all auto-fix steps, then check
+    python3 dev/preflight_check.py --fix-version       # sync version numbers (canonical source: visidata/__init__.py)
+    python3 dev/preflight_check.py --fix-date          # update manpage date in visidata/man/vd.inc
+    python3 dev/preflight_check.py --fix-docs          # rebuild manpages via dev/mkman.sh
 """
 
+import argparse
 import ast
+import datetime
 import importlib
 import importlib.util
 import os
 import re
+import shutil
+import subprocess
 import sys
-import pkgutil
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 
 ROOT = Path(__file__).resolve().parent.parent
 VD = ROOT / "visidata"
+MAN_DIR = VD / "man"
+
+
+# ---------------------------------------------------------------------------
+# Canonical version source: visidata/__init__.py
+# ---------------------------------------------------------------------------
+
+VERSION_SOURCES: Dict[str, Tuple[Path, str]] = {
+    "visidata/__init__.py": (
+        VD / "__init__.py",
+        r"__version__\s*=\s*['\"]([^'\"]+)['\"]"
+    ),
+    "visidata/main.py": (
+        VD / "main.py",
+        r"__version__\s*=\s*['\"]([^'\"]+)['\"]"
+    ),
+    "setup.py": (
+        ROOT / "setup.py",
+        r'__version__\s*=\s*["\']([^"\']+)["\']'
+    ),
+    "README.md": (
+        ROOT / "README.md",
+        r"# VisiData v([\w.]+)"
+    ),
+}
+
+CANONICAL_VERSION_KEY = "visidata/__init__.py"
+
+
+class FixResult:
+    def __init__(self, name: str, ok: bool, message: str = "",
+                 changed: List[str] = None, skipped: List[str] = None):
+        self.name = name
+        self.ok = ok
+        self.message = message
+        self.changed = changed or []
+        self.skipped = skipped or []
+
+    def __str__(self) -> str:
+        status = "OK" if self.ok else "FAIL" if not self.changed else "DONE"
+        lines = [f"[{status}] {self.name}"]
+        if self.message:
+            lines.append(f"       {self.message}")
+        for c in self.changed:
+            lines.append(f"       + {c}")
+        for s in self.skipped:
+            lines.append(f"       ~ {s}")
+        return "\n".join(lines)
 
 
 class CheckResult:
@@ -58,35 +115,178 @@ def _normalize_version(v: str) -> str:
     return v.replace(".dev0", "dev").replace(".dev", "dev").replace("-", "")
 
 
-# ---------------------------------------------------------------------------
-# Individual checks
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Fixers
+# ===========================================================================
+
+def fix_version_numbers() -> FixResult:
+    """Sync version numbers across all source files from canonical source (visidata/__init__.py)."""
+    changed: List[str] = []
+    skipped: List[str] = []
+
+    canon_path, canon_pattern = VERSION_SOURCES[CANONICAL_VERSION_KEY]
+    canon_version = _read_version_from_file(canon_path, canon_pattern)
+    if not canon_version:
+        return FixResult("fix-version", False,
+                        f"Could not read canonical version from {CANONICAL_VERSION_KEY}")
+
+    for name, (path, pattern) in VERSION_SOURCES.items():
+        if name == CANONICAL_VERSION_KEY:
+            continue
+        if not path.exists():
+            skipped.append(f"{name}: {path} does not exist")
+            continue
+        current = _read_version_from_file(path, pattern)
+        if current and (name == "setup.py" or _normalize_version(current) == _normalize_version(canon_version)):
+            if current == canon_version:
+                skipped.append(f"{name}: already at {canon_version}")
+                continue
+        content = path.read_text(encoding="utf-8")
+        if name == "setup.py":
+            new_content = re.sub(
+                r'(__version__\s*=\s*["\'][^"\']+["\'])',
+                f'__version__ = "{canon_version}"',
+                content
+            )
+        elif name == "README.md":
+            new_content = re.sub(
+                r"# VisiData v[\w.]+",
+                f"# VisiData v{canon_version}",
+                content
+            )
+        else:
+            new_content = re.sub(
+                r"(__version__\s*=\s*['\"])[^'\"]+(['\"])",
+                rf"\g<1>{canon_version}\g<2>",
+                content
+            )
+        if new_content != content:
+            path.write_text(new_content, encoding="utf-8")
+            changed.append(f"{name}: updated to {canon_version}")
+        else:
+            skipped.append(f"{name}: already at {canon_version}")
+
+    if changed:
+        return FixResult("fix-version", True,
+                       f"Synced {len(changed)} file(s) to v{canon_version}",
+                       changed=changed, skipped=skipped)
+    return FixResult("fix-version", True,
+                   f"All files already at v{canon_version}",
+                   skipped=skipped)
+
+
+def fix_manpage_date() -> FixResult:
+    """Update the .Dd date line in visidata/man/vd.inc to today."""
+    changed: List[str] = []
+    vd_inc = MAN_DIR / "vd.inc"
+    if not vd_inc.exists():
+        return FixResult("fix-date", False, f"{vd_inc} does not exist")
+
+    today = datetime.date.today().strftime("%B %d, %Y")
+    content = vd_inc.read_text(encoding="utf-8")
+
+    new_content = re.sub(
+        r"^\.Dd .*$",
+        f".Dd {today}",
+        content,
+        count=1,
+        flags=re.MULTILINE,
+    )
+
+    if new_content != content:
+        vd_inc.write_text(new_content, encoding="utf-8")
+        return FixResult("fix-date", True,
+                       f"Updated manpage date to {today}",
+                       changed=[f"visidata/man/vd.inc: .Dd {today}"])
+    return FixResult("fix-date", True, "Manpage date already current")
+
+
+def _find_system_tool(name: str) -> Optional[str]:
+    """Return full path to tool if available on PATH, else None."""
+    return shutil.which(name)
+
+
+def fix_docs() -> FixResult:
+    """Rebuild manpages via dev/mkman.sh if system tools are available."""
+    changed: List[str] = []
+    skipped: List[str] = []
+
+    mkman = ROOT / "dev" / "mkman.sh"
+    if not mkman.exists():
+        return FixResult("fix-docs", False, f"{mkman} does not exist")
+
+    required_tools = ["soelim", "preconv"]
+    optional_tools = ["man", "aha"]
+
+    missing_req = [t for t in required_tools if not _find_system_tool(t)]
+    missing_opt = [t for t in optional_tools if not _find_system_tool(t)]
+
+    if missing_req:
+        hints = []
+        if "preconv" in missing_req:
+            hints.append("Install groff:  brew install groff")
+        if "aha" in missing_opt:
+            hints.append("Install aha:    brew install aha")
+        if missing_opt:
+            hints.insert(0, f"Optional tools missing: {', '.join(missing_opt)}")
+        return FixResult(
+            "fix-docs", False,
+            f"Missing required tools: {', '.join(missing_req)}",
+            skipped=hints or []
+        )
+
+    if missing_opt:
+        skipped.append(f"Optional tools unavailable: {', '.join(missing_opt)}")
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{ROOT}:{ROOT / 'visidata'}"
+    env["PATH"] = f"{ROOT / 'bin'}:{env.get('PATH', '')}"
+
+    try:
+        result = subprocess.run(
+            ["bash", str(mkman)],
+            cwd=str(ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "").strip()
+            return FixResult("fix-docs", False,
+                           f"mkman.sh exited {result.returncode}",
+                           skipped=err.splitlines()[-5:] if err else [])
+        changed.append("Ran dev/mkman.sh successfully")
+        for f in ["vd.1", "visidata.1", "vd.txt"]:
+            p = MAN_DIR / f
+            if p.exists():
+                changed.append(f"Generated visidata/man/{f} ({p.stat().st_size} bytes)")
+        docs_man = ROOT / "docs" / "man.md"
+        if docs_man.exists():
+            changed.append(f"Generated docs/man.md ({docs_man.stat().st_size} bytes)")
+        return FixResult("fix-docs", True,
+                       "Manpages rebuilt",
+                       changed=changed, skipped=skipped)
+    except Exception as e:
+        return FixResult("fix-docs", False, str(e))
+
+
+FIXERS: Dict[str, Callable[[], FixResult]] = {
+    "fix-version": fix_version_numbers,
+    "fix-date": fix_manpage_date,
+    "fix-docs": fix_docs,
+}
+
+
+# ===========================================================================
+# Checkers
+# ===========================================================================
 
 def check_version_consistency() -> CheckResult:
     """Verify version numbers are consistent across all source files."""
-    sources: Dict[str, Tuple[Path, str]] = {
-        "setup.py": (
-            ROOT / "setup.py",
-            r'__version__\s*=\s*["\']([^"\']+)["\']'
-        ),
-        "visidata/__init__.py": (
-            VD / "__init__.py",
-            r"__version__\s*=\s*['\"]([^'\"]+)['\"]"
-        ),
-        "visidata/main.py": (
-            VD / "main.py",
-            r"__version__\s*=\s*['\"]([^'\"]+)['\"]"
-        ),
-        "README.md": (
-            ROOT / "README.md",
-            r"# VisiData v([\w.]+)"
-        ),
-    }
-
     versions: Dict[str, str] = {}
     missing: List[str] = []
 
-    for name, (path, pattern) in sources.items():
+    for name, (path, pattern) in VERSION_SOURCES.items():
         v = _read_version_from_file(path, pattern)
         if v is None:
             missing.append(f"{name}: could not extract version from {path}")
@@ -105,9 +305,10 @@ def check_version_consistency() -> CheckResult:
                            f"All sources agree on version {list(versions.values())[0]}")
 
     details = [f"{k}: {v}" for k, v in sorted(versions.items())]
+    canon = versions.get(CANONICAL_VERSION_KEY, "?")
     return CheckResult(
         "version", False,
-        f"Version mismatch: found {len(unique)} distinct normalized versions {unique}",
+        f"Version mismatch (canonical source {CANONICAL_VERSION_KEY}={canon}); run --fix-version to sync",
         details
     )
 
@@ -129,7 +330,6 @@ def check_module_imports() -> CheckResult:
     details: List[str] = []
     errors: List[str] = []
 
-    # Parse packages list from setup.py
     setup_path = ROOT / "setup.py"
     setup_content = setup_path.read_text(encoding="utf-8")
     m = re.search(r"packages\s*=\s*\[(.*?)\]", setup_content, re.DOTALL)
@@ -137,7 +337,6 @@ def check_module_imports() -> CheckResult:
         return CheckResult("imports", False, "Could not parse packages list from setup.py")
     setup_packages = set(re.findall(r'"([^"]+)"', m.group(1)))
 
-    # Check that each directory in visidata/ with __init__.py is in setup.py
     for item in sorted(VD.iterdir()):
         if item.is_dir() and (item / "__init__.py").exists():
             pkg_name = f"visidata.{item.name}"
@@ -149,7 +348,6 @@ def check_module_imports() -> CheckResult:
 
     total_checked = 0
 
-    # Helper: check all .py files in a subpackage directory
     def check_subpkg_dir(dirpath: Path, pkg_prefix: str):
         nonlocal total_checked
         if not dirpath.exists():
@@ -183,7 +381,6 @@ def check_cli_entrypoints() -> CheckResult:
     errors: List[str] = []
     details: List[str] = []
 
-    # Parse entry_points from setup.py
     setup_content = (ROOT / "setup.py").read_text(encoding="utf-8")
     m = re.search(
         r'"console_scripts"\s*:\s*\[(.*?)\]',
@@ -202,7 +399,6 @@ def check_cli_entrypoints() -> CheckResult:
         target = target.strip()
         details.append(f"{script_name} -> {target}")
 
-        # Parse module:func
         if ":" not in target:
             errors.append(f"{script_name}: target '{target}' missing ':' separator")
             continue
@@ -226,7 +422,6 @@ def check_cli_entrypoints() -> CheckResult:
                 f"{script_name}: '{func_name}' in '{mod_name}' is not callable"
             )
 
-    # Also check bin/vd script
     bin_vd = ROOT / "bin" / "vd"
     if bin_vd.exists():
         try:
@@ -238,7 +433,6 @@ def check_cli_entrypoints() -> CheckResult:
     else:
         errors.append("bin/vd does not exist")
 
-    # Also check visidata/__main__.py
     main_py = VD / "__main__.py"
     if main_py.exists():
         content = main_py.read_text(encoding="utf-8")
@@ -261,31 +455,31 @@ def check_documentation() -> CheckResult:
     errors: List[str] = []
     details: List[str] = []
 
-    man_dir = VD / "man"
     required_files = ["vd.1", "visidata.1", "vd.txt"]
     for f in required_files:
-        p = man_dir / f
+        p = MAN_DIR / f
         if p.exists():
             details.append(f"{f}: present ({p.stat().st_size} bytes)")
         else:
-            errors.append(f"{man_dir.name}/{f} missing - run `make man` first")
+            errors.append(f"visidata/man/{f} missing - run --fix-docs (or `make man`)")
 
-    # Check docs/man.md
     docs_man = ROOT / "docs" / "man.md"
     if docs_man.exists():
         details.append(f"docs/man.md: present ({docs_man.stat().st_size} bytes)")
     else:
-        errors.append("docs/man.md missing - run `make man` first")
+        errors.append("docs/man.md missing - run --fix-docs (or `make man`)")
 
-    # Check that parse_options.py exists
-    parse_opts = man_dir / "parse_options.py"
+    parse_opts = MAN_DIR / "parse_options.py"
     if not parse_opts.exists():
-        errors.append(f"{man_dir.name}/parse_options.py missing")
+        errors.append("visidata/man/parse_options.py missing")
 
-    # Check vd.inc exists
-    vd_inc = man_dir / "vd.inc"
-    if not vd_inc.exists():
-        errors.append(f"{man_dir.name}/vd.inc missing")
+    vd_inc = MAN_DIR / "vd.inc"
+    if vd_inc.exists():
+        m = re.search(r"^\.Dd (.*)$", vd_inc.read_text(encoding="utf-8"), re.MULTILINE)
+        if m:
+            details.append(f"visidata/man/vd.inc: dated {m.group(1).strip()}")
+    else:
+        errors.append("visidata/man/vd.inc missing")
 
     if errors:
         return CheckResult("docs", False,
@@ -329,7 +523,6 @@ def check_internal_formats() -> CheckResult:
     documented_formats = set(re.findall(r"## (\.\w+)", doc_content))
     details.append(f"Documented internal formats: {sorted(documented_formats)}")
 
-    # Find all open_<ext> functions across the package
     loaders_map = _find_open_functions()
     details.append(f"Discovered open_<ext> functions: {len(loaders_map)}")
 
@@ -356,7 +549,6 @@ def check_packaging_metadata() -> CheckResult:
     errors: List[str] = []
     details: List[str] = []
 
-    # Parse MANIFEST.in entries
     manifest = ROOT / "MANIFEST.in"
     if not manifest.exists():
         return CheckResult("metadata", False, "MANIFEST.in not found")
@@ -375,27 +567,20 @@ def check_packaging_metadata() -> CheckResult:
             for pat in patterns:
                 matches = list(base.glob(pat)) if "*" in pat or "?" in pat else [base / pat]
                 if not matches or not any(m.exists() for m in matches):
-                    errors.append(f"MANIFEST.in: {directive} {pat} matches nothing")
+                    errors.append(f"MANIFEST.in: {directive} {pat} matches nothing - run --fix-docs")
 
-    # Check setup.py package_data references
     setup_content = (ROOT / "setup.py").read_text(encoding="utf-8")
     m = re.search(r'package_data\s*=\s*\{(.*?)\}\s*,', setup_content, re.DOTALL)
     if m:
-        pkgdata_block = m.group(1)
-        for fpat in re.findall(r'"([^"]+)"', pkgdata_block):
-            if "/" in fpat and not any(c in fpat for c in "*?["):
-                # Check actual file references (not glob patterns)
-                pass  # package_data paths are relative to packages, skip deep check
         details.append("setup.py package_data block parsed")
 
-    # Check setup.py data_files references
     m = re.search(r'data_files\s*=\s*\[(.*?)\]\s*,', setup_content, re.DOTALL)
     if m:
         data_block = m.group(1)
         for f in re.findall(r'\[f for f in \["([^"]+)"', data_block):
             p = ROOT / f
             if not p.exists():
-                errors.append(f"setup.py data_files: {f} does not exist")
+                errors.append(f"setup.py data_files: {f} does not exist - run --fix-docs")
         for f in re.findall(r'\["([^"]+)"\]', data_block):
             if f.startswith("share/"):
                 continue
@@ -404,7 +589,6 @@ def check_packaging_metadata() -> CheckResult:
                 errors.append(f"setup.py data_files: {f} does not exist")
         details.append("setup.py data_files block parsed")
 
-    # Check desktop files exist
     desktop_dir = VD / "desktop"
     for f in ["visidata.desktop", "org.visidata.VisiData.metainfo.xml"]:
         p = desktop_dir / f
@@ -413,7 +597,6 @@ def check_packaging_metadata() -> CheckResult:
         else:
             errors.append(f"visidata/desktop/{f}: missing")
 
-    # Check icon files
     for size in ["32x32", "48x48"]:
         p = desktop_dir / "icons" / size / "visidata.png"
         if p.exists():
@@ -421,7 +604,6 @@ def check_packaging_metadata() -> CheckResult:
         else:
             errors.append(f"visidata/desktop/icons/{size}/visidata.png: missing")
 
-    # Check ddw files
     ddw_dir = VD / "ddw"
     for f in ["input.ddw", "regex.ddw"]:
         p = ddw_dir / f
@@ -447,7 +629,6 @@ def check_changelog() -> CheckResult:
 
     content = cl_path.read_text(encoding="utf-8")
 
-    # Extract version from visidata/__init__.py
     v = _read_version_from_file(
         VD / "__init__.py",
         r"__version__\s*=\s*['\"]([^'\"]+)['\"]"
@@ -455,7 +636,6 @@ def check_changelog() -> CheckResult:
     if not v:
         return CheckResult("changelog", False, "Could not read current version")
 
-    # Strip dev suffix for comparison
     v_clean = v.replace("dev", "").replace(".", "")
     found = False
     for line in content.splitlines():
@@ -476,10 +656,6 @@ def check_changelog() -> CheckResult:
     )
 
 
-# ---------------------------------------------------------------------------
-# Check registry
-# ---------------------------------------------------------------------------
-
 CHECKS: Dict[str, Callable[[], CheckResult]] = {
     "version": check_version_consistency,
     "imports": check_module_imports,
@@ -491,20 +667,94 @@ CHECKS: Dict[str, Callable[[], CheckResult]] = {
 }
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    argv = argv or sys.argv[1:]
+# ===========================================================================
+# Main
+# ===========================================================================
 
-    if "--list" in argv:
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="VisiData Preflight Check & Fix",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Examples:
+  %(prog)s                     run all checks
+  %(prog)s --list              list available check names
+  %(prog)s version imports      run only version and imports checks
+  %(prog)s --fix              run all auto-fix steps then check
+  %(prog)s --fix-version      sync version numbers only
+  %(prog)s --fix-date         update manpage date only
+  %(prog)s --fix-docs         rebuild manpages only
+""",
+    )
+    parser.add_argument("--list", action="store_true",
+                        help="list available check names and exit")
+    parser.add_argument("--fix", action="store_true",
+                        help="run all auto-fix steps, then run checks")
+    parser.add_argument("--fix-version", action="store_true",
+                        help=f"sync version numbers across files from canonical source")
+    parser.add_argument("--fix-date", action="store_true",
+                        help="update manpage date in visidata/man/vd.inc to today")
+    parser.add_argument("--fix-docs", action="store_true",
+                        help="rebuild manpages via dev/mkman.sh")
+    parser.add_argument("checks", nargs="*",
+                        help="specific check(s) to run (default: all)")
+
+    args = parser.parse_args(argv)
+
+    if args.list:
         print("Available preflight checks:")
         for name in sorted(CHECKS):
             fn = CHECKS[name]
             doc = (fn.__doc__ or "").strip().splitlines()[0]
             print(f"  {name:12s}  {doc}")
+        print()
+        print("Available auto-fixers:")
+        for name in sorted(FIXERS):
+            fn = FIXERS[name]
+            doc = (fn.__doc__ or "").strip().splitlines()[0]
+            print(f"  {name:15s}  {doc}")
         return 0
 
-    selected = argv if argv else list(CHECKS.keys())
+    # --- Fix phase ---
+    any_fix = args.fix or args.fix_version or args.fix_date or args.fix_docs
+    fixers_to_run: List[str] = []
 
-    # Validate names
+    if args.fix:
+        fixers_to_run = list(FIXERS.keys())
+    else:
+        if args.fix_version:
+            fixers_to_run.append("fix-version")
+        if args.fix_date:
+            fixers_to_run.append("fix-date")
+        if args.fix_docs:
+            fixers_to_run.append("fix-docs")
+
+    if fixers_to_run:
+        print("=" * 60)
+        print("VisiData Preflight Auto-Fix")
+        print(f"Root: {ROOT}")
+        print("=" * 60)
+        print()
+
+        fix_results: List[FixResult] = []
+        for fname in fixers_to_run:
+            if fname not in FIXERS:
+                continue
+            fr = FIXERS[fname]()
+            fix_results.append(fr)
+            print(str(fr))
+            print()
+
+        fix_ok = all(r.ok for r in fix_results)
+        if not fix_ok:
+            print("=" * 60)
+            print("Some fix steps failed. See details above.")
+            print("=" * 60)
+            return 1
+
+    # --- Check phase ---
+    selected = args.checks or list(CHECKS.keys())
+
     invalid = [n for n in selected if n not in CHECKS]
     if invalid:
         print(f"Unknown check(s): {', '.join(invalid)}", file=sys.stderr)
@@ -533,8 +783,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if failed > 0:
         print()
-        print("Fix the issues above before building or tagging a release.")
-        print("For documentation issues, run:  make man")
+        if any_fix:
+            print("Remaining issues after auto-fix:")
+        else:
+            print("Issues found. Try:  python3 dev/preflight_check.py --fix")
+            print("Or run individual fixers:")
+            print("  --fix-version   sync version numbers")
+            print("  --fix-date      update manpage date")
+            print("  --fix-docs      rebuild manpages")
         return 1
 
     return 0
