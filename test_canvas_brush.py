@@ -6,7 +6,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 import visidata
-from visidata import vd, Canvas, Box, TableSheet, Column, AttrDict
+from visidata import vd, Canvas, Box, TableSheet, Column, AttrDict, GraphSheet
+from visidata.loaders.vdx import save_vdx, CommandLogSimple
+import io
+import tempfile
+import os
 
 vd.options.disp_graph_labels = False
 
@@ -19,12 +23,11 @@ def make_source_sheet(with_keys=True, sheet_name='testsrc'):
         c.getter = lambda col, row: row[col.name]
         return c
 
-    src.columns = [
-        make_col('idx', type=int),
-        make_col('x', type=float),
-        make_col('y', type=float),
-        make_col('label'),
-    ]
+    src.addColumn(make_col('idx', type=int))
+    src.addColumn(make_col('x', type=float))
+    src.addColumn(make_col('y', type=float))
+    src.addColumn(make_col('label'))
+
     rows = []
     for i in range(10):
         r = AttrDict({'idx': i, 'x': float(i), 'y': float(i*2), 'label': 'p%d' % i})
@@ -363,6 +366,205 @@ def test_load_named_selection_validates_source():
     }
     warns = cvs2._validateBrushContext(ctx_for_validate)
     assert any('source sheet mismatch' in w for w in warns), 'must detect source sheet mismatch on load'
+
+
+def test_brush_replay_ctx_reads_from_getLastArgs():
+    src = make_source_sheet(with_keys=True)
+    cvs = make_canvas(src)
+
+    assert cvs._brushReplayCtx() is None, 'no replay row set, should return None'
+
+    bb = Box(0.0, 0.0, 5.0, 10.0)
+    rows = cvs.rowsWithinDataBox(bb.xmin, bb.ymin, bb.xmax, bb.ymax)
+    ctxstr = cvs._makeBrushContext(rows, bb)
+
+    vd.currentReplayRow = AttrDict(longname='select-cursor', input=ctxstr)
+    try:
+        got = cvs._brushReplayCtx()
+        assert got is not None
+        assert got.startswith(Canvas.VD_BRUSH_CONTEXT_PREFIX)
+    finally:
+        vd.currentReplayRow = None
+
+
+def test_brush_replay_ctx_ignores_plain_bbox():
+    src = make_source_sheet(with_keys=True)
+    cvs = make_canvas(src)
+
+    vd.currentReplayRow = AttrDict(longname='select-cursor', input='0.0 10.0 0.0 20.0')
+    try:
+        got = cvs._brushReplayCtx()
+        assert got is None, 'plain bbox string is not a brush context, should return None'
+    finally:
+        vd.currentReplayRow = None
+
+
+def test_brush_select_in_replay_mode_uses_saved_rowkeys():
+    src1 = make_source_sheet(with_keys=True)
+    cvs1 = make_canvas(src1)
+    bb = Box(2.0, 4.0, 5.0, 10.0)
+    rows1 = cvs1.rowsWithinDataBox(bb.xmin, bb.ymin, bb.xmax, bb.ymax)
+    ctxstr = cvs1._makeBrushContext(rows1, bb)
+    orig_idxs = sorted([r.idx for r in rows1])
+
+    src2 = make_source_sheet(with_keys=True)
+    cvs2 = make_canvas(src2)
+    cvs2.cursorBox = None
+
+    vd.currentReplayRow = AttrDict(longname='select-cursor', input=ctxstr)
+    try:
+        cvs2.brushSelect()
+        vd.sync()
+    finally:
+        vd.currentReplayRow = None
+
+    selected = [r for r in src2.rows if src2.isSelected(r)]
+    sel_idxs = sorted([r.idx for r in selected])
+    assert sel_idxs == orig_idxs, 'replay should select same rows by key, even with no cursorBox'
+
+
+def test_graphsheet_point_stores_source_row_in_polylines():
+    src = make_source_sheet(with_keys=True)
+    xcol = src.column('x')
+    ycol = src.column('y')
+
+    gs = GraphSheet('testgraph', source=src, sourceRows=src.rows, xcols=[xcol], ycols=[ycol])
+    gs.ensureLoaded()
+    vd.sync()
+
+    assert len(gs.polylines) == 10, 'GraphSheet.reload should plot 10 points'
+    for vertexes, attr, row in gs.polylines:
+        assert row is not None
+        assert 'idx' in row
+        assert len(vertexes) == 1
+
+
+def test_graphsheet_rows_within_data_box_matches_points():
+    src = make_source_sheet(with_keys=True)
+    xcol = src.column('x')
+    ycol = src.column('y')
+
+    gs = GraphSheet('testgraph2', source=src, sourceRows=src.rows, xcols=[xcol], ycols=[ycol])
+    gs.ensureLoaded()
+    vd.sync()
+
+    found = gs.rowsWithinDataBox(1.0, 2.0, 4.0, 8.0)
+    idxs = sorted([r.idx for r in found])
+    assert idxs == [1, 2, 3, 4]
+
+
+def test_graphsheet_has_stable_rowkeys_detects_source_keycols():
+    src_keys = make_source_sheet(with_keys=True)
+    xcol = src_keys.column('x')
+    ycol = src_keys.column('y')
+    gs1 = GraphSheet('gs_keys', source=src_keys, sourceRows=src_keys.rows, xcols=[xcol], ycols=[ycol])
+    gs1.ensureLoaded()
+    assert gs1._hasStableRowkeys() is True
+
+    src_nokeys = make_source_sheet(with_keys=False)
+    gs2 = GraphSheet('gs_nok', source=src_nokeys, sourceRows=src_nokeys.rows, xcols=[src_nokeys.column('x')], ycols=[src_nokeys.column('y')])
+    gs2.ensureLoaded()
+    assert gs2._hasStableRowkeys() is False
+
+
+def test_vdx_save_brush_context_roundtrip():
+    src = make_source_sheet(with_keys=True)
+    cvs = make_canvas(src)
+    bb = Box(0.0, 0.0, 5.0, 10.0)
+    rows = cvs.rowsWithinDataBox(bb.xmin, bb.ymin, bb.xmax, bb.ymax)
+    ctxstr = cvs._makeBrushContext(rows, bb)
+
+    logrow = AttrDict(
+        sheet='testsrc',
+        col='',
+        row='',
+        longname='select-cursor',
+        input=ctxstr,
+        keystrokes='s',
+        comment='',
+    )
+
+    class FakeCmdlog:
+        rows = [logrow]
+        options = AttrDict(save_encoding='utf-8')
+
+    tmpfd, tmppath = tempfile.mkstemp(suffix='.vdx')
+    os.close(tmpfd)
+    try:
+        save_vdx(vd, Path(tmppath), FakeCmdlog())
+        vdx_text = Path(tmppath).read_text(encoding='utf-8')
+    finally:
+        os.unlink(tmppath)
+
+    assert 'select-cursor' in vdx_text
+    assert Canvas.VD_BRUSH_CONTEXT_PREFIX in vdx_text
+
+    lines = [l for l in vdx_text.splitlines() if l and not l.startswith('#') and not l.startswith('!')]
+    assert len(lines) >= 1
+    cmdline = [l for l in lines if 'select-cursor' in l][0]
+
+    longname, *rest = cmdline.split(' ', maxsplit=1)
+    assert longname == 'select-cursor'
+    saved_input = rest[0] if rest else ''
+    assert saved_input.startswith(Canvas.VD_BRUSH_CONTEXT_PREFIX)
+
+    bbox, rk, ctx = cvs._parseBrushContext(saved_input)
+    assert rk is not None
+    assert len(rk) == 6
+    assert ctx['source_sheet'] == 'testsrc'
+
+
+def test_vdx_roundtrip_selects_by_rowkey_on_fresh_graphsheet():
+    src1 = make_source_sheet(with_keys=True, sheet_name='roundtrip_src')
+    xcol1 = src1.column('x')
+    ycol1 = src1.column('y')
+    gs1 = GraphSheet('rtgraph1', source=src1, sourceRows=src1.rows, xcols=[xcol1], ycols=[ycol1])
+    gs1.ensureLoaded()
+    vd.sync()
+
+    bb = Box(1.0, 2.0, 5.0, 10.0)
+    rows1 = gs1.rowsWithinDataBox(bb.xmin, bb.ymin, bb.xmax, bb.ymax)
+    ctxstr = gs1._makeBrushContext(rows1, bb)
+    orig_idxs = sorted([r.idx for r in rows1])
+
+    logrow = AttrDict(sheet='rtgraph2', col='', row='', longname='select-cursor', input=ctxstr, keystrokes='s', comment='')
+
+    class FakeCmdlog:
+        rows = [logrow]
+        options = AttrDict(save_encoding='utf-8')
+
+    tmpfd, tmppath = tempfile.mkstemp(suffix='.vdx')
+    os.close(tmpfd)
+    try:
+        save_vdx(vd, Path(tmppath), FakeCmdlog())
+        vdx_text = Path(tmppath).read_text(encoding='utf-8')
+    finally:
+        os.unlink(tmppath)
+
+    src2 = make_source_sheet(with_keys=True, sheet_name='roundtrip_src')
+    xcol2 = src2.column('x')
+    ycol2 = src2.column('y')
+    gs2 = GraphSheet('rtgraph2', source=src2, sourceRows=src2.rows, xcols=[xcol2], ycols=[ycol2])
+    gs2.ensureLoaded()
+    vd.sync()
+
+    lines = [l for l in vdx_text.splitlines() if l and not l.startswith('#') and not l.startswith('!') and 'select-cursor' in l]
+    assert lines
+    cmdline = lines[0]
+    longname, *rest = cmdline.split(' ', maxsplit=1)
+    replay_input = rest[0] if rest else ''
+
+    vd.currentReplayRow = AttrDict(longname=longname, input=replay_input)
+    vd.push(gs2)
+    try:
+        gs2.brushSelect()
+        vd.sync()
+    finally:
+        vd.currentReplayRow = None
+
+    selected = [r for r in src2.rows if src2.isSelected(r)]
+    sel_idxs = sorted([r.idx for r in selected])
+    assert sel_idxs == orig_idxs, 'VDX roundtrip should select exact same rows by stable key'
 
 
 if __name__ == '__main__':

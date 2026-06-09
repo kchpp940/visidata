@@ -896,8 +896,23 @@ class Canvas(Plotter):
         rows, _, _ = self._resolveRowsFromContext(ctxstr)
         self.source.unselect(rows, add_undo=add_undo)
 
+    def _brushReplayCtx(self):
+        'If in replay mode with valid saved brush context, return ctxstr. Otherwise return None.'
+        ctxstr = vd.getLastArgs()
+        if not ctxstr:
+            return None
+        s = str(ctxstr).strip()
+        if s.startswith(self.VD_BRUSH_CONTEXT_PREFIX) or s.startswith('{'):
+            return s
+        return None
+
     def brushSelect(self):
         'Select source rows within current cursor box, recording full brush context (bbox+rowkeys) for cmdlog replay.'
+        ctxstr = self._brushReplayCtx()
+        if ctxstr:
+            self.selectBbox(ctxstr)
+            vd.setLastArgs(ctxstr)
+            return
         if not self.cursorBox:
             return
         rows = self.rowsWithinDataBox(self.cursorBox.xmin, self.cursorBox.ymin,
@@ -908,6 +923,11 @@ class Canvas(Plotter):
 
     def brushToggle(self):
         'Toggle selection of source rows within current cursor box, recording full brush context (bbox+rowkeys) for cmdlog replay.'
+        ctxstr = self._brushReplayCtx()
+        if ctxstr:
+            self.stoggleBbox(ctxstr)
+            vd.setLastArgs(ctxstr)
+            return
         if not self.cursorBox:
             return
         rows = self.rowsWithinDataBox(self.cursorBox.xmin, self.cursorBox.ymin,
@@ -918,6 +938,11 @@ class Canvas(Plotter):
 
     def brushUnselect(self):
         'Unselect source rows within current cursor box, recording full brush context (bbox+rowkeys) for cmdlog replay.'
+        ctxstr = self._brushReplayCtx()
+        if ctxstr:
+            self.unselectBbox(ctxstr)
+            vd.setLastArgs(ctxstr)
+            return
         if not self.cursorBox:
             return
         rows = self.rowsWithinDataBox(self.cursorBox.xmin, self.cursorBox.ymin,
@@ -928,6 +953,11 @@ class Canvas(Plotter):
 
     def brushVisibleSelect(self):
         'Select source rows within visible canvas, recording full brush context (bbox+rowkeys) for cmdlog replay.'
+        ctxstr = self._brushReplayCtx()
+        if ctxstr:
+            self.selectBbox(ctxstr)
+            vd.setLastArgs(ctxstr)
+            return
         if not self.visibleBox:
             return
         rows = self.rowsWithinDataBox(self.visibleBox.xmin, self.visibleBox.ymin,
@@ -938,6 +968,11 @@ class Canvas(Plotter):
 
     def brushVisibleToggle(self):
         'Toggle selection of source rows within visible canvas, recording full brush context (bbox+rowkeys) for cmdlog replay.'
+        ctxstr = self._brushReplayCtx()
+        if ctxstr:
+            self.stoggleBbox(ctxstr)
+            vd.setLastArgs(ctxstr)
+            return
         if not self.visibleBox:
             return
         rows = self.rowsWithinDataBox(self.visibleBox.xmin, self.visibleBox.ymin,
@@ -948,6 +983,11 @@ class Canvas(Plotter):
 
     def brushVisibleUnselect(self):
         'Unselect source rows within visible canvas, recording full brush context (bbox+rowkeys) for cmdlog replay.'
+        ctxstr = self._brushReplayCtx()
+        if ctxstr:
+            self.unselectBbox(ctxstr)
+            vd.setLastArgs(ctxstr)
+            return
         if not self.visibleBox:
             return
         rows = self.rowsWithinDataBox(self.visibleBox.xmin, self.visibleBox.ymin,
