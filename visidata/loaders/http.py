@@ -104,6 +104,7 @@ def openurl_http(vd, path, filetype=None):
         'http', source_params, _fetch,
         text=False,
         with_meta=True,
+        required_meta_keys=['headers'],
         status_online=f'fetching {path.given}',
         status_offline=f'offline: using cached data for `{path.given}`',
     )
@@ -116,10 +117,17 @@ def openurl_http(vd, path, filetype=None):
     with body_cp.open_bytes() as fp:
         body_bytes = fp.read()
 
+    degraded = bool(meta and meta.get('_meta_degraded'))
     if meta and meta.get('headers'):
         response = _HttpCachedResponse(meta['headers'])
     else:
         response = None
+        if not degraded:
+            degraded = True
+
+    if degraded:
+        vd.warning(f'HTTP cache for `{path.given}` missing response headers; '
+                   'filetype guessing and pagination will fall back to URL/path only')
 
     if response is not None:
         filetype = filetype or vd.guessFiletype(path, response, funcprefix='guessurl_').get('filetype')
@@ -171,6 +179,7 @@ def openurl_http(vd, path, filetype=None):
                 'http', next_params, _next_fetch,
                 text=False,
                 with_meta=True,
+                required_meta_keys=['headers'],
                 status_online=f'fetching next page from {src}',
                 status_offline=f'offline: using cached data for `{src}`',
             )
@@ -183,6 +192,8 @@ def openurl_http(vd, path, filetype=None):
                     cur_resp = _HttpCachedResponse(next_meta['headers'])
                 else:
                     cur_resp = None
+                    if not (next_meta and next_meta.get('_meta_degraded')):
+                        vd.warning(f'next page cache for `{src}` missing response headers; pagination will stop')
             except Exception as e:
                 vd.warning(f'cannot fetch next page from {src}: {e}')
                 break

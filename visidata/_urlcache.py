@@ -22,15 +22,20 @@ class RemoteSourceSpec(dict):
                          (data_bytes_or_str, meta_dict) where meta_dict is JSON-serializable
 
     Optional keys:
-        days            -- cache TTL in days (default: options.remote_cache_days)
-        text            -- True for UTF-8 text, False for binary (default: True)
-        force_refresh   -- skip cache check, always fetch (default: False)
-        parse_fn        -- callable(raw_data) -> structured data (default: None)
-        with_meta       -- if True, remote_open returns (result, meta) tuple;
-                           meta is a dict (or None if not available) (default: False)
-        status_online   -- status message when fetching live
-        status_offline  -- status message when falling back to stale cache
-        error_msg       -- failure message prefix when fetch fails and no cache
+        days                -- cache TTL in days (default: options.remote_cache_days)
+        text                -- True for UTF-8 text, False for binary (default: True)
+        force_refresh       -- skip cache check, always fetch (default: False)
+        parse_fn            -- callable(raw_data) -> structured data (default: None)
+        with_meta           -- if True, remote_open returns (result, meta) tuple;
+                               meta is a dict (or None if not available) (default: False)
+        required_meta_keys  -- list of meta keys that MUST be present alongside the body
+                               for the cache entry to be considered valid.  If body exists
+                               but meta is missing any of these keys, the body is treated
+                               as stale and a refresh is attempted before falling back
+                               with a clear degradation signal.  (default: [])
+        status_online       -- status message when fetching live
+        status_offline      -- status message when falling back to stale cache
+        error_msg           -- failure message prefix when fetch fails and no cache
     '''
     __slots__ = ()
 
@@ -41,6 +46,7 @@ class RemoteSourceSpec(dict):
         'force_refresh': False,
         'parse_fn': None,
         'with_meta': False,
+        'required_meta_keys': [],
         'status_online': None,
         'status_offline': None,
         'error_msg': None,
@@ -161,6 +167,27 @@ def _apply_result(data, text, parse_fn, cp):
     return cp
 
 
+def _meta_validate(meta, required_keys):
+    '''Return True if meta is present and contains every key in required_keys.
+
+    An empty required_keys list always validates as True, even when meta is None.
+    '''
+    if not required_keys:
+        return True
+    if not isinstance(meta, dict):
+        return False
+    return all(k in meta for k in required_keys)
+
+
+def _meta_missing_keys(meta, required_keys):
+    '''Return a list of required keys that are missing from meta (informational).'''
+    if not required_keys:
+        return []
+    if not isinstance(meta, dict):
+        return list(required_keys)
+    return [k for k in required_keys if k not in meta]
+
+
 @VisiData.global_api
 def make_remote_spec(vd, source_type, source_params, fetch_fn, **kwargs):
     '''Build a RemoteSourceSpec.  Convenience constructor equivalent to RemoteSourceSpec(...).'''
@@ -263,6 +290,7 @@ def remote_open(vd, spec):
     force_refresh = spec['force_refresh']
     parse_fn = spec['parse_fn']
     with_meta = spec['with_meta']
+    required_meta_keys = spec['required_meta_keys'] or []
     status_online = spec['status_online']
     status_offline = spec['status_offline']
     error_msg = spec['error_msg']
@@ -270,12 +298,31 @@ def remote_open(vd, spec):
     key = vd.remote_key(source_type, source_params)
     cp = _cache_path_for(key)
 
-    if not force_refresh and _cache_is_fresh(cp, days):
-        vd.debug(f'remote cache hit for {source_type}')
-        meta = _meta_read(key)
-        result = _apply_result(None, text, parse_fn, cp)
-        return (result, meta) if with_meta else result
+    def _return_from_cache(cached_meta, degraded=False):
+        '''Build the return value from cache data and meta.
 
+        When degraded is True (meta missing required keys even after fallback), the
+        meta dict will contain a special `_meta_degraded: True` marker so callers
+        can detect the incomplete state.
+        '''
+        if degraded and isinstance(cached_meta, dict):
+            cached_meta = dict(cached_meta)
+            cached_meta['_meta_degraded'] = True
+        elif degraded and cached_meta is None:
+            cached_meta = {'_meta_degraded': True}
+        result = _apply_result(None, text, parse_fn, cp)
+        return (result, cached_meta) if with_meta else result
+
+    # Fast path: fresh body and valid meta together
+    if not force_refresh and _cache_is_fresh(cp, days):
+        meta = _meta_read(key)
+        if _meta_validate(meta, required_meta_keys):
+            vd.debug(f'remote cache hit for {source_type}')
+            return _return_from_cache(meta)
+        missing = _meta_missing_keys(meta, required_meta_keys)
+        vd.debug(f'remote cache body fresh but meta incomplete for {source_type} (missing {missing}); attempting refresh')
+
+    # Try a live fetch (either because body was stale, or meta was incomplete)
     try:
         if status_online:
             vd.status(status_online)
@@ -303,12 +350,18 @@ def remote_open(vd, spec):
         return (result, meta) if with_meta else result
 
     except Exception as e:
+        # Live fetch failed; attempt stale-body fallback
         if cp.exists() and vd.options.remote_offline_fallback:
-            offline_msg = status_offline or f'offline: using cached data for `{source_type}`'
-            vd.warning(f'{offline_msg}; {e}')
             meta = _meta_read(key)
-            result = _apply_result(None, text, parse_fn, cp)
-            return (result, meta) if with_meta else result
+            if _meta_validate(meta, required_meta_keys):
+                offline_msg = status_offline or f'offline: using cached data for `{source_type}`'
+                vd.warning(f'{offline_msg}; {e}')
+                return _return_from_cache(meta)
+            # Body exists but meta is incomplete — explicit degraded signal
+            missing = _meta_missing_keys(meta, required_meta_keys)
+            offline_msg = status_offline or f'offline: using cached data for `{source_type}`'
+            vd.warning(f'{offline_msg}; missing meta keys {missing}; {e}')
+            return _return_from_cache(meta, degraded=True)
 
         if error_msg:
             vd.fail(f'{error_msg}; {e}')
