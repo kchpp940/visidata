@@ -83,13 +83,14 @@ class S3Path(Path):
             fp.close()
             return data
 
-        cp = vd.remote_fetch(
+        spec = vd.make_remote_spec(
             's3', source_params, _fetch,
             text=False,
             status_online=f'fetching {self.given} from s3',
             status_offline=f'offline: using cached data for `{self.given}`',
             error_msg=f'cannot open s3 path `{self.given}`',
         )
+        cp = vd.remote_open(spec)
 
         with cp.open_bytes() as fp:
             raw = fp.read()
@@ -122,15 +123,7 @@ class S3Path(Path):
     def open(self, mode='r', **kwargs):
         """Open the current S3 path, decompressing along the way if needed."""
 
-        fp = None
-        try:
-            fp = self._s3_fetch_raw(mode=mode)
-        except Exception as e:
-            if vd.remote_has_stale('s3', _s3_source_params(self.given, self.version_id)):
-                vd.warning(f'offline: using cached data for `{self.given}`; {e}')
-                fp = self._s3_fetch_raw(mode=mode)
-            else:
-                raise
+        fp = self._s3_fetch_raw(mode=mode)
 
         if hasattr(fp, "cache") and hasattr(fp, "size") and hasattr(self, "size"):
             if fp.cache.size != fp.size:

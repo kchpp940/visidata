@@ -122,15 +122,14 @@ class MatrixSheet(Sheet):
                     ret = vd.matrix_client.api.get_room_messages(room.room_id, room.prev_batch, direction='b', limit=100)
                     return json.dumps(ret, ensure_ascii=False, default=str)
 
-                cp = vd.remote_fetch(
+                spec = vd.make_remote_spec(
                     'matrix', source_params, _fetch,
                     days=0,
+                    parse_fn=json.loads,
                     status_online=f'fetching messages from {room.display_name or room.room_id}',
                     error_msg=f'cannot fetch matrix messages from `{room.display_name or room.room_id}`',
                 )
-
-                with cp.open(encoding='utf-8') as fp:
-                    ret = json.load(fp)
+                ret = vd.remote_open(spec)
 
                 for r in ret['chunk']:
                     r['room'] = room

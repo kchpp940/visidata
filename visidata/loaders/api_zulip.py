@@ -105,15 +105,14 @@ class ZulipAPISheet(Sheet):
             r = zulip_func(*self.zulip_args, **self.zulip_kwargs)
             return json.dumps(r, ensure_ascii=False)
 
-        cp = vd.remote_fetch(
+        spec = vd.make_remote_spec(
             'zulip', source_params, _fetch,
             days=0,
+            parse_fn=json.loads,
             status_online=f'fetching {func_name} from zulip',
             error_msg=f'cannot fetch zulip `{func_name}`',
         )
-
-        with cp.open(encoding='utf-8') as fp:
-            r = json.load(fp)
+        r = vd.remote_open(spec)
 
         if r['result'] != 'success':
             vd.push(PyobjSheet(self.zulip_result_key+'_error', source=r))
@@ -201,15 +200,14 @@ Loads continuously starting with most recent, until all messages have been read.
                 r = vd.z_client.call_endpoint(url='messages', method='GET', request=req)
                 return json.dumps(r, ensure_ascii=False)
 
-            cp = vd.remote_fetch(
+            spec = vd.make_remote_spec(
                 'zulip_messages', source_params, _fetch,
                 days=0,
+                parse_fn=json.loads,
                 status_online='fetching messages from zulip',
                 error_msg='cannot fetch zulip messages',
             )
-
-            with cp.open(encoding='utf-8') as fp:
-                r = json.load(fp)
+            r = vd.remote_open(spec)
 
             if r['result'] == 'success':
                 if not r['messages']: break

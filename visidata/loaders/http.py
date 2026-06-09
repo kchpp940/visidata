@@ -8,6 +8,15 @@ vd.option('http_req_headers', {'User-Agent': __version_info__}, 'http headers to
 vd.option('http_ssl_verify', True, 'verify host and certificates for https')
 
 
+class _HttpCachedResponse:
+    '''Lightweight proxy mimicking the subset of urllib response we use: .getheader().'''
+    def __init__(self, headers):
+        self._headers = dict(headers or {})
+
+    def getheader(self, name, default=None):
+        return self._headers.get(name.lower(), self._headers.get(name, default))
+
+
 @VisiData.api
 def guessurl_mimetype(vd, path, response):
     content_filetypes = {
@@ -20,52 +29,45 @@ def guessurl_mimetype(vd, path, response):
             content_filetypes[ft] = ft
 
     contenttype = response.getheader('content-type')
+    if not contenttype:
+        return None
     subtype = contenttype.split(';')[0].split('/')[-1]
     if subtype in content_filetypes:
         return dict(filetype=content_filetypes.get(subtype), _likelihood=10)
 
 
-def _http_source_params(path):
+def _http_source_params(url):
     '''Return cache-key params dict for an HTTP source.'''
     return {
-        'url': path.given,
+        'url': url,
         'headers': dict(vd.options.getall('http_req_')),
         'ssl_verify': vd.options.http_ssl_verify,
     }
 
 
-def _http_fetch_response(url, ctx):
-    '''Fetch a single URL.  Returns (response_or_None, body_bytes).  On cache hit, response is None.'''
-    import urllib.request
+def _http_error_message(e, url):
+    import urllib.error
+    if isinstance(e, urllib.error.HTTPError):
+        return f'cannot open URL: HTTP Error {e.code}: {e.reason}'
+    if isinstance(e, urllib.error.URLError):
+        return f'cannot open URL: {e.reason}'
+    return f'cannot open URL: {e}'
 
-    req = urllib.request.Request(url, **vd.options.getall('http_req_'))
 
-    source_params = {'url': url, 'headers': dict(vd.options.getall('http_req_'))}
-
-    def _fetch():
-        resp = urllib.request.urlopen(req, context=ctx)
-        body = resp.read()
-        return body, resp
-
-    try:
-        cp = vd.remote_fetch(
-            'http', source_params, lambda: _fetch()[0],
-            text=False,
-            status_online=f'fetching {url}',
-            status_offline=f'offline: using cached data for `{url}`',
-            error_msg=f'cannot open URL `{url}`',
-        )
-    except Exception as e:
-        raise
-
-    with cp.open_bytes() as fp:
-        cached_body = fp.read()
-
-    try:
-        resp = urllib.request.urlopen(req, context=ctx)
-        return resp, resp.read()
-    except Exception:
-        return None, cached_body
+def _http_extract_meta(resp):
+    '''Extract JSON-serializable metadata from a live urllib response.'''
+    headers = {}
+    if hasattr(resp, 'headers'):
+        for k, v in resp.headers.items():
+            headers[k.lower()] = v
+    elif hasattr(resp, 'getheaders'):
+        for k, v in resp.getheaders():
+            headers[k.lower()] = v
+    return {
+        'headers': headers,
+        'content-type': headers.get('content-type'),
+        'Link': headers.get('link'),
+    }
 
 
 @VisiData.api
@@ -79,7 +81,6 @@ def openurl_http(vd, path, filetype=None):
         return openfunc(Path(schemes[-1]+'://'+path.given.split('://')[1]))
 
     import urllib.request
-    import urllib.error
     import mimetypes
 
     ctx = None
@@ -91,41 +92,34 @@ def openurl_http(vd, path, filetype=None):
         ctx.verify_mode = ssl.CERT_NONE
 
     req = urllib.request.Request(path.given, **vd.options.getall('http_req_'))
-    source_params = _http_source_params(path)
+    source_params = _http_source_params(path.given)
 
-    def _live_fetch():
-        return urllib.request.urlopen(req, context=ctx)
+    def _fetch():
+        resp = urllib.request.urlopen(req, context=ctx)
+        body = resp.read()
+        meta = _http_extract_meta(resp)
+        return body, meta
 
-    response = None
-    body_bytes = None
+    spec = vd.make_remote_spec(
+        'http', source_params, _fetch,
+        text=False,
+        with_meta=True,
+        status_online=f'fetching {path.given}',
+        status_offline=f'offline: using cached data for `{path.given}`',
+    )
 
-    cached = vd.remote_cached('http', source_params)
     try:
-        try:
-            response = _live_fetch()
-            body_bytes = response.read()
-            vd.remote_fetch(
-                'http', source_params, lambda: body_bytes,
-                text=False,
-                force_refresh=True,
-            )
-        except (urllib.error.HTTPError, urllib.error.URLError) as e:
-            if cached and vd.options.remote_offline_fallback:
-                vd.warning(f'offline: using cached data for `{path.given}`; {e}')
-                with cached.open_bytes() as fp:
-                    body_bytes = fp.read()
-            else:
-                if isinstance(e, urllib.error.HTTPError):
-                    vd.fail(f'cannot open URL: HTTP Error {e.code}: {e.reason}')
-                else:
-                    vd.fail(f'cannot open URL: {e.reason}')
+        body_cp, meta = vd.remote_open(spec)
     except Exception as e:
-        if cached and vd.options.remote_offline_fallback:
-            vd.warning(f'offline: using cached data for `{path.given}`; {e}')
-            with cached.open_bytes() as fp:
-                body_bytes = fp.read()
-        else:
-            vd.fail(f'cannot open URL: {e}')
+        vd.fail(_http_error_message(e, path.given))
+
+    with body_cp.open_bytes() as fp:
+        body_bytes = fp.read()
+
+    if meta and meta.get('headers'):
+        response = _HttpCachedResponse(meta['headers'])
+    else:
+        response = None
 
     if response is not None:
         filetype = filetype or vd.guessFiletype(path, response, funcprefix='guessurl_').get('filetype')
@@ -164,26 +158,34 @@ def openurl_http(vd, path, filetype=None):
                 vd.warning(f'stopping at max next pages: {max_next} pages')
                 break
 
-            vd.status(f'fetching next page from {src}')
             next_req = urllib.request.Request(src, **vd.options.getall('http_req_'))
+            next_params = _http_source_params(src)
+
+            def _next_fetch():
+                resp = urllib.request.urlopen(next_req, context=ctx)
+                body = resp.read()
+                meta = _http_extract_meta(resp)
+                return body, meta
+
+            next_spec = vd.make_remote_spec(
+                'http', next_params, _next_fetch,
+                text=False,
+                with_meta=True,
+                status_online=f'fetching next page from {src}',
+                status_offline=f'offline: using cached data for `{src}`',
+            )
+
             try:
-                cur_resp = urllib.request.urlopen(next_req, context=ctx)
-                cur_body = cur_resp.read()
-                next_params = {'url': src, 'headers': dict(vd.options.getall('http_req_'))}
-                vd.remote_fetch(
-                    'http', next_params, lambda: cur_body,
-                    text=False, force_refresh=True,
-                )
-            except Exception as e:
-                next_cached = vd.remote_cached('http', {'url': src, 'headers': dict(vd.options.getall('http_req_'))})
-                if next_cached and vd.options.remote_offline_fallback:
-                    vd.warning(f'offline: using cached data for `{src}`; {e}')
-                    with next_cached.open_bytes() as fp:
-                        cur_body = fp.read()
-                    cur_resp = None
+                next_cp, next_meta = vd.remote_open(next_spec)
+                with next_cp.open_bytes() as fp:
+                    cur_body = fp.read()
+                if next_meta and next_meta.get('headers'):
+                    cur_resp = _HttpCachedResponse(next_meta['headers'])
                 else:
-                    vd.warning(f'cannot fetch next page from {src}: {e}')
-                    break
+                    cur_resp = None
+            except Exception as e:
+                vd.warning(f'cannot fetch next page from {src}: {e}')
+                break
 
     path.fptext = RepeatFile(_iter_lines())
 

@@ -76,15 +76,14 @@ class AirtableSheet(Sheet):
                 all_pages.append(page)
             return json.dumps(all_pages, ensure_ascii=False, default=str)
 
-        cp = vd.remote_fetch(
+        spec = vd.make_remote_spec(
             'airtable', source_params, _fetch,
             days=0,
+            parse_fn=json.loads,
             status_online=f'fetching {self.airtable_table} from airtable',
             error_msg=f'cannot fetch airtable `{self.airtable_table}`',
         )
-
-        with cp.open(encoding='utf-8') as fp:
-            all_pages = json.load(fp)
+        all_pages = vd.remote_open(spec)
 
         for page in all_pages:
             for row in page:
