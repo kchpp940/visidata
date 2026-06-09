@@ -42,11 +42,14 @@ VisiData.save_vd = VisiData.save_tsv
 
 @VisiData.api
 def save_vdj(vd, p, *vsheets):
-    with p.open(mode='w', encoding=vsheets[0].options.save_encoding) as fp:
-        fp.write("#!/usr/bin/env -S vd -p\n")
-        fp.write(f"# {visidata.__version_info__}\n")
-        for vs in vsheets:
-            vs.write_jsonl(fp)
+    snap = {
+        'version': visidata.__version_info__,
+        'cmdlog': [],
+    }
+    for vs in vsheets:
+        for r in vs.rows:
+            snap['cmdlog'].append({k: getattr(r, k, '') for k in ('sheet', 'col', 'row', 'longname', 'input', 'keystrokes', 'comment')})
+    vd.write_snapshot(p, 'vdj', snap, encoding=vsheets[0].options.save_encoding if vsheets else 'utf-8')
 
 
 @VisiData.api

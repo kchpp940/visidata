@@ -78,15 +78,16 @@ def macrosheet(vd):
 @VisiData.api
 def loadMacro(vd, p:Path):
     if p.exists():
-        if p.ext == 'vd':
-            vs = CommandLog(p.base_stem, source=p)
-            vs.ensureLoaded()
+        snap = vd.read_snapshot(p, fmt='macro', binding=p.stem)
+        if snap.get('macros'):
+            from visidata.cmdlog import CommandLogJsonl
+            m = snap['macros'][0]
+            rows = [vd.cmdlog.newRow(**r) for r in m.get('rows', [])]
+            vs = CommandLogJsonl(p.base_stem, rows=rows)
+            vs.keystroke = m.get('keystroke', '')
+            vs.helpstr = m.get('helpstr', '')
+            vs.source = str(p)
             return vs
-        elif p.ext == 'vdj':
-            vs = CommandLogJsonl(p.base_stem, source=p)
-            vs.ensureLoaded()
-            return vs
-
     vd.warning(f'failed to load macro {p}')
 
 
@@ -157,7 +158,16 @@ def saveMacro(self, rows, ks, keystroke=''):
         vs = copy(self)
         vs.rows = rows
         macropath = Path(vd.fnSuffix(str(Path(vd.options.visidata_dir)/ks)))
-        vd.save_vdj(macropath, vs)
+        snap = vd.generate_snapshot(scope=[], include_cmdlog=False, include_macros=True)
+        snap['macros'] = [{
+            'binding': ks,
+            'keystroke': keystroke,
+            'helpstr': '',
+            'source': str(macropath),
+            'rows': [{k: getattr(r, k, '') for k in ('sheet', 'col', 'row', 'longname', 'input', 'keystrokes', 'comment')}
+                     for r in rows],
+        }]
+        vd.write_snapshot(macropath, 'macro', snap, binding=ks)
         vd.status(f'{ks} saved to {macropath}')
         vd.setMacro(ks, vs, keystroke=keystroke)
         vd.macros.append(dict(binding=ks, source=str(macropath), helpstr='', keystroke=keystroke))
