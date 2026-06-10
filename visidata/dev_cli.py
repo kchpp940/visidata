@@ -27,15 +27,22 @@ Run `vd-dev <command> --help` for command-specific help.
 from __future__ import annotations
 
 import argparse
+import ast
+import configparser
 import difflib
+import email.parser
 import glob
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
+import zipfile
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, NoReturn, Optional
 
@@ -1257,14 +1264,72 @@ def setup_check(sub) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# preflight (release readiness checks)
+# shared validation rules (used by both `preflight check` and `package verify`)
 # ═══════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class CheckResult:
+    """Result of a single validation rule."""
+    rule: str                     # rule identifier, e.g. "version-consistency"
+    ok: bool                      # True = pass, False = fail
+    severity: str                 # "error" or "warn"
+    message: str                  # human-readable message
+    detail: str = ""              # optional extra detail (paths, etc.)
+
+    def format(self) -> str:
+        if self.ok:
+            tag = _colorize("green", "PASS")
+        elif self.severity == "warn":
+            tag = _colorize("yellow", "WARN")
+        else:
+            tag = _colorize("red", "FAIL")
+        line = f"[{tag}] {self.rule}: {self.message}"
+        if self.detail:
+            line += f"\n       {self.detail}"
+        return line
+
+# ---------------------------------------------------------------------------
+# helpers: parse metadata from built artifacts
+# ---------------------------------------------------------------------------
+
+EXPECTED_CONSOLE_SCRIPTS = {
+    "vd": "visidata.main:vd_cli",
+    "visidata": "visidata.main:vd_cli",
+    "vd-dev": "visidata.dev_cli:vd_dev_cli",
+}
+
+EXPECTED_PACKAGES = [
+    "visidata",
+    "visidata.loaders",
+    "visidata.vendor",
+    "visidata.tests",
+    "visidata.guides",
+    "visidata.ddw",
+    "visidata.man",
+    "visidata.themes",
+    "visidata.features",
+    "visidata.experimental",
+    "visidata.apps",
+    "visidata.apps.vgit",
+    "visidata.apps.vdsql",
+    "visidata.desktop",
+]
+
+EXPECTED_DATA_FILES_SOURCE = [
+    "visidata/man/vd.1",
+    "visidata/man/visidata.1",
+    "visidata/desktop/visidata.desktop",
+    "visidata/desktop/org.visidata.VisiData.metainfo.xml",
+    "visidata/desktop/icons/48x48/visidata.png",
+    "visidata/desktop/icons/32x32/visidata.png",
+]
+
 
 def _read_version_setup() -> str:
     """Extract __version__ from setup.py."""
     for line in (ROOT / "setup.py").read_text().splitlines():
         if line.strip().startswith("__version__"):
-            # __version__ = "3.4dev"
             parts = line.split("=", 1)
             if len(parts) == 2:
                 return parts[1].strip().strip('"').strip("'")
@@ -1296,86 +1361,705 @@ def _read_version_main() -> str:
     return ""
 
 
-def cmd_preflight_check(args: argparse.Namespace) -> int:
-    """Run pre-release checks (version consistency, files, etc.)."""
-    issues: list[str] = []
-    warnings: list[str] = []
+def _parse_wheel_metadata(wheel_path: Path) -> dict:
+    """Parse METADATA and entry_points.txt from a .whl file.
 
-    # 1. Version consistency
+    Returns dict with keys: 'name', 'version', 'console_scripts' (dict name->entry).
+    """
+    result: dict = {"name": "", "version": "", "console_scripts": {}}
+    with zipfile.ZipFile(wheel_path) as zf:
+        # find dist-info dir
+        dist_info_names = [n for n in zf.namelist() if n.endswith(".dist-info/METADATA")]
+        if not dist_info_names:
+            return result
+        dist_info_prefix = dist_info_names[0].rsplit("/", 1)[0] + "/"
+
+        with zf.open(dist_info_names[0]) as mf:
+            parser = email.parser.Parser()
+            msg = parser.parsestr(mf.read().decode("utf-8", errors="replace"))
+            result["name"] = msg.get("Name", "")
+            result["version"] = msg.get("Version", "")
+
+        ep_path = dist_info_prefix + "entry_points.txt"
+        if ep_path in zf.namelist():
+            with zf.open(ep_path) as epf:
+                cp = configparser.ConfigParser()
+                cp.read_string(epf.read().decode("utf-8", errors="replace"))
+                if cp.has_section("console_scripts"):
+                    for k, v in cp.items("console_scripts"):
+                        result["console_scripts"][k] = v.strip()
+    return result
+
+
+def _wheel_file_set(wheel_path: Path) -> set[str]:
+    """Return set of normalized file paths inside a wheel."""
+    with zipfile.ZipFile(wheel_path) as zf:
+        return set(zf.namelist())
+
+
+def _sdist_file_set(sdist_path: Path) -> set[str]:
+    """Return set of normalized file paths inside an sdist tar.gz."""
+    paths: set[str] = set()
+    with tarfile.open(sdist_path, "r:gz") as tf:
+        for member in tf.getmembers():
+            if not member.isfile():
+                continue
+            name = member.name
+            # strip top-level directory like "visidata-3.4/"
+            if "/" in name:
+                name = name.split("/", 1)[1]
+            paths.add(name)
+    return paths
+
+
+# ---------------------------------------------------------------------------
+# rule: version consistency across source files
+# ---------------------------------------------------------------------------
+
+def rule_version_consistency() -> list[CheckResult]:
+    results: list[CheckResult] = []
     v_setup = _read_version_setup()
     v_init = _read_version_init()
     v_main = _read_version_main()
 
-    _print_info(f"versions — setup.py: {v_setup or '(missing)'}  "
-                f"__init__.py: {v_init or '(missing)'}  "
-                f"main.py: {v_main or '(n/a)'}")
+    detail = (f"setup.py={v_setup or '(missing)'}  "
+              f"__init__.py={v_init or '(missing)'}  "
+              f"main.py={v_main or '(n/a)'}")
+    _print_info(f"versions — {detail}")
 
     versions = {v for v in (v_setup, v_init, v_main) if v}
     if len(versions) > 1:
-        issues.append(f"version mismatch: setup.py={v_setup!r} __init__.py={v_init!r} main.py={v_main!r}")
+        results.append(CheckResult(
+            "version-consistency", False, "error",
+            "version mismatch across source files",
+            detail,
+        ))
     elif not versions:
-        issues.append("could not determine version from any source file")
+        results.append(CheckResult(
+            "version-consistency", False, "error",
+            "could not determine version from any source file",
+            detail,
+        ))
     else:
         version = next(iter(versions))
+        results.append(CheckResult(
+            "version-consistency", True, "error",
+            f"all sources agree on version {version!r}",
+            detail,
+        ))
         if version.endswith("dev"):
-            warnings.append(f"version {version!r} still has 'dev' suffix — bump before release")
+            results.append(CheckResult(
+                "version-dev-suffix", False, "warn",
+                f"version {version!r} still has 'dev' suffix",
+                "bump version before release",
+            ))
+    return results
 
-    # 2. CHANGELOG has entry for current version
+
+# ---------------------------------------------------------------------------
+# rule: CHANGELOG mentions the current version
+# ---------------------------------------------------------------------------
+
+def rule_changelog_entry(version: str) -> list[CheckResult]:
+    results: list[CheckResult] = []
     changelog = ROOT / "CHANGELOG.md"
-    if changelog.exists():
-        head = changelog.read_text()[:2000]
-        if v_setup and v_setup not in head and not v_setup.endswith("dev"):
-            issues.append(f"CHANGELOG.md does not mention version {v_setup} near the top")
+    if not changelog.exists():
+        results.append(CheckResult(
+            "changelog-entry", False, "warn",
+            "CHANGELOG.md not found",
+            f"expected at {changelog}",
+        ))
+        return results
+    head = changelog.read_text()[:2000]
+    if version.endswith("dev"):
+        results.append(CheckResult(
+            "changelog-entry", True, "warn",
+            "skipping CHANGELOG check (dev version)",
+            f"CHANGELOG.md exists at {changelog}",
+        ))
+    elif version not in head:
+        results.append(CheckResult(
+            "changelog-entry", False, "error",
+            f"CHANGELOG.md does not mention version {version} near the top",
+            f"checked first 2000 chars of {changelog}",
+        ))
     else:
-        warnings.append("CHANGELOG.md not found")
+        results.append(CheckResult(
+            "changelog-entry", True, "error",
+            f"CHANGELOG.md mentions version {version}",
+            str(changelog),
+        ))
+    return results
 
-    # 3. Man pages and generated files exist
-    required_generated = [
-        ROOT / "visidata/man/vd.1",
-        ROOT / "visidata/man/visidata.1",
-    ]
-    for f in required_generated:
-        if not f.exists():
-            warnings.append(f"generated file missing: {f.relative_to(ROOT)} — run `vd-dev build man`")
 
-    # 4. Install consistency (dev mode at minimum)
-    install_issues, install_warnings = _check_install_consistency("dev")
-    issues.extend(install_issues)
-    warnings.extend(install_warnings)
+# ---------------------------------------------------------------------------
+# rule: generated / data files present in source tree
+# ---------------------------------------------------------------------------
 
-    # 5. Setup.py extras_require "test" matches actual test needs
-    rc, imports_out, _ = _run_capture(
-        [sys.executable, "-c", (
-            "import sys; sys.path.insert(0, '.');\n"
-            "exec(open('setup.py').read().split('setup(')[0]);\n"
-            "print('\\n'.join(extras_require.get('test', [])))"
-        )],
-        echo=False,
-    )
-    if rc == 0 and imports_out.strip():
-        test_pkgs_cfg = set()
-        for line in imports_out.splitlines():
-            name = line.strip().split(">=")[0].split(";")[0].split("[")[0].strip().lower().replace("-", "_")
-            if name:
-                test_pkgs_cfg.add(name)
-        installed = _pip_freeze_versions()
-        missing_cfg = [p for p in sorted(test_pkgs_cfg) if p not in installed]
-        if missing_cfg and not v_setup.endswith("dev"):
-            warnings.append(
-                f"setup.py [test] extras not all installed locally: {', '.join(missing_cfg)}"
+def rule_source_data_files() -> list[CheckResult]:
+    results: list[CheckResult] = []
+    missing: list[str] = []
+    present: list[str] = []
+    for rel in EXPECTED_DATA_FILES_SOURCE:
+        p = ROOT / rel
+        if p.exists():
+            present.append(rel)
+        else:
+            missing.append(rel)
+    if missing:
+        results.append(CheckResult(
+            "source-data-files", False, "warn",
+            f"{len(missing)} expected data file(s) missing from source tree",
+            "missing:\n  " + "\n  ".join(f"{m}  (try: vd-dev build man)" for m in missing),
+        ))
+    if present:
+        results.append(CheckResult(
+            "source-data-files", True, "error",
+            f"{len(present)} data files present in source tree",
+            "\n  ".join(present),
+        ))
+    return results
+
+
+# ---------------------------------------------------------------------------
+# rule: setup.py entry_points defines expected console_scripts
+# ---------------------------------------------------------------------------
+
+def _parse_setup_ast() -> tuple[dict[str, str], list[str]]:
+    """Parse setup.py with AST to extract console_scripts and packages list.
+
+    Returns (console_scripts_dict, packages_list).
+    """
+    console_scripts: dict[str, str] = {}
+    packages: list[str] = []
+    setup_path = ROOT / "setup.py"
+    try:
+        tree = ast.parse(setup_path.read_text())
+    except Exception as e:
+        _print_warn(f"could not parse {setup_path}: {e}")
+        return console_scripts, packages
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id == "setup":
+            for kw in node.keywords:
+                if kw.arg == "entry_points":
+                    # entry_points = {"console_scripts": ["vd=visidata.main:vd_cli", ...]}
+                    if isinstance(kw.value, ast.Dict):
+                        for k, v in zip(kw.value.keys, kw.value.values):
+                            if isinstance(k, ast.Constant) and k.value == "console_scripts":
+                                if isinstance(v, ast.List):
+                                    for elt in v.elts:
+                                        if isinstance(elt, ast.Constant):
+                                            parts = elt.value.partition("=")
+                                            if parts[2]:
+                                                console_scripts[parts[0].strip()] = parts[2].strip()
+                elif kw.arg == "packages":
+                    if isinstance(kw.value, ast.List):
+                        for elt in kw.value.elts:
+                            if isinstance(elt, ast.Constant):
+                                packages.append(elt.value)
+    return console_scripts, packages
+
+
+def rule_setup_entry_points() -> list[CheckResult]:
+    results: list[CheckResult] = []
+    setup_path = ROOT / "setup.py"
+    found, _ = _parse_setup_ast()
+
+    if not found:
+        results.append(CheckResult(
+            "setup-entry-points", False, "error",
+            "could not parse setup.py entry_points",
+            f"setup.py at {setup_path}",
+        ))
+        return results
+
+    issues: list[str] = []
+    for name, expected_entry in EXPECTED_CONSOLE_SCRIPTS.items():
+        if name not in found:
+            issues.append(f"missing console_scripts entry: {name}")
+        elif found[name] != expected_entry:
+            issues.append(
+                f"console_scripts[{name}] = {found[name]!r}, expected {expected_entry!r}"
             )
+    extra = [n for n in found if n not in EXPECTED_CONSOLE_SCRIPTS]
+    for n in extra:
+        issues.append(f"unexpected console_scripts entry: {n}={found[n]!r}")
 
-    # 6. Report
-    if warnings:
-        for w in warnings:
-            _print_warn(w)
     if issues:
-        for i in issues:
-            _print_err(i)
-        _print_err(f"preflight check failed: {len(issues)} issue(s), {len(warnings)} warning(s)")
-        return EXIT_ERR
+        results.append(CheckResult(
+            "setup-entry-points", False, "error",
+            f"{len(issues)} problem(s) with setup.py console_scripts",
+            "\n  ".join(issues),
+        ))
+    else:
+        results.append(CheckResult(
+            "setup-entry-points", True, "error",
+            "setup.py console_scripts matches expected",
+            "\n  ".join(f"{k}={v}" for k, v in EXPECTED_CONSOLE_SCRIPTS.items()),
+        ))
+    return results
 
-    _print_info(f"preflight check passed (0 issues, {len(warnings)} warning(s))")
+
+# ---------------------------------------------------------------------------
+# rule: setup.py packages list matches actual source directories
+# ---------------------------------------------------------------------------
+
+def rule_setup_packages_list() -> list[CheckResult]:
+    results: list[CheckResult] = []
+    setup_path = ROOT / "setup.py"
+    _, declared_list = _parse_setup_ast()
+
+    if not declared_list:
+        results.append(CheckResult(
+            "setup-packages", False, "warn",
+            "could not parse setup.py packages list (skipping)",
+            f"setup.py at {setup_path}",
+        ))
+        return results
+
+    declared = set(declared_list)
+    missing_decl = [p for p in EXPECTED_PACKAGES if p not in declared]
+    missing_dirs: list[str] = []
+    no_init: list[str] = []
+    for pkg in declared:
+        pkg_path = ROOT / pkg.replace(".", "/")
+        if not pkg_path.exists():
+            missing_dirs.append(pkg)
+        elif not (pkg_path / "__init__.py").exists():
+            no_init.append(pkg)
+
+    if missing_decl:
+        results.append(CheckResult(
+            "setup-packages", False, "warn",
+            f"{len(missing_decl)} expected package(s) not in setup.py packages list",
+            "\n  ".join(missing_decl),
+        ))
+    if missing_dirs:
+        results.append(CheckResult(
+            "setup-packages", False, "error",
+            f"{len(missing_dirs)} package(s) in setup.py have no source directory",
+            "\n  ".join(missing_dirs),
+        ))
+    if no_init:
+        results.append(CheckResult(
+            "setup-packages", True, "warn",
+            f"{len(no_init)} package(s) are data-only (no __init__.py) — valid with package_data",
+            "\n  ".join(no_init),
+        ))
+    if not missing_decl and not missing_dirs:
+        results.append(CheckResult(
+            "setup-packages", True, "error",
+            f"setup.py packages list and source directories agree ({len(declared)} packages)",
+            "\n  ".join(sorted(declared)),
+        ))
+    return results
+
+
+# ---------------------------------------------------------------------------
+# rule: install consistency (editable + deps)
+# ---------------------------------------------------------------------------
+
+def rule_install_consistency(mode: str = "dev") -> list[CheckResult]:
+    results: list[CheckResult] = []
+    issues, warnings = _check_install_consistency(mode)
+    for w in warnings:
+        results.append(CheckResult(
+            f"install-{mode}", False, "warn", w,
+        ))
+    for i in issues:
+        results.append(CheckResult(
+            f"install-{mode}", False, "error", i,
+        ))
+    if not issues and not warnings:
+        results.append(CheckResult(
+            f"install-{mode}", True, "error",
+            f"installation matches '{mode}' mode",
+        ))
+    return results
+
+
+# ---------------------------------------------------------------------------
+# rule: built artifacts exist
+# ---------------------------------------------------------------------------
+
+def rule_artifact_existence(dist_dir: Path) -> tuple[list[CheckResult], Path | None, Path | None]:
+    results: list[CheckResult] = []
+    sdist_files = sorted(dist_dir.glob("*.tar.gz"))
+    wheel_files = sorted(dist_dir.glob("*.whl"))
+
+    sdist = sdist_files[0] if sdist_files else None
+    wheel = wheel_files[0] if wheel_files else None
+
+    if sdist:
+        results.append(CheckResult(
+            "artifact-existence", True, "error",
+            f"sdist present: {sdist.name} ({sdist.stat().st_size:,} bytes)",
+            str(sdist),
+        ))
+    else:
+        results.append(CheckResult(
+            "artifact-existence", False, "error",
+            "missing sdist (.tar.gz) in dist/",
+            f"expected in {dist_dir}",
+        ))
+
+    if wheel:
+        results.append(CheckResult(
+            "artifact-existence", True, "error",
+            f"wheel present: {wheel.name} ({wheel.stat().st_size:,} bytes)",
+            str(wheel),
+        ))
+    else:
+        results.append(CheckResult(
+            "artifact-existence", False, "error",
+            "missing wheel (.whl) in dist/",
+            f"expected in {dist_dir}",
+        ))
+
+    return results, sdist, wheel
+
+
+# ---------------------------------------------------------------------------
+# rule: wheel metadata (name, version, console_scripts)
+# ---------------------------------------------------------------------------
+
+def _normalize_version(v: str) -> str:
+    """Normalize a version string per PEP 440 (e.g. '3.4dev' → '3.4.dev0')."""
+    v = v.strip()
+    # handle trailing dev without dot: '3.4dev' → '3.4.dev0'
+    v = re.sub(r"(\d)dev$", r"\1.dev0", v, flags=re.IGNORECASE)
+    return v
+
+
+def rule_wheel_metadata(wheel_path: Path, expected_version: str) -> list[CheckResult]:
+    results: list[CheckResult] = []
+    meta = _parse_wheel_metadata(wheel_path)
+
+    # name
+    if meta["name"].lower() != "visidata":
+        results.append(CheckResult(
+            "wheel-metadata", False, "error",
+            f"wheel Name = {meta['name']!r}, expected 'visidata'",
+            str(wheel_path),
+        ))
+    else:
+        results.append(CheckResult(
+            "wheel-metadata", True, "error",
+            "wheel Name = 'visidata'",
+            str(wheel_path),
+        ))
+
+    # version (compare normalized)
+    actual_norm = _normalize_version(meta["version"])
+    expected_norm = _normalize_version(expected_version) if expected_version else ""
+    if expected_norm and actual_norm != expected_norm:
+        results.append(CheckResult(
+            "wheel-version", False, "warn",
+            f"wheel Version = {meta['version']!r}, expected {expected_version!r} (normalized: {actual_norm} vs {expected_norm})",
+            str(wheel_path),
+        ))
+    elif meta["version"]:
+        results.append(CheckResult(
+            "wheel-version", True, "error",
+            f"wheel Version = {meta['version']!r}",
+            str(wheel_path),
+        ))
+
+    # console_scripts
+    cs = meta["console_scripts"]
+    cs_issues: list[str] = []
+    for name, expected_entry in EXPECTED_CONSOLE_SCRIPTS.items():
+        if name not in cs:
+            cs_issues.append(f"missing: {name}")
+        elif cs[name] != expected_entry:
+            cs_issues.append(f"{name} = {cs[name]!r} (expected {expected_entry!r})")
+    extra_cs = [n for n in cs if n not in EXPECTED_CONSOLE_SCRIPTS]
+    for n in extra_cs:
+        cs_issues.append(f"unexpected: {n}={cs[n]!r}")
+
+    if cs_issues:
+        results.append(CheckResult(
+            "wheel-console-scripts", False, "error",
+            f"{len(cs_issues)} problem(s) with wheel console_scripts",
+            "\n  ".join(cs_issues),
+        ))
+    else:
+        results.append(CheckResult(
+            "wheel-console-scripts", True, "error",
+            f"wheel console_scripts correct ({len(EXPECTED_CONSOLE_SCRIPTS)} entries)",
+            "\n  ".join(f"{k}={v}" for k, v in EXPECTED_CONSOLE_SCRIPTS.items()),
+        ))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# rule: wheel contents (packages, data files, modules)
+# ---------------------------------------------------------------------------
+
+def rule_wheel_contents(wheel_path: Path) -> list[CheckResult]:
+    results: list[CheckResult] = []
+    contents = _wheel_file_set(wheel_path)
+
+    # packages with __init__.py
+    code_packages = [p for p in EXPECTED_PACKAGES
+                     if p not in ("visidata.guides", "visidata.ddw",
+                                  "visidata.man", "visidata.desktop")]
+    pkg_issues: list[str] = []
+    pkg_ok: list[str] = []
+    for pkg in code_packages:
+        init_path = pkg.replace(".", "/") + "/__init__.py"
+        found = any(p.endswith(init_path) for p in contents)
+        if found:
+            pkg_ok.append(pkg)
+        else:
+            pkg_issues.append(pkg)
+
+    if pkg_issues:
+        results.append(CheckResult(
+            "wheel-contents", False, "error",
+            f"{len(pkg_issues)} expected package(s) missing from wheel",
+            "\n  ".join(pkg_issues),
+        ))
+    if pkg_ok:
+        results.append(CheckResult(
+            "wheel-contents", True, "error",
+            f"{len(pkg_ok)} code packages present in wheel",
+            "\n  ".join(pkg_ok),
+        ))
+
+    # data-only packages: check their data files exist somewhere in the wheel
+    data_pkg_specs = {
+        "visidata.man": ["vd.1", "visidata.1", "vd.txt"],
+        "visidata.ddw": ["input.ddw", "regex.ddw"],
+        "visidata.guides": [".md"],
+        "visidata.desktop": ["visidata.desktop", "metainfo.xml"],
+    }
+    data_pkg_missing: list[str] = []
+    data_pkg_ok: list[str] = []
+    data_pkg_warn: list[str] = []
+    for pkg, markers in data_pkg_specs.items():
+        pkg_prefix = pkg.replace(".", "/") + "/"
+        pkg_files = [p for p in contents if pkg_prefix in p]
+        if not pkg_files:
+            data_pkg_missing.append(pkg)
+            continue
+        # package directory exists; check for specific data markers
+        any_marker = False
+        for p in pkg_files:
+            for marker in markers:
+                if marker in p:
+                    any_marker = True
+                    break
+            if any_marker:
+                break
+        if any_marker:
+            data_pkg_ok.append(pkg)
+        else:
+            data_pkg_warn.append(f"{pkg} (has {len(pkg_files)} file(s), but no data markers: {', '.join(markers)})")
+
+    if data_pkg_missing:
+        results.append(CheckResult(
+            "wheel-contents", False, "error",
+            f"{len(data_pkg_missing)} data-only package(s) entirely missing from wheel",
+            "\n  ".join(data_pkg_missing),
+        ))
+    if data_pkg_warn:
+        results.append(CheckResult(
+            "wheel-contents", False, "warn",
+            f"{len(data_pkg_warn)} data-only package(s) missing expected data markers",
+            "\n  ".join(data_pkg_warn),
+        ))
+    if data_pkg_ok:
+        results.append(CheckResult(
+            "wheel-contents", True, "error",
+            f"{len(data_pkg_ok)} data-only packages present in wheel",
+            "\n  ".join(data_pkg_ok),
+        ))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# rule: sdist contents
+# ---------------------------------------------------------------------------
+
+def rule_sdist_contents(sdist_path: Path) -> list[CheckResult]:
+    results: list[CheckResult] = []
+    contents = _sdist_file_set(sdist_path)
+
+    required = ["setup.py", "README.md", "requirements.txt", "CHANGELOG.md"]
+    missing_core = [f for f in required if f not in contents]
+
+    if missing_core:
+        results.append(CheckResult(
+            "sdist-contents", False, "error",
+            f"{len(missing_core)} required file(s) missing from sdist",
+            "\n  ".join(missing_core),
+        ))
+    else:
+        results.append(CheckResult(
+            "sdist-contents", True, "error",
+            "core files present in sdist",
+            "\n  ".join(required),
+        ))
+
+    # spot-check some package directories
+    for pkg in ["visidata", "visidata/loaders", "visidata/features"]:
+        init = f"{pkg}/__init__.py"
+        if init not in contents:
+            results.append(CheckResult(
+                "sdist-contents", False, "error",
+                f"expected package directory missing from sdist",
+                f"missing {init}",
+            ))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# rule: after installing wheel in a venv, commands and import work
+# ---------------------------------------------------------------------------
+
+def _clean_env() -> dict:
+    """Return a clean environment dict for venv subprocess calls (no PYTHONPATH leaking)."""
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    env.pop("VIRTUAL_ENV", None)
+    return env
+
+
+def rule_installed_wheel(venv_bin_dir: Path, expected_version: str, cwd: Path | None = None) -> list[CheckResult]:
+    results: list[CheckResult] = []
+    venv_python = venv_bin_dir / "python"
+    clean_env = _clean_env()
+    safe_cwd = cwd or Path.home()
+
+    # 1. import visidata works and version matches
+    rc, out, err = _run_capture(
+        [str(venv_python), "-c",
+         "import visidata, os; print(visidata.__version__); print(os.path.dirname(visidata.__file__))"],
+        echo=False, env=clean_env, cwd=str(safe_cwd),
+    )
+    if rc != 0:
+        results.append(CheckResult(
+            "installed-import", False, "error",
+            "import visidata failed in venv after wheel install",
+            err.strip()[:300],
+        ))
+    else:
+        lines = out.strip().splitlines()
+        actual = lines[0].strip() if lines else ""
+        actual_norm = _normalize_version(actual)
+        expected_norm = _normalize_version(expected_version) if expected_version else ""
+        detail = f"imported from: {lines[1].strip() if len(lines) > 1 else 'n/a'}"
+        if expected_norm and actual_norm != expected_norm:
+            results.append(CheckResult(
+                "installed-import", False, "warn",
+                f"imported version = {actual!r}, expected {expected_version!r}",
+                detail,
+            ))
+        else:
+            results.append(CheckResult(
+                "installed-import", True, "error",
+                f"`import visidata` works, version = {actual!r}",
+                detail,
+            ))
+
+    # 2. each console_script works
+    # Small delay to ensure pip install has fully written files to disk
+    time.sleep(0.2)
+    for script in EXPECTED_CONSOLE_SCRIPTS:
+        script_path = venv_bin_dir / script
+        if not script_path.exists():
+            results.append(CheckResult(
+                f"installed-cmd-{script}", False, "error",
+                f"console_script {script!r} not found after wheel install",
+                f"checked at {script_path}",
+            ))
+            continue
+        # vd-dev is a subparser CLI and doesn't accept --version; use -h which exits 0
+        test_args = ["-h"] if script == "vd-dev" else ["--version"]
+        rc, out, err = _run_capture([str(script_path)] + test_args, echo=False, env=clean_env, cwd=str(safe_cwd))
+        if rc != 0:
+            results.append(CheckResult(
+                f"installed-cmd-{script}", False, "error",
+                f"`{script} {' '.join(test_args)}` failed",
+                err.strip()[:300] or f"exit code {rc}",
+            ))
+        else:
+            if script == "vd-dev":
+                results.append(CheckResult(
+                    f"installed-cmd-{script}", True, "error",
+                    f"`{script}` is installed and invokable",
+                    "help output printed successfully",
+                ))
+            else:
+                ver_line = out.strip().splitlines()[-1] if out.strip() else "(no output)"
+                results.append(CheckResult(
+                    f"installed-cmd-{script}", True, "error",
+                    f"`{script} --version` works",
+                    ver_line,
+                ))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# shared report formatter
+# ---------------------------------------------------------------------------
+
+def _report_results(results: list[CheckResult], header: str) -> tuple[int, int, int]:
+    """Print formatted results. Return (passed, errors, warnings)."""
+    _print_info(f"=== {header} ===")
+    errors = 0
+    warnings = 0
+    passed = 0
+    for r in results:
+        print(r.format())
+        if r.ok:
+            passed += 1
+        elif r.severity == "warn":
+            warnings += 1
+        else:
+            errors += 1
+    total = len(results)
+    _print_info(
+        f"summary: {passed}/{total} passed, "
+        f"{errors} error(s), {warnings} warning(s)"
+    )
+    return passed, errors, warnings
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# preflight (release readiness checks)
+# ═══════════════════════════════════════════════════════════════════════
+
+def cmd_preflight_check(args: argparse.Namespace) -> int:
+    """Run pre-release checks using the shared validation rule set."""
+    all_results: list[CheckResult] = []
+
+    all_results += rule_version_consistency()
+
+    version = _read_version_setup() or _read_version_init()
+    if version:
+        all_results += rule_changelog_entry(version)
+
+    all_results += rule_source_data_files()
+    all_results += rule_setup_entry_points()
+    all_results += rule_setup_packages_list()
+    all_results += rule_install_consistency("dev")
+
+    passed, errors, warnings = _report_results(all_results, "preflight check")
+
+    if errors > 0:
+        _print_err(f"preflight check FAILED: {errors} error(s), {warnings} warning(s)")
+        return EXIT_ERR
+    _print_info(f"preflight check PASSED: {passed} passed, {warnings} warning(s)")
     return EXIT_OK
 
 
@@ -1451,62 +2135,78 @@ def cmd_package_build(args: argparse.Namespace) -> int:
 
 
 def cmd_package_verify(args: argparse.Namespace) -> int:
-    """Verify built packages: metadata, required files, can be imported."""
+    """Verify built packages using the shared validation rule set."""
     dist = ROOT / "dist"
+    all_results: list[CheckResult] = []
+
     if not dist.exists() or not any(dist.iterdir()):
-        _print_err("no artifacts in dist/ — run `vd-dev package build` first")
+        all_results.append(CheckResult(
+            "artifact-existence", False, "error",
+            "no artifacts in dist/",
+            "run `vd-dev package build` first",
+        ))
+        _report_results(all_results, "package verify")
         return EXIT_ERR
 
-    issues: list[str] = []
+    # 1. Artifact existence
+    exist_results, sdist_path, wheel_path = rule_artifact_existence(dist)
+    all_results += exist_results
 
-    # 1. Find sdist and wheel
-    sdist_files = list(dist.glob("*.tar.gz"))
-    wheel_files = list(dist.glob("*.whl"))
-    if not sdist_files:
-        issues.append("missing sdist (.tar.gz) in dist/")
-    if not wheel_files:
-        issues.append("missing wheel (.whl) in dist/")
+    expected_version = _read_version_setup() or _read_version_init()
 
-    # 2. Try pip install in a temp venv if venv module available
-    if wheel_files:
+    # 2. Wheel metadata + contents
+    if wheel_path:
+        all_results += rule_wheel_metadata(wheel_path, expected_version)
+        all_results += rule_wheel_contents(wheel_path)
+
+    # 3. Sdist contents
+    if sdist_path:
+        all_results += rule_sdist_contents(sdist_path)
+
+    # 4. Install wheel in temp venv and verify commands + import
+    if wheel_path:
         import venv as _venv
         tmpdir = Path(tempfile.mkdtemp(prefix="vd-pkgverify-"))
         try:
             venv_dir = tmpdir / "venv"
             _venv.create(venv_dir, with_pip=True)
-            venv_python = venv_dir / "bin" / "python"
+            venv_bin_dir = venv_dir / "bin"
+            venv_python = venv_bin_dir / "python"
             if not venv_python.exists():
-                venv_python = venv_dir / "Scripts" / "python.exe"
+                venv_bin_dir = venv_dir / "Scripts"
+                venv_python = venv_bin_dir / "python.exe"
 
-            wheel = str(wheel_files[0])
             rc, out, err = _run_capture(
-                [str(venv_python), "-m", "pip", "install", wheel],
-                echo=False,
+                [str(venv_python), "-m", "pip", "install", str(wheel_path)],
+                echo=False, env=_clean_env(), cwd=str(tmpdir),
             )
             if rc != 0:
-                issues.append(f"pip install from wheel failed: {err.strip()[:300]}")
+                all_results.append(CheckResult(
+                    "wheel-install", False, "error",
+                    "pip install from wheel failed in venv",
+                    err.strip()[:300] or f"exit code {rc}",
+                ))
             else:
-                rc, out, err = _run_capture(
-                    [str(venv_python), "-c",
-                     "import visidata; print(visidata.__version_info__)"],
-                    echo=False,
-                )
-                if rc != 0:
-                    issues.append(f"import after wheel install failed: {err.strip()[:300]}")
-                else:
-                    _print_info(f"  wheel install + import: {out.strip()}")
+                all_results.append(CheckResult(
+                    "wheel-install", True, "error",
+                    "pip install from wheel succeeded in fresh venv",
+                    str(wheel_path),
+                ))
+                all_results += rule_installed_wheel(venv_bin_dir, expected_version, cwd=tmpdir)
         except Exception as e:
-            _print_warn(f"could not verify wheel in venv: {e}")
+            all_results.append(CheckResult(
+                "wheel-install", False, "warn",
+                f"could not verify wheel in venv: {e}",
+            ))
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
-    # 3. Report
-    if issues:
-        for i in issues:
-            _print_err(i)
-        _print_err(f"package verify failed: {len(issues)} issue(s)")
+    passed, errors, warnings = _report_results(all_results, "package verify")
+
+    if errors > 0:
+        _print_err(f"package verify FAILED: {errors} error(s), {warnings} warning(s)")
         return EXIT_ERR
-    _print_info("package verify passed")
+    _print_info(f"package verify PASSED: {passed} passed, {warnings} warning(s)")
     return EXIT_OK
 
 
