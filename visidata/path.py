@@ -11,7 +11,7 @@ from urllib.parse import urlparse, urlunparse
 from functools import wraps, lru_cache
 
 from visidata import vd
-from visidata import VisiData
+from visidata import VisiData, BaseSheet
 
 vd.help_encoding = '''Common Encodings:
 
@@ -762,6 +762,14 @@ class RuntimePaths:
                 except OSError:
                     pass
 
+    def session_file(self, name='session', ensure_dir=False, writable=False):
+        '''Get path to a session state file in the state directory.'''
+        return self.get_file('state', f'{name}.json', ensure_dir=ensure_dir, writable=writable)
+
+    def graph_file(self, name='graph', ensure_dir=False, writable=False):
+        '''Get path to a graph state file in the state directory.'''
+        return self.get_file('state', f'{name}.graph.json', ensure_dir=ensure_dir, writable=writable)
+
 
 @VisiData.cached_property
 def runtime_paths(vd):
@@ -795,9 +803,110 @@ def diagnosePaths(vd):
         vd.status(f'{category}: {status} {path} {note}')
 
 
+@VisiData.api
+def sessionStatePath(vd, name='session', writable=False):
+    '''Get path to a session state file, optionally ensuring writability.'''
+    return vd.runtime_paths.session_file(name, ensure_dir=writable, writable=writable)
+
+
+@VisiData.api
+def graphStatePath(vd, name='graph', writable=False):
+    '''Get path to a graph state file, optionally ensuring writability.'''
+    return vd.runtime_paths.graph_file(name, ensure_dir=writable, writable=writable)
+
+
+@VisiData.api
+def saveSessionState(vd, state, name='session'):
+    '''Save session state dict to the state directory. Returns True on success.'''
+    import json
+    p = vd.runtime_paths.session_file(name, ensure_dir=True, writable=True)
+    try:
+        with open(str(p), 'w') as fp:
+            json.dump(state, fp)
+        vd.status(f'saved session state to {p}')
+        return True
+    except (OSError, PermissionError) as e:
+        vd.warning(f'failed to save session state to {p}: {e}')
+        return False
+
+
+@VisiData.api
+def restoreSessionState(vd, name='session'):
+    '''Restore session state dict from the state directory. Returns state or None.'''
+    import json
+    p = vd.runtime_paths.session_file(name)
+    if not p.exists():
+        return None
+    try:
+        with open(str(p)) as fp:
+            state = json.load(fp)
+        vd.status(f'restored session state from {p}')
+        return state
+    except (OSError, PermissionError, json.JSONDecodeError) as e:
+        vd.warning(f'failed to restore session state from {p}: {e}')
+        return None
+
+
+@VisiData.api
+def saveGraphState(vd, state, name='graph'):
+    '''Save graph state dict to the state directory. Returns True on success.'''
+    import json
+    p = vd.runtime_paths.graph_file(name, ensure_dir=True, writable=True)
+    try:
+        with open(str(p), 'w') as fp:
+            json.dump(state, fp)
+        vd.status(f'saved graph state to {p}')
+        return True
+    except (OSError, PermissionError) as e:
+        vd.warning(f'failed to save graph state to {p}: {e}')
+        return False
+
+
+@VisiData.api
+def restoreGraphState(vd, name='graph'):
+    '''Restore graph state dict from the state directory. Returns state or None.'''
+    import json
+    p = vd.runtime_paths.graph_file(name)
+    if not p.exists():
+        return None
+    try:
+        with open(str(p)) as fp:
+            state = json.load(fp)
+        vd.status(f'restored graph state from {p}')
+        return state
+    except (OSError, PermissionError, json.JSONDecodeError) as e:
+        vd.warning(f'failed to restore graph state from {p}: {e}')
+        return None
+
+
+@VisiData.api
+def openDiagnosticsSheet(vd):
+    '''Open a TextSheet showing all runtime path diagnostics.'''
+    from visidata import TextSheet
+    lines = []
+    lines.append('Runtime Paths Diagnostics')
+    lines.append('=' * 60)
+    lines.append('')
+    for path, category, ok, note in vd.runtime_paths.diagnose():
+        status = 'OK' if ok else 'FAIL'
+        lines.append(f'[{status == "OK" and "green" or "error"}]{category}: {status}[/{status == "OK" and "green" or "error"}]  {path}')
+        if note:
+            lines.append(f'  note: {note}')
+        lines.append('')
+    lines.append('')
+    lines.append('Temporary directory:')
+    import tempfile
+    lines.append(f'  {tempfile.gettempdir()}')
+    return TextSheet('runtime_paths_diagnostics', source=lines)
+
+
 vd.addGlobals(RepeatFile=RepeatFile,
               Path=Path,
               modtime=modtime,
               filesize=filesize,
               vstat=vstat,
               RuntimePaths=RuntimePaths)
+
+BaseSheet.addCommand('', 'diagnose-paths', 'vd.push(vd.openDiagnosticsSheet())', 'show runtime path diagnostics as a sheet')
+BaseSheet.addCommand('', 'session-save', 'vd.saveSessionState({"sheets": [s.name for s in vd.sheets], "version": __version_info__})', 'save session state to state directory')
+BaseSheet.addCommand('', 'session-restore', 'vd.status("restored session: " + str(vd.restoreSessionState() or "none"))', 'restore session state from state directory')
