@@ -8,7 +8,7 @@ __all__ = ['openurl_postgres', 'openurl_postgresql', 'openurl_rds', 'PgTable', '
 vd.option('postgres_schema', 'public', 'desired schema for the Postgres database')
 
 def codeToType(type_code, colname):
-    psycopg2 = vd.importExternal('psycopg2', 'psycopg2-binary')
+    psycopg2 = vd.requireLoaderDep('postgres', 'psycopg2')
     try:
         tname = psycopg2._psycopg.string_types[type_code].name
         if 'INTEGER' in tname:
@@ -22,8 +22,8 @@ def codeToType(type_code, colname):
 
 @VisiData.api
 def openurl_rds(vd, url, filetype=None):
-    boto3 = vd.importExternal('boto3')
-    psycopg2 = vd.importExternal('psycopg2', 'psycopg2-binary')
+    boto3 = vd.requireLoaderDep('postgres', 'boto3')
+    psycopg2 = vd.requireLoaderDep('postgres', 'psycopg2')
 
     rds = boto3.client('rds')
     url = urlparse(url.given)
@@ -43,7 +43,7 @@ def openurl_rds(vd, url, filetype=None):
 
 @VisiData.api
 def openurl_postgres(vd, url, filetype=None):
-    psycopg2 = vd.importExternal('psycopg2', 'psycopg2-binary')
+    psycopg2 = vd.requireLoaderDep('postgres', 'psycopg2')
 
     url = urlparse(url.given)
     dbname = url.path[1:]

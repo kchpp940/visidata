@@ -45,7 +45,7 @@ Some helpful commands when working with cells of lists and dictionaries:
             import tomllib
         except ModuleNotFoundError:
             # Python 3.10 and below
-            tomllib = vd.importExternal("tomli")
+            tomllib = vd.requireLoaderDep('toml', 'tomli')
 
         data = tomllib.loads(self.source.read_text())
         for k, v in data.items():
