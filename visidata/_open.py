@@ -90,8 +90,10 @@ def guessFiletype(vd, p, *args, funcprefix='guess_'):
 
 @VisiData.api
 def guess_extension(vd, path):
-    # try auto-detect from extension
     ext = path.suffix[1:].lower()
+    cap = vd.loaders.get_by_extension(ext)
+    if cap and cap.can_open:
+        return dict(filetype=cap.filetype, _likelihood=3)
     openfunc = getattr(vd, f'open_{ext}', vd.getGlobals().get(f'open_{ext}'))
     if openfunc:
         return dict(filetype=ext, _likelihood=3)
@@ -107,14 +109,11 @@ def openPath(vd, p, filetype=None, create=False):
         schemes = p.scheme.split('+')
         scheme = schemes[-1]
 
-        cap = vd.loaders.get_by_scheme(scheme)
-        if cap and not cap.is_available:
-            vd.fail(f'{scheme} loader unavailable: {cap.unavailable_reason}')
-
-        openfuncname = 'openurl_' + scheme
-
-        openfunc = getattr(vd, openfuncname, None) or vd.getGlobals().get(openfuncname, None)
+        openfunc = vd.loaders.find_openurlfunc(scheme)
         if not openfunc:
+            cap = vd.loaders.get_by_scheme(scheme)
+            if cap and not cap.is_available:
+                vd.fail(f'{scheme} loader unavailable: {cap.unavailable_reason}')
             vd.fail(f'no loader for url scheme: {p.scheme}')
 
         return openfunc(p, filetype=filetype)
@@ -144,14 +143,13 @@ def openPath(vd, p, filetype=None, create=False):
         # read the file as text, into a RepeatFile that can be opened multiple times
         p = Path(p.given, fp=p.open(mode='rb'))
 
-    openfuncname = 'open_' + filetype
-    openfunc = getattr(vd, openfuncname, vd.getGlobals().get(openfuncname))
-
-    cap = vd.loaders.get(filetype)
-    if cap and not cap.is_available:
-        vd.fail(f'{filetype} loader unavailable: {cap.unavailable_reason}')
+    openfunc = vd.loaders.find_openfunc(filetype)
 
     if not openfunc:
+        cap = vd.loaders.get(filetype)
+        if cap and not cap.is_available:
+            vd.fail(f'{filetype} loader unavailable: {cap.unavailable_reason}')
+
         opts = vd.guessFiletype(p)
         if opts and 'filetype' in opts:
             filetype = opts['filetype']
@@ -160,10 +158,9 @@ def openPath(vd, p, filetype=None, create=False):
             if guess_cap and not guess_cap.is_available:
                 vd.fail(f'{filetype} loader unavailable: {guess_cap.unavailable_reason}')
 
-            openfuncname = 'open_' + filetype
-            openfunc = getattr(vd, openfuncname, vd.getGlobals().get(openfuncname))
+            openfunc = vd.loaders.find_openfunc(filetype)
             if not openfunc:
-                vd.error(f'guessed {filetype} but no {openfuncname}')
+                vd.error(f'guessed {filetype} but no open function found')
 
             vs = openfunc(p)
             for k, v in opts.items():

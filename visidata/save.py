@@ -151,14 +151,7 @@ def saveSheets(vd, givenpath, *vsheets, confirm_overwrite=True):
     savefunc = None
     filetype = None
     for ft in filetypes:
-        cap = vd.loaders.get(ft)
-        if cap:
-            if not cap.is_available:
-                vd.fail(f'{ft} loader unavailable: {cap.unavailable_reason}')
-            if not cap.can_save:
-                continue
-
-        savefunc = getattr(vsheets[0], 'save_' + ft, None) or getattr(vd, 'save_' + ft, None)
+        savefunc = vd.loaders.find_savefunc(ft, sheet=vsheets[0] if vsheets else None)
         if savefunc:
             filetype = ft
             break
@@ -214,7 +207,7 @@ def save_zip(vd, p, *vsheets):
             for vs in Progress(vsheets):
                 filetype = vs.options.save_filetype
                 tmpp = Path(f'{tmpdir}{vs.name}.{filetype}')
-                savefunc = getattr(vs, 'save_' + filetype, None) or getattr(vd, 'save_' + filetype, None)
+                savefunc = vd.loaders.find_savefunc(filetype, sheet=vs)
                 savefunc(tmpp, vs)
                 zfp.write(tmpp, f'{vs.name}.{vs.options.save_filetype}')
 

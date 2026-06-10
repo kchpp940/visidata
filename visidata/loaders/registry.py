@@ -1,7 +1,7 @@
 import importlib
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any, Callable
+from typing import List, Optional, Dict, Any
 
 from visidata import vd, VisiData, Sheet, Column, BaseSheet
 
@@ -42,11 +42,21 @@ class LoaderCapability:
     dependencies: List[LoaderDependency] = field(default_factory=list)
     description: str = ''
     openurl_schemes: List[str] = field(default_factory=list)
+    openfunc_name: str = ''
+    savefunc_name: str = ''
+    openurl_func_name: str = ''
+    guess_func_name: str = ''
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         if not self.extensions:
             self.extensions = [self.filetype]
+        if not self.openfunc_name and self.can_open and not self.openurl_schemes:
+            self.openfunc_name = f'open_{self.filetype}'
+        if not self.savefunc_name and self.can_save:
+            self.savefunc_name = f'save_{self.filetype}'
+        if not self.openurl_func_name and self.openurl_schemes:
+            self.openurl_func_name = f'openurl_{self.openurl_schemes[-1]}'
 
     @property
     def is_available(self) -> bool:
@@ -71,6 +81,32 @@ class LoaderCapability:
         if self.is_available:
             return 'available'
         return f'unavailable: {self.unavailable_reason}'
+
+    def resolve_openfunc(self):
+        if self.openfunc_name:
+            return getattr(vd, self.openfunc_name, None) or vd.getGlobals().get(self.openfunc_name)
+        return None
+
+    def resolve_savefunc(self):
+        if self.savefunc_name:
+            fn = getattr(vd, self.savefunc_name, None) or vd.getGlobals().get(self.savefunc_name)
+            if fn:
+                return fn
+            for ft in self.extensions:
+                fn = getattr(vd, f'save_{ft}', None) or vd.getGlobals().get(f'save_{ft}')
+                if fn:
+                    return fn
+        return None
+
+    def resolve_openurlfunc(self):
+        if self.openurl_func_name:
+            return getattr(vd, self.openurl_func_name, None) or vd.getGlobals().get(self.openurl_func_name)
+        return None
+
+    def resolve_guessfunc(self):
+        if self.guess_func_name:
+            return getattr(vd, self.guess_func_name, None) or vd.getGlobals().get(self.guess_func_name)
+        return None
 
 
 class LoaderRegistry:
@@ -158,19 +194,55 @@ class LoaderRegistry:
         cap = self.get(filetype)
         if not cap:
             vd.fail(f'unknown filetype: {filetype}')
-        if not cap.can_open:
-            vd.fail(f'{filetype} loader does not support opening')
         if not cap.is_available:
             vd.fail(f'{filetype} loader unavailable: {cap.unavailable_reason}')
+        if not cap.can_open:
+            vd.fail(f'{filetype} loader does not support opening')
 
     def check_save(self, filetype: str) -> None:
         cap = self.get(filetype)
         if not cap:
             vd.fail(f'unknown filetype: {filetype}')
-        if not cap.can_save:
-            vd.fail(f'{filetype} loader does not support saving')
         if not cap.is_available:
             vd.fail(f'{filetype} loader unavailable: {cap.unavailable_reason}')
+        if not cap.can_save:
+            vd.fail(f'{filetype} loader does not support saving')
+
+    def find_openfunc(self, filetype: str):
+        cap = self.get(filetype)
+        if cap:
+            if not cap.is_available:
+                vd.fail(f'{filetype} loader unavailable: {cap.unavailable_reason}')
+            fn = cap.resolve_openfunc()
+            if fn:
+                return fn
+        return getattr(vd, f'open_{filetype}', None) or vd.getGlobals().get(f'open_{filetype}')
+
+    def find_savefunc(self, filetype: str, sheet=None):
+        cap = self.get(filetype)
+        if cap:
+            if not cap.is_available:
+                vd.fail(f'{filetype} loader unavailable: {cap.unavailable_reason}')
+            if not cap.can_save:
+                return None
+            fn = cap.resolve_savefunc()
+            if fn:
+                return fn
+        if sheet:
+            fn = getattr(sheet, f'save_{filetype}', None)
+            if fn:
+                return fn
+        return getattr(vd, f'save_{filetype}', None) or vd.getGlobals().get(f'save_{filetype}')
+
+    def find_openurlfunc(self, scheme: str):
+        cap = self.get_by_scheme(scheme)
+        if cap:
+            if not cap.is_available:
+                vd.fail(f'{scheme} loader unavailable: {cap.unavailable_reason}')
+            fn = cap.resolve_openurlfunc()
+            if fn:
+                return fn
+        return getattr(vd, f'openurl_{scheme}', None) or vd.getGlobals().get(f'openurl_{scheme}')
 
 
 _D = LoaderDependency
@@ -182,16 +254,20 @@ LOADER_MANIFEST = [
         description='Tab-separated values'),
     LoaderCapability('csv', module='csv', extensions=['csv'],
         can_open=True, can_save=True, dependencies=[],
-        description='Comma-separated values'),
+        description='Comma-separated values',
+        guess_func_name='guess_csv'),
     LoaderCapability('json', module='json', extensions=['json'],
         can_open=True, can_save=True, dependencies=[],
-        description='JavaScript Object Notation'),
+        description='JavaScript Object Notation',
+        guess_func_name='guess_json'),
     LoaderCapability('jsonl', module='json', extensions=['jsonl', 'ndjson', 'ldjson'],
         can_open=True, can_save=True, dependencies=[],
+        openfunc_name='open_jsonl', savefunc_name='save_jsonl',
         description='JSON Lines (one object per line)'),
     LoaderCapability('jsonla', module='jsonla', extensions=['jsonla'],
         can_open=True, can_save=True, dependencies=[],
-        description='JSON Lines with async wrapper'),
+        description='JSON Lines with async wrapper',
+        guess_func_name='guess_jsonla'),
     LoaderCapability('fixed', module='fixed_width', extensions=['fixed'],
         can_open=True, can_save=True, dependencies=[],
         description='Fixed-width text'),
@@ -232,9 +308,11 @@ LOADER_MANIFEST = [
     LoaderCapability('html', module='html', extensions=['html', 'htm'],
         can_open=True, can_save=True,
         dependencies=[_D('lxml')],
-        description='HTML table'),
+        description='HTML table',
+        guess_func_name='guess_html'),
     LoaderCapability('markdown', module='markdown', extensions=['md'],
         can_save=True, dependencies=[],
+        savefunc_name='save_md',
         description='Markdown table'),
     LoaderCapability('jira', module='markdown', extensions=['jira'],
         can_save=True, dependencies=[],
@@ -244,31 +322,38 @@ LOADER_MANIFEST = [
         description='Email message (EML / MHTML)'),
     LoaderCapability('mbox', module='mailbox', extensions=['mbox', 'maildir', 'mmdf', 'babyl', 'mh'],
         can_open=True, dependencies=[],
+        openfunc_name='open_mbox',
         description='Mailbox formats'),
     LoaderCapability('sqlite', module='sqlite', extensions=['sqlite', 'sqlite3', 'db'],
         can_open=True, can_save=True, dependencies=[],
         description='SQLite database',
-        openurl_schemes=['sqlite']),
+        openurl_schemes=['sqlite'],
+        guess_func_name='guess_sqlite'),
     LoaderCapability('dot', module='graphviz', extensions=['dot'],
         can_save=True, dependencies=[],
         description='Graphviz DOT graph'),
     LoaderCapability('yaml', module='yaml', extensions=['yml', 'yaml'],
         can_open=True,
         dependencies=[_D('yaml', 'PyYAML')],
+        openfunc_name='open_yml',
         description='YAML'),
     LoaderCapability('toml', module='toml', extensions=['toml'],
-        can_open=True, dependencies=[],
+        can_open=True,
+        dependencies=[_D('tomli', required=False)],
         description='TOML configuration file'),
     LoaderCapability('http', module='http',
         can_open=True, dependencies=[],
         description='HTTP/HTTPS URL',
-        openurl_schemes=['http', 'https']),
+        openurl_schemes=['http', 'https'],
+        openurl_func_name='openurl_http'),
     LoaderCapability('zip', module='archive', extensions=['zip', 'whl'],
         can_open=True,
         dependencies=[_D('urllib3', required=False)],
+        openfunc_name='open_zip', guess_func_name='guess_zip',
         description='ZIP archive'),
     LoaderCapability('tar', module='archive', extensions=['tar', 'tgz', 'txz', 'tbz2'],
         can_open=True, dependencies=[],
+        openfunc_name='open_tar', guess_func_name='guess_tar',
         description='TAR archive'),
     LoaderCapability('xlsx', module='xlsx', extensions=['xlsx'],
         can_open=True, can_save=True,
@@ -281,6 +366,7 @@ LOADER_MANIFEST = [
     LoaderCapability('xlsb', module='xlsb', extensions=['xlsb'],
         can_open=True,
         dependencies=[_D('pyxlsb', 'git+https://github.com/saulpw/pyxlsb.git@visidata#egg=pyxlsb')],
+        guess_func_name='guess_xls',
         description='Excel XLSB binary'),
     LoaderCapability('ods', module='odf', extensions=['ods'],
         can_open=True,
@@ -292,15 +378,16 @@ LOADER_MANIFEST = [
         description='Pandas DataFrame (feather/gbq/orc/pickle/sas/stata/dta)'),
     LoaderCapability('arrow', module='arrow', extensions=['arrow', 'arrows'],
         can_open=True, can_save=True,
-        dependencies=[_D('pyarrow')],
+        dependencies=[_D('pyarrow'), _D('numpy', required=False)],
         description='Apache Arrow IPC'),
     LoaderCapability('parquet', module='parquet', extensions=['parquet'],
         can_open=True, can_save=True,
-        dependencies=[_D('pyarrow')],
+        dependencies=[_D('pyarrow'), _D('shapely', required=False)],
         description='Apache Parquet'),
     LoaderCapability('hdf5', module='hdf5', extensions=['h5', 'hdf5', 'hdf'],
         can_open=True,
-        dependencies=[_D('h5py')],
+        dependencies=[_D('h5py'), _D('numpy', required=False)],
+        openfunc_name='open_h5',
         description='HDF5 hierarchical data'),
     LoaderCapability('npy', module='npy', extensions=['npy', 'npz'],
         can_open=True, can_save=True,
@@ -310,26 +397,30 @@ LOADER_MANIFEST = [
         can_open=True,
         dependencies=[_D('s3fs.core', 's3fs')],
         description='Amazon S3',
-        openurl_schemes=['s3']),
+        openurl_schemes=['s3'],
+        openurl_func_name='openurl_s3'),
     LoaderCapability('postgres', module='postgres',
         can_open=True,
-        dependencies=[_D('psycopg2', 'psycopg2-binary')],
+        dependencies=[_D('psycopg2', 'psycopg2-binary'), _D('boto3', required=False)],
         description='PostgreSQL',
-        openurl_schemes=['postgres', 'postgresql', 'rds']),
+        openurl_schemes=['postgres', 'postgresql', 'rds'],
+        openurl_func_name='openurl_postgres'),
     LoaderCapability('mysql', module='mysql',
         can_open=True,
         dependencies=[_D('MySQLdb', 'mysqlclient')],
         description='MySQL',
-        openurl_schemes=['mysql']),
+        openurl_schemes=['mysql'],
+        openurl_func_name='openurl_mysql'),
     LoaderCapability('imap', module='imap',
         can_open=True,
         dependencies=[_D('google.auth.transport.requests', 'google-auth'),
                       _D('google_auth_oauthlib.flow', 'google-auth-oauthlib')],
         description='IMAP email',
-        openurl_schemes=['imap']),
+        openurl_schemes=['imap'],
+        openurl_func_name='openurl_imap'),
     LoaderCapability('pdf', module='pdf', extensions=['pdf'],
         can_open=True,
-        dependencies=[_D('pdfminer.high_level', 'pdfminer.six')],
+        dependencies=[_D('pdfminer.high_level', 'pdfminer.six'), _D('tabula', required=False)],
         description='PDF document'),
     LoaderCapability('png', module='png', extensions=['png'],
         can_open=True, can_save=True,
@@ -338,6 +429,7 @@ LOADER_MANIFEST = [
     LoaderCapability('pcap', module='pcap', extensions=['pcap', 'cap', 'pcapng', 'ntar'],
         can_open=True,
         dependencies=[_D('dpkt'), _D('dnslib', required=False)],
+        openfunc_name='open_pcap',
         description='Packet capture'),
     LoaderCapability('vcf', module='vcf', extensions=['vcf'],
         can_open=True,
@@ -357,11 +449,11 @@ LOADER_MANIFEST = [
         description='TrueType / OpenType font'),
     LoaderCapability('msgpack', module='msgpack', extensions=['msgpack', 'msgpackz'],
         can_open=True,
-        dependencies=[_D('msgpack')],
-        description='MessagePack binary'),
+        dependencies=[_D('msgpack'), _D('brotli', required=False)],
+        description='MessagePack / MessagePackZ binary'),
     LoaderCapability('sas', module='sas', extensions=['sas7bdat'],
         can_open=True,
-        dependencies=[_D('sas7bdat')],
+        dependencies=[_D('sas7bdat'), _D('xport', required=False)],
         description='SAS dataset'),
     LoaderCapability('xpt', module='sas', extensions=['xpt'],
         can_open=True,
@@ -370,6 +462,7 @@ LOADER_MANIFEST = [
     LoaderCapability('spss', module='spss', extensions=['spss', 'sav'],
         can_open=True,
         dependencies=[_D('savReaderWriter')],
+        openfunc_name='open_spss',
         description='SPSS dataset'),
     LoaderCapability('fec', module='fec', extensions=['fec'],
         can_open=True,
@@ -385,12 +478,14 @@ LOADER_MANIFEST = [
     LoaderCapability('conll', module='conll', extensions=['conll', 'conllu'],
         can_open=True,
         dependencies=[_D('pyconll')],
+        openfunc_name='open_conll',
         description='CoNLL / CoNLL-U annotation'),
     LoaderCapability('scrape', module='scrape',
         can_open=True,
         dependencies=[_D('bs4', 'beautifulsoup4'), _D('requests')],
         description='Web scraper (BeautifulSoup + requests)',
-        openurl_schemes=['http+scrape', 'scrape']),
+        openurl_schemes=['http+scrape', 'scrape'],
+        openurl_func_name='openhttp_scrape'),
     LoaderCapability('airtable', module='api_airtable',
         can_open=True,
         dependencies=[_D('pyairtable')],
@@ -399,7 +494,8 @@ LOADER_MANIFEST = [
         can_open=True,
         dependencies=[_D('matrix_client')],
         description='Matrix protocol',
-        openurl_schemes=['http+matrix', 'matrix']),
+        openurl_schemes=['http+matrix', 'matrix'],
+        openurl_func_name='openhttp_matrix'),
     LoaderCapability('reddit', module='api_reddit', extensions=['reddit'],
         can_open=True,
         dependencies=[_D('praw')],
@@ -408,7 +504,8 @@ LOADER_MANIFEST = [
         can_open=True,
         dependencies=[_D('zulip')],
         description='Zulip chat API',
-        openurl_schemes=['http+zulip', 'zulip']),
+        openurl_schemes=['http+zulip', 'zulip'],
+        openurl_func_name='openhttp_zulip'),
     LoaderCapability('claude', module='claude', extensions=['claude'],
         can_open=True, dependencies=[],
         description='Claude AI conversation'),
@@ -424,6 +521,10 @@ LOADER_MANIFEST = [
         dependencies=[_D('google.auth.transport.requests', 'google-auth'),
                       _D('google_auth_oauthlib.flow', 'google-auth-oauthlib')],
         description='Google OAuth helper'),
+    LoaderCapability('texttables', module='texttables',
+        can_save=True,
+        dependencies=[_D('tabulate')],
+        description='Tabulate text table formats (grid/pipe/simple/rst/etc)'),
 ]
 
 
@@ -459,6 +560,10 @@ def registerLoader(vd, filetype, **kwargs):
         dependencies=deps,
         description=kwargs.pop('description', ''),
         openurl_schemes=kwargs.pop('openurl_schemes', []),
+        openfunc_name=kwargs.pop('openfunc_name', ''),
+        savefunc_name=kwargs.pop('savefunc_name', ''),
+        openurl_func_name=kwargs.pop('openurl_func_name', ''),
+        guess_func_name=kwargs.pop('guess_func_name', ''),
         extra=kwargs.pop('extra', {}),
     )
     return vd.loaders.register(cap)
@@ -489,10 +594,12 @@ class LoaderSheet(Sheet):
         Column('description', type=str, getter=lambda c, r: r.description),
         Column('dependencies', type=str,
                getter=lambda c, r: ', '.join(
-                   f'{d.modname}{"✓" if d.is_available else "✗"}'
+                   f'{d.modname}{"+" if d.is_available else "-"}'
                    for d in r.dependencies) if r.dependencies else ''),
         Column('schemes', type=str,
                getter=lambda c, r: ', '.join(r.openurl_schemes) if r.openurl_schemes else ''),
+        Column('openfunc', type=str, getter=lambda c, r: r.openfunc_name or r.openurl_func_name or ''),
+        Column('savefunc', type=str, getter=lambda c, r: r.savefunc_name or ''),
     ]
 
     def iterload(self):
