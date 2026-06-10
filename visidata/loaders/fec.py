@@ -205,6 +205,7 @@ class FECFiling(Sheet):
 
     @asyncthread
     def reload(self):
+        fecfile = vd.requireLoaderDep('fec', 'fecfile')
         from fecfile import fecparser
         self.rows = []  # rowdef:  Sheet, of a type from COMPONENT_SHEET_CLASSES.values()
 

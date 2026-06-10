@@ -11,9 +11,9 @@ VisiData.open_msgpackz = VisiData.open_msgpack
 
 class MsgpackSheet(JsonSheet):
     def iterload(self):
-        msgpack = vd.importModule('msgpack')
+        msgpack = vd.requireLoaderDep('msgpack', 'msgpack')
         data = self.source.read_bytes()
         if self.source.options.filetype == 'msgpackz':
-            brotli = vd.importModule('brotli')
+            brotli = vd.requireLoaderDep('msgpack', 'brotli')
             data = brotli.decompress(data)
         yield from msgpack.unpackb(data, raw=False)

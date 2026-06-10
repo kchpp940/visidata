@@ -11,7 +11,7 @@ VisiData.open_yaml = VisiData.open_yml
 
 class YamlSheet(JsonSheet):
     def iterload(self):
-        yaml = vd.importExternal('yaml', 'PyYAML')
+        yaml = vd.requireLoaderDep('yaml', 'yaml')
 
         class PrettySafeLoader(yaml.SafeLoader):
             def construct_python_tuple(self, node):

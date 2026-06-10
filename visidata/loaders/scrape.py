@@ -13,14 +13,14 @@ from visidata import vd, VisiData, TableSheet, vdtype, Column, AttrColumn, Progr
 
 @VisiData.api
 def soup(vd, s):
-    bs4 = vd.importExternal('bs4', 'beautifulsoup4')
+    bs4 = vd.requireLoaderDep('scrape', 'bs4')
     from bs4 import BeautifulSoup
     return BeautifulSoup(s, 'html.parser')
 
 
 @VisiData.api
 def open_scrape(vd, p):
-    bs4 = vd.importExternal('bs4', 'beautifulsoup4')
+    bs4 = vd.requireLoaderDep('scrape', 'bs4')
 
     vd.enable_requests_cache()
     if p.is_url():
@@ -147,7 +147,7 @@ class HtmlDocsSheet(TableSheet):
         AttrColumn('soup.title.string'),
     ]
     def iterload(self):
-        requests = vd.importExternal('requests')
+        requests = vd.requireLoaderDep('scrape', 'requests')
         self.colnames = {}
 #        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
 #            yield from executor.map(requests.get, Progress(self.urls))

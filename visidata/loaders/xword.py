@@ -83,7 +83,7 @@ class CrosswordSheet(Sheet):
 
     @asyncthread
     def reload(self):
-        import xdfile
+        xdfile = vd.requireLoaderDep('xword', 'xdfile')
         self.xd = xdfile.xdfile(xd_contents=self.source.read_text(), filename=self.source)
         self.rows = self.xd.clues
 
@@ -94,6 +94,7 @@ class CrosswordSheet(Sheet):
 class PuzSheet(CrosswordSheet):
     @asyncthread
     def reload(self):
+        xdfile = vd.requireLoaderDep('xword', 'xdfile')
         import xdfile.puz2xd
         self.xd = xdfile.puz2xd.parse_puz(self.source.read_bytes(), str(self.source))
         self.rows = self.xd.clues

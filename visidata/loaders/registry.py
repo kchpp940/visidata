@@ -31,6 +31,13 @@ class LoaderDependency:
             return f'{self.reason}; run: `pip install {self.pipmodname}`'
         return f'run: `pip install {self.pipmodname}`'
 
+    def import_module(self):
+        '''Import and return this module. Fail with unified error if missing.'''
+        try:
+            return importlib.import_module(self.modname)
+        except ModuleNotFoundError:
+            vd.fail(f'package `{self.modname}` not installed; {self.install_hint}')
+
 
 @dataclass
 class LoaderCapability:
@@ -106,6 +113,30 @@ class LoaderCapability:
     def resolve_guessfunc(self):
         if self.guess_func_name:
             return getattr(vd, self.guess_func_name, None) or vd.getGlobals().get(self.guess_func_name)
+        return None
+
+    def require_deps(self):
+        '''Check all required dependencies. Return list of imported required modules. Fail if any missing.'''
+        imported = []
+        for dep in self.dependencies:
+            if dep.required:
+                m = dep.import_module()
+                vd.addGlobals({dep.modname: m})
+                imported.append(m)
+        return imported
+
+    def require_dep(self, modname):
+        '''Import and return a single dependency module by modname. Fail if missing or not declared.'''
+        dep = self.get_dep(modname)
+        if dep is None:
+            vd.fail(f'dependency `{modname}` not declared for filetype `{self.filetype}`')
+        return dep.import_module()
+
+    def get_dep(self, modname):
+        '''Return the LoaderDependency for the given modname, or None if not declared.'''
+        for dep in self.dependencies:
+            if dep.modname == modname:
+                return dep
         return None
 
 
@@ -210,39 +241,42 @@ class LoaderRegistry:
 
     def find_openfunc(self, filetype: str):
         cap = self.get(filetype)
-        if cap:
-            if not cap.is_available:
-                vd.fail(f'{filetype} loader unavailable: {cap.unavailable_reason}')
-            fn = cap.resolve_openfunc()
-            if fn:
-                return fn
-        return getattr(vd, f'open_{filetype}', None) or vd.getGlobals().get(f'open_{filetype}')
+        if not cap:
+            return None
+        if not cap.is_available:
+            vd.fail(f'{filetype} loader unavailable: {cap.unavailable_reason}')
+        if not cap.can_open:
+            return None
+        return cap.resolve_openfunc()
 
     def find_savefunc(self, filetype: str, sheet=None):
         cap = self.get(filetype)
-        if cap:
-            if not cap.is_available:
-                vd.fail(f'{filetype} loader unavailable: {cap.unavailable_reason}')
-            if not cap.can_save:
-                return None
-            fn = cap.resolve_savefunc()
-            if fn:
-                return fn
+        if not cap:
+            if sheet:
+                fn = getattr(sheet, f'save_{filetype}', None)
+                if fn:
+                    return fn
+            return None
+        if not cap.is_available:
+            vd.fail(f'{filetype} loader unavailable: {cap.unavailable_reason}')
+        if not cap.can_save:
+            return None
+        fn = cap.resolve_savefunc()
+        if fn:
+            return fn
         if sheet:
             fn = getattr(sheet, f'save_{filetype}', None)
             if fn:
                 return fn
-        return getattr(vd, f'save_{filetype}', None) or vd.getGlobals().get(f'save_{filetype}')
+        return None
 
     def find_openurlfunc(self, scheme: str):
         cap = self.get_by_scheme(scheme)
-        if cap:
-            if not cap.is_available:
-                vd.fail(f'{scheme} loader unavailable: {cap.unavailable_reason}')
-            fn = cap.resolve_openurlfunc()
-            if fn:
-                return fn
-        return getattr(vd, f'openurl_{scheme}', None) or vd.getGlobals().get(f'openurl_{scheme}')
+        if not cap:
+            return None
+        if not cap.is_available:
+            vd.fail(f'{scheme} loader unavailable: {cap.unavailable_reason}')
+        return cap.resolve_openurlfunc()
 
 
 _D = LoaderDependency
@@ -540,6 +574,21 @@ vd.loaders = _build_registry()
 
 @VisiData.api
 def registerLoader(vd, filetype, **kwargs):
+    '''Register a loader capability into the global registry.
+
+    This is the explicit entry point for external addons to register their own
+    file types.  The filetype is required; all other arguments are optional.
+
+    Function references may be passed directly as ``openfunc`` / ``savefunc``
+    / ``openurlfunc`` / ``guessfunc``, which will be auto-assigned to the
+    ``openfunc_name`` / ``savefunc_name`` / ``openurl_func_name`` /
+    ``guess_func_name`` slots on the resulting LoaderCapability.
+
+    Examples::
+
+        vd.registerLoader('mydb', can_open=True, dependencies=['mydb'],
+                          openfunc=open_mydb, extensions=['mydb', 'mdb'])
+    '''
     deps = []
     for dep in (kwargs.pop('dependencies', None) or []):
         if isinstance(dep, LoaderDependency):
@@ -551,7 +600,7 @@ def registerLoader(vd, filetype, **kwargs):
         elif isinstance(dep, dict):
             deps.append(LoaderDependency(**dep))
 
-    cap = LoaderCapability(
+    cap_kwargs = dict(
         filetype=filetype,
         module=kwargs.pop('module', ''),
         extensions=kwargs.pop('extensions', []),
@@ -560,12 +609,44 @@ def registerLoader(vd, filetype, **kwargs):
         dependencies=deps,
         description=kwargs.pop('description', ''),
         openurl_schemes=kwargs.pop('openurl_schemes', []),
-        openfunc_name=kwargs.pop('openfunc_name', ''),
-        savefunc_name=kwargs.pop('savefunc_name', ''),
-        openurl_func_name=kwargs.pop('openurl_func_name', ''),
-        guess_func_name=kwargs.pop('guess_func_name', ''),
         extra=kwargs.pop('extra', {}),
     )
+
+    openfunc = kwargs.pop('openfunc', None)
+    savefunc = kwargs.pop('savefunc', None)
+    openurlfunc = kwargs.pop('openurlfunc', None)
+    guessfunc = kwargs.pop('guessfunc', None)
+
+    openfunc_name = kwargs.pop('openfunc_name', '')
+    savefunc_name = kwargs.pop('savefunc_name', '')
+    openurl_func_name = kwargs.pop('openurl_func_name', '')
+    guess_func_name = kwargs.pop('guess_func_name', '')
+
+    if openfunc:
+        if not openfunc_name:
+            openfunc_name = getattr(openfunc, '__name__', f'open_{filetype}')
+        vd.addGlobals({openfunc_name: openfunc})
+    if savefunc:
+        if not savefunc_name:
+            savefunc_name = getattr(savefunc, '__name__', f'save_{filetype}')
+        vd.addGlobals({savefunc_name: savefunc})
+    if openurlfunc:
+        if not openurl_func_name:
+            openurl_func_name = getattr(openurlfunc, '__name__', f'openurl_{filetype}')
+        vd.addGlobals({openurl_func_name: openurlfunc})
+    if guessfunc:
+        if not guess_func_name:
+            guess_func_name = getattr(guessfunc, '__name__', f'guess_{filetype}')
+        vd.addGlobals({guess_func_name: guessfunc})
+
+    cap_kwargs.update(
+        openfunc_name=openfunc_name,
+        savefunc_name=savefunc_name,
+        openurl_func_name=openurl_func_name,
+        guess_func_name=guess_func_name,
+    )
+
+    cap = LoaderCapability(**cap_kwargs)
     return vd.loaders.register(cap)
 
 
@@ -579,6 +660,41 @@ def listLoaders(vd, include_unavailable=True):
 @VisiData.api
 def getLoaderInfo(vd, filetype):
     return vd.loaders.get(filetype)
+
+
+@VisiData.api
+def requireLoaderDeps(vd, filetype):
+    '''Require (import and return) all required dependencies of the given filetype.
+
+    Fail with a unified error message from the capability registry if any
+    required package is missing.  This is the registry-aware replacement for
+    scattered ``vd.importExternal`` / ``vd.importModule`` calls inside loaders.
+
+    Example inside a loader::
+
+        pandas, numpy = vd.requireLoaderDeps('pandas')
+    '''
+    cap = vd.loaders.get(filetype)
+    if not cap:
+        vd.fail(f'unknown filetype: {filetype}')
+    return cap.require_deps()
+
+
+@VisiData.api
+def requireLoaderDep(vd, filetype, modname):
+    '''Require (import and return) a single dependency ``modname`` of the given filetype.
+
+    Fail with a unified error from the registry if the package is missing or
+    not declared in the manifest.
+
+    Example inside a loader::
+
+        requests = vd.requireLoaderDep('scrape', 'requests')
+    '''
+    cap = vd.loaders.get(filetype)
+    if not cap:
+        vd.fail(f'unknown filetype: {filetype}')
+    return cap.require_dep(modname)
 
 
 class LoaderSheet(Sheet):
