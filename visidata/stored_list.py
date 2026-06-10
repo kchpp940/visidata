@@ -40,5 +40,8 @@ class StoredList(list):
         if not vd.runtime_paths.ensure_dir(p.parent, writable=True):
             return
 
-        with p.open(encoding='utf-8', mode='a') as fp:
-            fp.write(json.dumps(v) + '\n')
+        try:
+            with p.open(encoding='utf-8', mode='a') as fp:
+                fp.write(json.dumps(v) + '\n')
+        except (OSError, PermissionError) as e:
+            vd.warning(f'cannot append to stored list {self.name} at {p}: {e}')

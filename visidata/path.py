@@ -550,6 +550,8 @@ class RuntimePaths:
         self._vd = vd
         self._dirs = {}
         self._writable_cache = {}
+        self._migration_log = []
+        self._permission_log = []
 
     def _resolve_base(self, category):
         '''Resolve the base directory for a given category.'''
@@ -630,9 +632,11 @@ class RuntimePaths:
             if not p.exists():
                 p.mkdir(parents=True, exist_ok=True)
         except PermissionError as e:
+            self._permission_log.append((str(p), f'permission denied: {e}'))
             self._vd.warning(f'permission denied creating {p}: {e}')
             return False
         except OSError as e:
+            self._permission_log.append((str(p), f'cannot create: {e}'))
             self._vd.warning(f'cannot create directory {p}: {e}')
             return False
 
@@ -654,6 +658,7 @@ class RuntimePaths:
             os.unlink(testfile)
             result = True
         except (PermissionError, OSError) as e:
+            self._permission_log.append((str(path), f'not writable: {e}'))
             self._vd.warning(f'{path} is not writable: {e}')
             result = False
 
@@ -669,7 +674,12 @@ class RuntimePaths:
         p = Path(relpath) if not isinstance(relpath, Path) else relpath
         if p.is_absolute():
             return p
-        base = self.get_dir(base_category)
+        try:
+            base = self.get_dir(base_category)
+        except Exception as e:
+            self._permission_log.append((str(relpath), f'cannot resolve base for {base_category}: {e}'))
+            self._vd.warning(f'cannot resolve relative path {relpath}: {e}')
+            return p
         return base / p
 
     def migrate_file(self, old_path, new_category, *new_subpaths, filename=None):
@@ -690,14 +700,16 @@ class RuntimePaths:
         try:
             self.ensure_dir(new.parent, writable=True)
             shutil.copy2(str(old), str(new))
+            self._migration_log.append((str(old), str(new), True, ''))
             self._vd.status(f'migrated {old} to {new}')
             return new
         except (OSError, IOError) as e:
+            self._migration_log.append((str(old), str(new), False, str(e)))
             self._vd.warning(f'failed to migrate {old} to {new}: {e}')
             return None
 
     def diagnose(self):
-        '''Return a list of (path, status, note) tuples for all managed paths.'''
+        '''Return a list of (path, category, ok, note) tuples for all managed paths.'''
         results = []
         for category in ['config', 'data', 'cache', 'state']:
             try:
@@ -712,6 +724,12 @@ class RuntimePaths:
                 results.append((str(p), category, exists and writable, note))
             except Exception as e:
                 results.append(('', category, False, str(e)))
+        for old, new, ok, note in self._migration_log:
+            status = 'migrated' if ok else 'migration failed'
+            note = f'{old} -> {new}' + (f': {note}' if note else '')
+            results.append((new, 'migration', ok, note))
+        for path, note in self._permission_log:
+            results.append((path, 'permission', False, note))
         return results
 
     def config_file(self, name='config.py'):
@@ -722,6 +740,10 @@ class RuntimePaths:
 
         legacy = Path(os.path.expanduser('~/.visidatarc'))
         if legacy.exists() and name == 'config.py':
+            migrated = self.migrate_file(str(legacy), 'config', filename='config.py')
+            if migrated:
+                self._vd.status(f'migrated legacy ~/.visidatarc to {migrated}')
+                return migrated
             return legacy
 
         return xdg_path

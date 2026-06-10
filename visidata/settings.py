@@ -558,6 +558,12 @@ def loadConfigAndPlugins(vd, args=AttrDict()):
     if vd.options.config:
         vd.loadConfigFile(vd.options.config)
 
+    for path, category, ok, note in _get_runtime_paths(vd).diagnose():
+        if not ok:
+            vd.warning(f'runtime path {category}: {path} - {note}')
+        elif note:
+            vd.debug(f'runtime path {category}: {path} - {note}')
+
 
 @VisiData.api
 def importModule(vd, pkgname, symbols=[]):

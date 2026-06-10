@@ -408,6 +408,10 @@ def main_vd():
     if not args.nothing:
         vd.loadConfigAndPlugins(args)
 
+    for path, category, ok, note in vd.runtime_paths.diagnose():
+        if not ok:
+            vd.warning(f'{category}: {path} - {note}')
+
     for k, v in global_args.items():
         options.set(k, v, obj='global')
 

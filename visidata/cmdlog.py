@@ -64,6 +64,41 @@ def fnSuffix(vd, prefix:str):
 
     return fn
 
+
+@VisiData.api
+def cmdlogStatePath(vd, name='cmdlog', writable=False):
+    '''Get path to cmdlog state file in state directory.'''
+    return vd.runtime_paths.get_file('state', f'{name}.vdj', ensure_dir=writable, writable=writable)
+
+
+@VisiData.api
+def saveCmdlogState(vd, name='cmdlog'):
+    '''Save current cmdlog to state directory. Returns True on success.'''
+    p = vd.cmdlogStatePath(name, writable=True)
+    try:
+        vd.saveSheets(p, vd.cmdlog, confirm_overwrite=False)
+        vd.status(f'saved cmdlog state to {p}')
+        return True
+    except (OSError, PermissionError) as e:
+        vd.warning(f'failed to save cmdlog state to {p}: {e}')
+        return False
+
+
+@VisiData.api
+def restoreCmdlogState(vd, name='cmdlog'):
+    '''Restore cmdlog from state directory. Returns loaded CommandLog sheet or None.'''
+    p = vd.cmdlogStatePath(name)
+    if not p.exists():
+        return None
+    try:
+        vs = vd.openSource(p)
+        if vs:
+            vd.status(f'restored cmdlog state from {p}')
+        return vs
+    except (OSError, PermissionError) as e:
+        vd.warning(f'failed to restore cmdlog state from {p}: {e}')
+        return None
+
 def indexMatch(L, func):
     'returns the smallest i for which func(L[i]) is true'
     for i, x in enumerate(L):
@@ -462,9 +497,12 @@ BaseSheet.init('_shortcut')
 globalCommand('gD', 'cmdlog-all', 'vd.push(vd.cmdlog)', 'open global CommandLog for all commands executed in current session')
 globalCommand('D', 'cmdlog-sheet', 'vd.push(sheet.cmdlog)', "open current sheet's CommandLog with all other loose ends removed; includes commands from parent sheets")
 globalCommand('zD', 'cmdlog-sheet-only', 'vd.push(sheet.cmdlog_sheet)', 'open CommandLog for current sheet with commands from parent sheets removed')
-BaseSheet.addCommand('Ctrl+D', 'save-cmdlog', 'saveSheets(inputPath("save cmdlog to: ", value=fnSuffix(name)), vd.cmdlog)', 'save CommandLog to filename.vdj file')
+BaseSheet.addCommand('Ctrl+D', 'save-cmdlog', 'saveSheets(inputPath("save cmdlog to: ", value=str(vd.cmdlogStatePath("cmdlog"))), vd.cmdlog)', 'save CommandLog to filename.vdj file')
 BaseSheet.bindkey('Ctrl+N', 'no-op')
 BaseSheet.addCommand('Ctrl+K', 'replay-stop', 'vd.replay_cancel(); vd.warning("replay canceled")', 'cancel current replay')
+
+BaseSheet.addCommand('', 'save-cmdlog-state', 'vd.saveCmdlogState()', 'save current cmdlog to state directory')
+BaseSheet.addCommand('', 'restore-cmdlog-state', 'vs = vd.restoreCmdlogState(); vd.push(vs) if vs else vd.status("no cmdlog state found")', 'restore cmdlog from state directory and replay')
 
 globalCommand(None, 'show-status', 'status(input("status: "))', 'show given message on status line')
 globalCommand('Ctrl+V', 'show-version', 'status(__version_info__);', 'Show version and copyright information on status line')
