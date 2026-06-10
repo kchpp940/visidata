@@ -843,9 +843,20 @@ def saveSessionState(vd, state=None, name='session'):
     current sheets and sources. Returns True on success.'''
     import json
     if state is None:
+        sources = []
+        for s in vd.sheets:
+            src = getattr(s, 'source', None)
+            if src is None:
+                sources.append(None)
+            elif isinstance(src, str):
+                sources.append(src)
+            elif hasattr(src, 'given'):
+                sources.append(str(src.given) if src.given else str(src))
+            else:
+                sources.append(str(src))
         state = {
             'sheets': [s.name for s in vd.sheets],
-            'sources': [str(s.source) if hasattr(s, 'source') and s.source else None for s in vd.sheets],
+            'sources': sources,
             'version': getattr(vd, 'version_info', ''),
         }
     p = vd.runtime_paths.session_file(name, ensure_dir=True, writable=True)
@@ -870,7 +881,6 @@ def restoreSessionState(vd, name='session', open_sources=True):
     try:
         with open(str(p)) as fp:
             state = json.load(fp)
-        vd.status(f'restored session state from {p}')
         if open_sources and isinstance(state, dict) and state.get('sources'):
             opened = 0
             for src in state['sources']:
@@ -879,12 +889,13 @@ def restoreSessionState(vd, name='session', open_sources=True):
                 try:
                     vs = vd.openSource(src)
                     if vs:
+                        vd.sync(vs.reload())
                         vd.push(vs)
                         opened += 1
                 except Exception as e:
                     vd.warning(f'failed to restore source {src}: {e}')
             if opened:
-                vd.status(f'restored {opened} sheets from session')
+                vd.status(f'restored {opened}/{len(state["sources"])} sheets from session')
         return state
     except (OSError, PermissionError, json.JSONDecodeError) as e:
         vd.warning(f'failed to restore session state from {p}: {e}')
@@ -899,7 +910,6 @@ def saveGraphState(vd, state, name='graph'):
     try:
         with open(str(p), 'w') as fp:
             json.dump(state, fp)
-        vd.status(f'saved graph state to {p}')
         return True
     except (OSError, PermissionError) as e:
         vd.warning(f'failed to save graph state to {p}: {e}')
@@ -916,7 +926,6 @@ def restoreGraphState(vd, name='graph'):
     try:
         with open(str(p)) as fp:
             state = json.load(fp)
-        vd.status(f'restored graph state from {p}')
         return state
     except (OSError, PermissionError, json.JSONDecodeError) as e:
         vd.warning(f'failed to restore graph state from {p}: {e}')

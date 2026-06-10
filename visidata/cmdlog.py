@@ -94,10 +94,12 @@ def restoreCmdlogState(vd, name='cmdlog', replay=True):
     try:
         vs = vd.openSource(p)
         if vs:
-            vd.status(f'restored cmdlog state from {p}')
-            if replay:
+            vd.sync(vs.reload())
+            if replay and vs.rows:
                 vd.replay(vs)
                 vd.status(f'replaying {len(vs.rows)} commands from saved cmdlog')
+            else:
+                vd.status(f'restored cmdlog state from {p} ({len(vs.rows)} commands)')
         return vs
     except (OSError, PermissionError) as e:
         vd.warning(f'failed to restore cmdlog state from {p}: {e}')
@@ -506,7 +508,7 @@ BaseSheet.bindkey('Ctrl+N', 'no-op')
 BaseSheet.addCommand('Ctrl+K', 'replay-stop', 'vd.replay_cancel(); vd.warning("replay canceled")', 'cancel current replay')
 
 BaseSheet.addCommand('', 'save-cmdlog-state', 'vd.saveCmdlogState()', 'save current cmdlog to state directory')
-BaseSheet.addCommand('', 'restore-cmdlog-state', 'vs = vd.restoreCmdlogState(); vd.push(vs) if vs else vd.status("no cmdlog state found")', 'restore cmdlog from state directory and replay')
+BaseSheet.addCommand('', 'restore-cmdlog-state', 'vd.restoreCmdlogState() or vd.status("no cmdlog state found")', 'restore and replay cmdlog from state directory')
 
 globalCommand(None, 'show-status', 'status(input("status: "))', 'show given message on status line')
 globalCommand('Ctrl+V', 'show-version', 'status(__version_info__);', 'Show version and copyright information on status line')

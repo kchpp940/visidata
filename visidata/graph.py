@@ -382,7 +382,11 @@ class GraphSheet(InvertedCanvas):
             'xzoomlevel': getattr(self, 'xzoomlevel', None),
             'yzoomlevel': getattr(self, 'yzoomlevel', None),
         }
-        return vd.saveGraphState(state, name or self.stateKey)
+        key = name or self.stateKey
+        if vd.saveGraphState(state, key):
+            vd.status(f'graph state saved as {key}')
+            return True
+        return False
 
     def restoreState(self, name=None):
         state = vd.restoreGraphState(name or self.stateKey)
@@ -405,6 +409,7 @@ class GraphSheet(InvertedCanvas):
         if state.get('yzoomlevel') is not None:
             self.yzoomlevel = state['yzoomlevel']
         self.refresh()
+        vd.status(f'graph state restored ({len(self.reflines_x)} x-reflines, {len(self.reflines_y)} y-reflines)')
         return True
 
 def format_input_value(val, type):
