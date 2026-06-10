@@ -81,17 +81,15 @@
     ```
 
 
-  Push to pypi
+  Build, verify, and push to pypi:
     ```
-    rm -rf dist/
-    rm -rf build/
-    python3 setup.py sdist bdist_wheel
-    chmod -R a+rX dist
-    ls dist/
+    vd-dev package all          # builds sdist + wheel, verifies install in temp venv
     twine upload dist/*
     ```
 
-11. Test install/upgrade from pypi
+    (equivalently: `make package` then `twine upload dist/*`)
+
+13. Test install/upgrade from pypi
 
   a. Build and deploy the website
 

@@ -328,12 +328,23 @@ def cmd_install(args: argparse.Namespace) -> int:
 
 def setup_install(sub) -> None:
     p = sub.add_parser("install", help="install package with optional extras")
-    p.add_argument("mode", nargs="?", default="dev",
-                   choices=["dev", "test", "all", "prod"],
-                   help="installation mode (default: dev)")
+    inst_sub = p.add_subparsers(dest="mode", metavar="<mode>")
+    inst_sub.required = False
+
+    for name, help_text in [
+        ("dev", "editable install with dev dependencies (default)"),
+        ("test", "install with test dependencies"),
+        ("all", "install with all optional dependencies"),
+        ("prod", "non-editable production install"),
+    ]:
+        sp = inst_sub.add_parser(name, help=help_text)
+        sp.add_argument("--check", action="store_true",
+                        help="only verify installation matches mode, do not install")
+        sp.set_defaults(func=cmd_install)
+
     p.add_argument("--check", action="store_true",
                    help="only verify installation matches mode, do not install")
-    p.set_defaults(func=cmd_install)
+    p.set_defaults(func=cmd_install, mode="dev")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -883,49 +894,59 @@ def cmd_test_smoke(args: argparse.Namespace) -> int:
 # test dispatch
 # ═══════════════════════════════════════════════════════════════════════
 
-def cmd_test(args: argparse.Namespace) -> int:
-    mode = args.mode
+def _cmd_test_unit(args: argparse.Namespace) -> int:
+    extra = args.extra_args or []
+    if extra:
+        return _run([sys.executable, "-m", "pytest", *extra])
+    return _run([sys.executable, "-m", "pytest", "visidata/tests/"])
 
-    if mode == "all":
-        return cmd_test_all(args)
-    if mode == "golden":
-        return cmd_test_golden(args)
-    if mode == "unit":
-        extra = args.extra_args or []
-        if extra:
-            return _run([sys.executable, "-m", "pytest", *extra])
-        return _run([sys.executable, "-m", "pytest", "visidata/tests/"])
-    if mode == "vgit":
-        extra = args.extra_args or []
-        cmd = (
-            f"{sys.executable} -m visidata --config tests/.visidatarc"
-            f" -p visidata/apps/vgit/tests/*.vdx --batch"
-        )
-        if extra:
-            cmd += " " + " ".join(extra)
-        return _run(cmd, shell=True)
-    if mode == "vdsql":
-        extra = args.extra_args or []
-        return _run(["bash", "./test.sh", *extra], cwd=ROOT / "visidata/apps/vdsql")
-    if mode == "smoke":
-        return cmd_test_smoke(args)
-    if mode == "perf":
-        return _run(["bash", "tests/test-perf.sh", *(args.extra_args or [])])
-    if mode == "individual":
-        return cmd_test_individual(args)
 
-    _die(f"unknown test mode: {mode}")
+def _cmd_test_vgit(args: argparse.Namespace) -> int:
+    extra = args.extra_args or []
+    cmd = (
+        f"{sys.executable} -m visidata --config tests/.visidatarc"
+        f" -p visidata/apps/vgit/tests/*.vdx --batch"
+    )
+    if extra:
+        cmd += " " + " ".join(extra)
+    return _run(cmd, shell=True)
+
+
+def _cmd_test_vdsql(args: argparse.Namespace) -> int:
+    extra = args.extra_args or []
+    return _run(["bash", "./test.sh", *extra], cwd=ROOT / "visidata/apps/vdsql")
+
+
+def _cmd_test_perf(args: argparse.Namespace) -> int:
+    return _run(["bash", "tests/test-perf.sh", *(args.extra_args or [])])
+
+
+def _add_extra_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("extra_args", nargs=argparse.REMAINDER,
+                   help="extra arguments passed to underlying test runner")
 
 
 def setup_test(sub) -> None:
     p = sub.add_parser("test", help="run tests")
-    p.add_argument("mode", nargs="?", default="all",
-                   choices=["all", "golden", "unit", "vgit", "vdsql",
-                            "smoke", "perf", "individual"],
-                   help="which test suite to run (default: all)")
-    p.add_argument("extra_args", nargs=argparse.REMAINDER,
-                   help="extra arguments passed to underlying test runner")
-    p.set_defaults(func=cmd_test)
+    test_sub = p.add_subparsers(dest="mode", metavar="<suite>")
+    test_sub.required = False
+
+    for name, func, help_text in [
+        ("all", cmd_test_all, "run all test suites (default)"),
+        ("golden", cmd_test_golden, "run functional cmdlog tests"),
+        ("unit", _cmd_test_unit, "run pytest unit tests"),
+        ("vgit", _cmd_test_vgit, "run vgit tests"),
+        ("vdsql", _cmd_test_vdsql, "run vdsql tests"),
+        ("smoke", cmd_test_smoke, "run quick import/version smoke test"),
+        ("perf", _cmd_test_perf, "run performance tests"),
+        ("individual", cmd_test_individual, "run each test in isolation"),
+    ]:
+        sp = test_sub.add_parser(name, help=help_text)
+        if name in ("unit", "vgit", "vdsql", "perf"):
+            _add_extra_args(sp)
+        sp.set_defaults(func=func)
+
+    p.set_defaults(func=cmd_test_all, mode="all")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1029,22 +1050,39 @@ def cmd_build(args: argparse.Namespace) -> int:
         if mode == "man" or rc != 0:
             return rc
     if mode in ("all", "zsh"):
-        rc = _run([sys.executable, "dev/zsh-completion.py", "_visidata"])
+        rc = cmd_build_zsh(args)
         if mode == "zsh" or rc != 0:
             return rc
     if mode == "docker":
-        return _run(["bash", "dev/build-container"])
+        return cmd_build_docker(args)
     if mode == "all":
         return EXIT_OK
     _die(f"unknown build mode: {mode}")
 
 
+def cmd_build_zsh(args: argparse.Namespace) -> int:
+    return _run([sys.executable, "dev/zsh-completion.py", "_visidata"])
+
+
+def cmd_build_docker(args: argparse.Namespace) -> int:
+    return _run(["bash", "dev/build-container"])
+
+
 def setup_build(sub) -> None:
     p = sub.add_parser("build", help="build resources (man pages, completions, docker)")
-    p.add_argument("mode", nargs="?", default="all",
-                   choices=["all", "man", "zsh", "docker"],
-                   help="what to build (default: all)")
-    p.set_defaults(func=cmd_build)
+    b_sub = p.add_subparsers(dest="mode", metavar="<target>")
+    b_sub.required = False
+
+    for name, func, help_text in [
+        ("all", cmd_build, "build everything (default)"),
+        ("man", cmd_build_man, "build man pages"),
+        ("zsh", cmd_build_zsh, "build zsh completions"),
+        ("docker", cmd_build_docker, "build docker container"),
+    ]:
+        sp = b_sub.add_parser(name, help=help_text)
+        sp.set_defaults(func=func)
+
+    p.set_defaults(func=cmd_build, mode="all")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1052,8 +1090,11 @@ def setup_build(sub) -> None:
 # ═══════════════════════════════════════════════════════════════════════
 
 def cmd_lint(args: argparse.Namespace) -> int:
-    if args.extra_args:
-        return _run([sys.executable, "-m", "ruff", "check", *args.extra_args])
+    extra = args.extra_args or []
+    if "-h" in extra or "--help" in extra:
+        return _run([sys.executable, "-m", "ruff", "check", "--help"])
+    if extra:
+        return _run([sys.executable, "-m", "ruff", "check", *extra])
     return _run([sys.executable, "-m", "ruff", "check", "."])
 
 
@@ -1096,10 +1137,18 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
 def setup_setup(sub) -> None:
     p = sub.add_parser("setup", help="setup development environment")
-    p.add_argument("mode", nargs="?", default="all",
-                   choices=["all", "hooks", "vscode"],
-                   help="what to setup (default: all)")
-    p.set_defaults(func=cmd_setup)
+    s_sub = p.add_subparsers(dest="mode", metavar="<target>")
+    s_sub.required = False
+
+    for name, help_text in [
+        ("all", "setup everything (default)"),
+        ("hooks", "configure git hooks"),
+        ("vscode", "configure VS Code settings"),
+    ]:
+        sp = s_sub.add_parser(name, help=help_text)
+        sp.set_defaults(func=cmd_setup)
+
+    p.set_defaults(func=cmd_setup, mode="all")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1186,6 +1235,11 @@ def setup_clean(sub) -> None:
 # ═══════════════════════════════════════════════════════════════════════
 
 def cmd_check(args: argparse.Namespace) -> int:
+    extra = args.extra_args or []
+    if "-h" in extra or "--help" in extra:
+        _print_info("runs: lint + test all")
+        _print_info("pass extra args to the test runner, e.g. `vd-dev check -k keyword`")
+        return EXIT_OK
     _print_info("=== lint ===")
     rc = _run([sys.executable, "-m", "ruff", "check", "."])
     if rc != 0:
@@ -1346,21 +1400,19 @@ def cmd_preflight_smoke(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def cmd_preflight(args: argparse.Namespace) -> int:
-    mode = args.mode
-    if mode == "check":
-        return cmd_preflight_check(args)
-    if mode == "smoke":
-        return cmd_preflight_smoke(args)
-    _die(f"unknown preflight mode: {mode}")
-
-
 def setup_preflight(sub) -> None:
     p = sub.add_parser("preflight", help="release readiness checks")
-    p.add_argument("mode", nargs="?", default="check",
-                   choices=["check", "smoke"],
-                   help="check mode (default: check)")
-    p.set_defaults(func=cmd_preflight)
+    pf_sub = p.add_subparsers(dest="mode", metavar="<mode>")
+    pf_sub.required = False
+
+    for name, func, help_text in [
+        ("check", cmd_preflight_check, "full release readiness check (default)"),
+        ("smoke", cmd_preflight_smoke, "fast import + version smoke test"),
+    ]:
+        sp = pf_sub.add_parser(name, help=help_text)
+        sp.set_defaults(func=func)
+
+    p.set_defaults(func=cmd_preflight_check, mode="check")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1468,28 +1520,28 @@ def cmd_package_clean(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def cmd_package(args: argparse.Namespace) -> int:
-    mode = args.mode
-    if mode == "build":
-        return cmd_package_build(args)
-    if mode == "verify":
-        return cmd_package_verify(args)
-    if mode == "clean":
-        return cmd_package_clean(args)
-    if mode == "all":
-        rc = cmd_package_build(args)
-        if rc != 0:
-            return rc
-        return cmd_package_verify(args)
-    _die(f"unknown package mode: {mode}")
+def _cmd_package_all(args: argparse.Namespace) -> int:
+    rc = cmd_package_build(args)
+    if rc != 0:
+        return rc
+    return cmd_package_verify(args)
 
 
 def setup_package(sub) -> None:
     p = sub.add_parser("package", help="build and verify distribution artifacts")
-    p.add_argument("mode", nargs="?", default="all",
-                   choices=["all", "build", "verify", "clean"],
-                   help="what to do (default: all = build + verify)")
-    p.set_defaults(func=cmd_package)
+    pkg_sub = p.add_subparsers(dest="mode", metavar="<mode>")
+    pkg_sub.required = False
+
+    for name, func, help_text in [
+        ("all", _cmd_package_all, "build + verify (default)"),
+        ("build", cmd_package_build, "build sdist + wheel into dist/"),
+        ("verify", cmd_package_verify, "verify built packages can be installed"),
+        ("clean", cmd_package_clean, "remove dist/ and build/"),
+    ]:
+        sp = pkg_sub.add_parser(name, help=help_text)
+        sp.set_defaults(func=func)
+
+    p.set_defaults(func=_cmd_package_all, mode="all")
 
 
 # ═══════════════════════════════════════════════════════════════════════
