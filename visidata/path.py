@@ -838,9 +838,16 @@ def graphStatePath(vd, name='graph', writable=False):
 
 
 @VisiData.api
-def saveSessionState(vd, state, name='session'):
-    '''Save session state dict to the state directory. Returns True on success.'''
+def saveSessionState(vd, state=None, name='session'):
+    '''Save session state to the state directory. If state is None, auto-collect
+    current sheets and sources. Returns True on success.'''
     import json
+    if state is None:
+        state = {
+            'sheets': [s.name for s in vd.sheets],
+            'sources': [str(s.source) if hasattr(s, 'source') and s.source else None for s in vd.sheets],
+            'version': getattr(vd, 'version_info', ''),
+        }
     p = vd.runtime_paths.session_file(name, ensure_dir=True, writable=True)
     try:
         with open(str(p), 'w') as fp:
@@ -853,8 +860,9 @@ def saveSessionState(vd, state, name='session'):
 
 
 @VisiData.api
-def restoreSessionState(vd, name='session'):
-    '''Restore session state dict from the state directory. Returns state or None.'''
+def restoreSessionState(vd, name='session', open_sources=True):
+    '''Restore session from state directory. If open_sources=True, attempts to
+    reopen saved sources. Returns state dict or None.'''
     import json
     p = vd.runtime_paths.session_file(name)
     if not p.exists():
@@ -863,6 +871,20 @@ def restoreSessionState(vd, name='session'):
         with open(str(p)) as fp:
             state = json.load(fp)
         vd.status(f'restored session state from {p}')
+        if open_sources and isinstance(state, dict) and state.get('sources'):
+            opened = 0
+            for src in state['sources']:
+                if not src:
+                    continue
+                try:
+                    vs = vd.openSource(src)
+                    if vs:
+                        vd.push(vs)
+                        opened += 1
+                except Exception as e:
+                    vd.warning(f'failed to restore source {src}: {e}')
+            if opened:
+                vd.status(f'restored {opened} sheets from session')
         return state
     except (OSError, PermissionError, json.JSONDecodeError) as e:
         vd.warning(f'failed to restore session state from {p}: {e}')
@@ -930,5 +952,5 @@ vd.addGlobals(RepeatFile=RepeatFile,
               RuntimePaths=RuntimePaths)
 
 BaseSheet.addCommand('', 'diagnose-paths', 'vd.push(vd.openDiagnosticsSheet())', 'show runtime path diagnostics as a sheet')
-BaseSheet.addCommand('', 'session-save', 'vd.saveSessionState({"sheets": [s.name for s in vd.sheets], "version": __version_info__})', 'save session state to state directory')
-BaseSheet.addCommand('', 'session-restore', 'vd.status("restored session: " + str(vd.restoreSessionState() or "none"))', 'restore session state from state directory')
+BaseSheet.addCommand('', 'session-save', 'vd.saveSessionState()', 'save current session (open sheets, sources) to state directory')
+BaseSheet.addCommand('', 'session-restore', 'vd.restoreSessionState() or vd.status("no session state found")', 'restore session from state directory, reopen saved sources')

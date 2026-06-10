@@ -85,8 +85,9 @@ def saveCmdlogState(vd, name='cmdlog'):
 
 
 @VisiData.api
-def restoreCmdlogState(vd, name='cmdlog'):
-    '''Restore cmdlog from state directory. Returns loaded CommandLog sheet or None.'''
+def restoreCmdlogState(vd, name='cmdlog', replay=True):
+    '''Restore cmdlog from state directory and optionally replay it.
+    Returns loaded CommandLog sheet or None.'''
     p = vd.cmdlogStatePath(name)
     if not p.exists():
         return None
@@ -94,6 +95,9 @@ def restoreCmdlogState(vd, name='cmdlog'):
         vs = vd.openSource(p)
         if vs:
             vd.status(f'restored cmdlog state from {p}')
+            if replay:
+                vd.replay(vs)
+                vd.status(f'replaying {len(vs.rows)} commands from saved cmdlog')
         return vs
     except (OSError, PermissionError) as e:
         vd.warning(f'failed to restore cmdlog state from {p}: {e}')

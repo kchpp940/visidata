@@ -91,8 +91,6 @@ class GraphSheet(InvertedCanvas):
 
         self.ycols or vd.fail('%s is non-numeric' % '/'.join(yc.name for yc in kwargs.get('ycols')))
 
-        self._restoreGraphState()
-
     def resetCanvasDimensions(self, windowHeight, windowWidth):
         if self.left_margin < self.ylabel_maxw:
             self.left_margin = self.ylabel_maxw
@@ -329,7 +327,6 @@ class GraphSheet(InvertedCanvas):
             refval = xtype(xstr.strip())
             if refval not in self.reflines_x:
                 self.reflines_x.append(refval)
-        self._saveGraphState()
         self.refresh()
 
     def draw_refline_y(self):
@@ -339,7 +336,6 @@ class GraphSheet(InvertedCanvas):
         ystrs = vd.input("add line(s) at y = ", type="refliney", value=suggested, defaultLast=True).split()
 
         self.reflines_y += [ ytype(y) for y in ystrs if ytype(y) not in self.reflines_y ]
-        self._saveGraphState()
         self.refresh()
 
     def erase_refline_x(self):
@@ -354,7 +350,6 @@ class GraphSheet(InvertedCanvas):
                 self.reflines_x.remove(xtype(x))
             except ValueError:
                 vd.warning(f'value {x} not in reflines_x')
-        self._saveGraphState()
         self.refresh()
 
     def erase_refline_y(self):
@@ -368,14 +363,13 @@ class GraphSheet(InvertedCanvas):
                 self.reflines_y.remove(ytype(y))
             except ValueError:
                 vd.warning(f'value {y} not in reflines_y')
-        self._saveGraphState()
         self.refresh()
 
     @property
-    def _graphStateName(self):
+    def stateKey(self):
         return self.name or 'graph'
 
-    def _saveGraphState(self):
+    def saveState(self, name=None):
         state = {
             'reflines_x': list(self.reflines_x),
             'reflines_y': list(self.reflines_y),
@@ -388,12 +382,12 @@ class GraphSheet(InvertedCanvas):
             'xzoomlevel': getattr(self, 'xzoomlevel', None),
             'yzoomlevel': getattr(self, 'yzoomlevel', None),
         }
-        vd.saveGraphState(state, self._graphStateName)
+        return vd.saveGraphState(state, name or self.stateKey)
 
-    def _restoreGraphState(self):
-        state = vd.restoreGraphState(self._graphStateName)
+    def restoreState(self, name=None):
+        state = vd.restoreGraphState(name or self.stateKey)
         if not state:
-            return
+            return False
         if 'reflines_x' in state:
             self.reflines_x = list(state['reflines_x'])
         if 'reflines_y' in state:
@@ -410,6 +404,8 @@ class GraphSheet(InvertedCanvas):
             self.xzoomlevel = state['xzoomlevel']
         if state.get('yzoomlevel') is not None:
             self.yzoomlevel = state['yzoomlevel']
+        self.refresh()
+        return True
 
 def format_input_value(val, type):
     '''format a value for entry into vd.input(), so its representation has no spaces and no commas'''
@@ -442,14 +438,12 @@ InvertedCanvas.addCommand(None, 'resize-cursor-taller', 'sheet.cursorBox.h += ca
 def set_y(sheet, s):
     ymin, ymax = map(float, map(sheet.parseY, s.split()))
     sheet.zoomTo(BoundingBox(sheet.visibleBox.xmin, ymin, sheet.visibleBox.xmax, ymax))
-    sheet._saveGraphState()
     sheet.refresh()
 
 @GraphSheet.api
 def set_x(sheet, s):
     xmin, xmax = map(float, map(sheet.parseX, s.split()))
     sheet.zoomTo(BoundingBox(xmin, sheet.visibleBox.ymin, xmax, sheet.visibleBox.ymax))
-    sheet._saveGraphState()
     sheet.refresh()
 
 Canvas.addCommand('y', 'resize-y-input', 'sheet.set_y(input("set ymin ymax="))', 'set ymin/ymax on graph axes')
@@ -459,8 +453,10 @@ GraphSheet.addCommand('gx', 'draw-refline-x', 'sheet.draw_refline_x()', 'draw a 
 GraphSheet.addCommand('gy', 'draw-refline-y', 'sheet.draw_refline_y()', 'draw a horizontal line at y-values (space-separated)')
 GraphSheet.addCommand('zx', 'erase-refline-x', 'sheet.erase_refline_x()', 'remove a horizontal line at x-values (space-separated)')
 GraphSheet.addCommand('zy', 'erase-refline-y', 'sheet.erase_refline_y()', 'remove a vertical line at y-values (space-separated)')
-GraphSheet.addCommand('gzx', 'erase-reflines-x', 'sheet.reflines_x = []; sheet._saveGraphState(); sheet.refresh()', 'erase all vertical x-value lines')
-GraphSheet.addCommand('gzy', 'erase-reflines-y', 'sheet.reflines_y = []; sheet._saveGraphState(); sheet.refresh()', 'erase any horizontal y-value lines')
+GraphSheet.addCommand('gzx', 'erase-reflines-x', 'sheet.reflines_x = []; sheet.refresh()', 'erase all vertical x-value lines')
+GraphSheet.addCommand('gzy', 'erase-reflines-y', 'sheet.reflines_y = []; sheet.refresh()', 'erase any horizontal y-value lines')
+GraphSheet.addCommand('', 'save-graph-state', 'sheet.saveState()', 'save current graph state (reflines, zoom, view) to state directory')
+GraphSheet.addCommand('', 'restore-graph-state', 'sheet.restoreState() or vd.status("no graph state found")', 'restore graph state from state directory')
 
 @GraphSheet.after
 def reload(sheet):
