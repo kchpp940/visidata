@@ -44,10 +44,12 @@ def launchBrowser(vd, *args):
 @visidata.VisiData.api
 def launchExternalEditor(vd, v, linenum=0):
     'Launch $EDITOR to edit string *v* starting on line *linenum*.'
-    with vd.runtime_paths.temp_file_ctx() as temppath:
-        with open(str(temppath), 'w') as fp:
+    import tempfile
+    with tempfile.NamedTemporaryFile() as temp:
+        temp.close()  #2118 must close before re-opening on windows
+        with open(temp.name, 'w') as fp:
             fp.write(v)
-        return vd.launchExternalEditorPath(visidata.Path(temppath), linenum)
+        return vd.launchExternalEditorPath(visidata.Path(temp.name), linenum)
 
 
 @visidata.VisiData.api

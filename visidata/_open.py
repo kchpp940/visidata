@@ -100,7 +100,13 @@ def openPath(vd, p, filetype=None, create=False):
 
     if p.scheme and not p.has_fp():
         schemes = p.scheme.split('+')
-        openfuncname = 'openurl_' + schemes[-1]
+        scheme = schemes[-1]
+
+        cap = vd.loaders.get_by_scheme(scheme)
+        if cap and not cap.is_available:
+            vd.fail(f'{scheme} loader unavailable: {cap.unavailable_reason}')
+
+        openfuncname = 'openurl_' + scheme
 
         openfunc = getattr(vd, openfuncname, None) or vd.getGlobals().get(openfuncname, None)
         if not openfunc:
@@ -135,10 +141,20 @@ def openPath(vd, p, filetype=None, create=False):
 
     openfuncname = 'open_' + filetype
     openfunc = getattr(vd, openfuncname, vd.getGlobals().get(openfuncname))
+
+    cap = vd.loaders.get(filetype)
+    if cap and not cap.is_available:
+        vd.fail(f'{filetype} loader unavailable: {cap.unavailable_reason}')
+
     if not openfunc:
         opts = vd.guessFiletype(p)
         if opts and 'filetype' in opts:
             filetype = opts['filetype']
+
+            guess_cap = vd.loaders.get(filetype)
+            if guess_cap and not guess_cap.is_available:
+                vd.fail(f'{filetype} loader unavailable: {guess_cap.unavailable_reason}')
+
             openfuncname = 'open_' + filetype
             openfunc = getattr(vd, openfuncname, vd.getGlobals().get(openfuncname))
             if not openfunc:

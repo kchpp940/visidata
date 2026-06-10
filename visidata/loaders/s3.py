@@ -342,6 +342,14 @@ S3DirSheet.addCommand(
     "download the file or directory in the cursor row",
 )
 
+vd.registerLoader(
+    's3',
+    can_open=True,
+    dependencies=[('s3fs.core', 's3fs')],
+    description='Amazon S3 filesystem access',
+    openurl_schemes=['s3'],
+)
+
 vd.addMenuItems(
     """
     File > Toggle versioning > s3-toggle-versioning

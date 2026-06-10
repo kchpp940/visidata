@@ -27,15 +27,10 @@ def google_auth(vd, scopes=None):
             scope = 'https://www.googleapis.com/auth/' + scope
         SCOPES.append(scope)
 
-    GOOGLE_TOKEN_FILE = vd.runtime_paths.get_file(
-        'data',
-        f'google-{urllib.parse.quote_plus(str(scopes))}.pickle',
-        ensure_dir=True,
-        writable=True
-    )
+    GOOGLE_TOKEN_FILE = Path(vd.options.visidata_dir)/f'google-{urllib.parse.quote_plus(str(scopes))}.pickle'
     creds = None
-    if GOOGLE_TOKEN_FILE and os.path.exists(str(GOOGLE_TOKEN_FILE)):
-        with open(str(GOOGLE_TOKEN_FILE), 'rb') as fp:
+    if os.path.exists(GOOGLE_TOKEN_FILE):
+        with open(GOOGLE_TOKEN_FILE, 'rb') as fp:
             creds = pickle.load(fp)
 
     if not creds or not creds.valid:
@@ -47,8 +42,7 @@ def google_auth(vd, scopes=None):
             flow = InstalledAppFlow.from_client_secrets_file(_google_creds_fn(), SCOPES)
             creds = flow.run_local_server(port=0)
 
-        if GOOGLE_TOKEN_FILE:
-            with open(str(GOOGLE_TOKEN_FILE), 'wb') as fp:
-                pickle.dump(creds, fp)
+        with open(GOOGLE_TOKEN_FILE, 'wb') as fp:
+            pickle.dump(creds, fp)
 
     return creds

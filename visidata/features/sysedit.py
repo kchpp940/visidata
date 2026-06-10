@@ -17,8 +17,10 @@ def syseditCells_async(sheet, cols, rows, filetype=None):
     vs.rows = rows or vd.fail('no %s selected' % sheet.rowtype)
     vs.columns = cols
 
-    with vd.runtime_paths.temp_file_ctx() as temppath:
-        p = Path(temppath)
+    import tempfile
+    with tempfile.NamedTemporaryFile() as temp:
+        temp.close()  #2118
+        p = Path(temp.name)
 
         vd.status(f'copying {vs.nRows} {vs.rowtype} to {p} as {filetype}')
         vd.sync(vd.saveSheets(p, vs))

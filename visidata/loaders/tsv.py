@@ -119,6 +119,17 @@ def save_tsv(vd, p, vs):
             fp.write(rowsep)
 
 
+vd.registerLoader(
+    'tsv',
+    extensions=['tsv'],
+    can_open=True,
+    can_save=True,
+    dependencies=[],
+    description='Tab-separated values file',
+    openfunc=VisiData.open_tsv,
+    savefunc=VisiData.save_tsv,
+)
+
 vd.addGlobals({
     'TsvSheet': TsvSheet,
 })

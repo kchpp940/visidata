@@ -206,6 +206,29 @@ JsonSheet.options.regex_skip = r'^(//|#).*'
 VisiData.save_ndjson = VisiData.save_jsonl
 VisiData.save_ldjson = VisiData.save_jsonl
 
+vd.registerLoader(
+    'json',
+    extensions=['json'],
+    can_open=True,
+    can_save=True,
+    dependencies=[],
+    description='JavaScript Object Notation (JSON)',
+    openfunc=VisiData.open_json,
+    savefunc=VisiData.save_json,
+    guessfunc=VisiData.guess_json,
+)
+
+vd.registerLoader(
+    'jsonl',
+    extensions=['jsonl', 'ndjson', 'ldjson'],
+    can_open=True,
+    can_save=True,
+    dependencies=[],
+    description='JSON Lines (one JSON object per line)',
+    openfunc=VisiData.open_jsonl,
+    savefunc=VisiData.save_jsonl,
+)
+
 vd.addGlobals({
     'JsonSheet': JsonSheet,
     'JsonLinesSheet': JsonSheet,

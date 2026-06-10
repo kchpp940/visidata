@@ -301,3 +301,25 @@ def tint_luminance(tint, lum):
         return int(round(lum * (1.0 + tint)))
     else:
         return int(round(lum * (1.0 - tint) + (HLSMAX - HLSMAX * (1.0 - tint))))
+
+vd.registerLoader(
+    'xlsx',
+    extensions=['xlsx'],
+    can_open=True,
+    can_save=True,
+    dependencies=[('openpyxl', 'openpyxl')],
+    description='Excel 2007+ XLSX file format',
+    openfunc=VisiData.open_xlsx,
+    savefunc=VisiData.save_xlsx,
+)
+
+vd.registerLoader(
+    'xls',
+    extensions=['xls'],
+    can_open=True,
+    can_save=True,
+    dependencies=[('xlrd', 'xlrd'), ('xlwt', 'xlwt')],
+    description='Legacy Excel XLS file format',
+    openfunc=VisiData.open_xls,
+    savefunc=VisiData.save_xls,
+)

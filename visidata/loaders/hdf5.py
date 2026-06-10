@@ -85,3 +85,12 @@ def _guess_type(fmt):
     return anytype
 
 Hdf5ObjSheet.addCommand('A', 'dive-metadata', 'vd.push(SheetDict(cursorRow.name + "_attrs", source=cursorRow.attrs))', 'open metadata sheet for object referenced in current row')
+
+vd.registerLoader(
+    'hdf5',
+    extensions=['h5', 'hdf5', 'hdf'],
+    can_open=True,
+    dependencies=[('h5py', 'h5py')],
+    description='HDF5 hierarchical data format',
+    openfunc=VisiData.open_h5,
+)

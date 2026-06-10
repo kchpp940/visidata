@@ -189,4 +189,15 @@ def save_parquet(vd, p, sheet):
 ParquetSheet.addCommand('.', 'plot-row', 'vd.push(ParquetGeoCanvas(name+"_map", source=sheet, sourceRows=[cursorRow], textCol=cursorCol))', 'plot geometry in current row')
 ParquetSheet.addCommand('g.', 'plot-rows', 'vd.push(ParquetGeoCanvas(name+"_map", source=sheet, sourceRows=rows, textCol=cursorCol))', 'plot geometries in all rows')
 
+vd.registerLoader(
+    'parquet',
+    extensions=['parquet'],
+    can_open=True,
+    can_save=True,
+    dependencies=[('pyarrow', 'pyarrow')],
+    description='Apache Parquet columnar storage format',
+    openfunc=VisiData.open_parquet,
+    savefunc=VisiData.save_parquet,
+)
+
 vd.addGlobals(ParquetGeoCanvas=ParquetGeoCanvas)

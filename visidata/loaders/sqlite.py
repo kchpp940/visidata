@@ -300,6 +300,19 @@ SqliteIndexSheet.bindkey('ga', 'add-table')
 SqliteSheet.options.header = 0
 VisiData.save_db = VisiData.save_sqlite
 
+vd.registerLoader(
+    'sqlite',
+    extensions=['sqlite', 'sqlite3', 'db'],
+    can_open=True,
+    can_save=True,
+    dependencies=[],
+    description='SQLite database file',
+    openfunc=VisiData.open_sqlite,
+    savefunc=VisiData.save_sqlite,
+    guessfunc=VisiData.guess_sqlite,
+    openurl_schemes=['sqlite'],
+)
+
 vd.addMenuItems('''
     Data > execute SQL query > exec-sql
 ''')

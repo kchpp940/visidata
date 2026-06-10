@@ -156,7 +156,7 @@ def setMacro(vd, ks:str, vs, helpstr='', keystroke=''):
 def saveMacro(self, rows, ks, keystroke=''):
         vs = copy(self)
         vs.rows = rows
-        macropath = vd.runtime_paths.get_file('config', vd.fnSuffix(ks + '.vdj'), ensure_dir=True, writable=True)
+        macropath = Path(vd.fnSuffix(str(Path(vd.options.visidata_dir)/ks)))
         vd.save_vdj(macropath, vs)
         vd.status(f'{ks} saved to {macropath}')
         vd.setMacro(ks, vs, keystroke=keystroke)
@@ -180,9 +180,8 @@ def afterExecSheet(cmdlog, sheet, escaped, err):
 
 @CommandLogJsonl.api
 def startMacro(cmdlog):
-    config_dir = vd.runtime_paths.get_dir('config', ensure=True, writable=True)
-    if not config_dir or not config_dir.is_dir():
-        vd.fail(f'cannot create config directory to save macros')
+    if not Path(vd.options.visidata_dir).is_dir():
+        vd.fail(f'create {vd.options.visidata_dir} to save macros')
     if vd.macroMode:
         try:
             ks = vd.input('bind macro to: ', help=f'''
@@ -231,7 +230,9 @@ def run(vd, *args, **kwargs):
 def reloadMacros(vd):
     vd.macros.reload()
     for r in vd.macros:
-        p = vd.runtime_paths.resolve_relative(r.source, 'data')
+        p = Path(r.source)
+        if not p.is_absolute():
+            p = vd.macros.path.parent / r.source
         vs = vd.loadMacro(p)
         if vs:
             vd.setMacro(r.binding, vs, getattr(r, 'helpstr', ''), keystroke=getattr(r, 'keystroke', ''))

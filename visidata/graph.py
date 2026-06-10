@@ -365,53 +365,6 @@ class GraphSheet(InvertedCanvas):
                 vd.warning(f'value {y} not in reflines_y')
         self.refresh()
 
-    @property
-    def stateKey(self):
-        return self.name or 'graph'
-
-    def saveState(self, name=None):
-        state = {
-            'reflines_x': list(self.reflines_x),
-            'reflines_y': list(self.reflines_y),
-            'visibleBox': {
-                'xmin': getattr(self.visibleBox, 'xmin', None),
-                'ymin': getattr(self.visibleBox, 'ymin', None),
-                'xmax': getattr(self.visibleBox, 'xmax', None),
-                'ymax': getattr(self.visibleBox, 'ymax', None),
-            } if self.visibleBox else None,
-            'xzoomlevel': getattr(self, 'xzoomlevel', None),
-            'yzoomlevel': getattr(self, 'yzoomlevel', None),
-        }
-        key = name or self.stateKey
-        if vd.saveGraphState(state, key):
-            vd.status(f'graph state saved as {key}')
-            return True
-        return False
-
-    def restoreState(self, name=None):
-        state = vd.restoreGraphState(name or self.stateKey)
-        if not state:
-            return False
-        if 'reflines_x' in state:
-            self.reflines_x = list(state['reflines_x'])
-        if 'reflines_y' in state:
-            self.reflines_y = list(state['reflines_y'])
-        vb = state.get('visibleBox')
-        if vb and self.visibleBox:
-            try:
-                for k in ('xmin', 'ymin', 'xmax', 'ymax'):
-                    if vb.get(k) is not None:
-                        setattr(self.visibleBox, k, float(vb[k]))
-            except (ValueError, TypeError):
-                pass
-        if state.get('xzoomlevel') is not None:
-            self.xzoomlevel = state['xzoomlevel']
-        if state.get('yzoomlevel') is not None:
-            self.yzoomlevel = state['yzoomlevel']
-        self.refresh()
-        vd.status(f'graph state restored ({len(self.reflines_x)} x-reflines, {len(self.reflines_y)} y-reflines)')
-        return True
-
 def format_input_value(val, type):
     '''format a value for entry into vd.input(), so its representation has no spaces and no commas'''
     if type is date:
@@ -460,8 +413,6 @@ GraphSheet.addCommand('zx', 'erase-refline-x', 'sheet.erase_refline_x()', 'remov
 GraphSheet.addCommand('zy', 'erase-refline-y', 'sheet.erase_refline_y()', 'remove a vertical line at y-values (space-separated)')
 GraphSheet.addCommand('gzx', 'erase-reflines-x', 'sheet.reflines_x = []; sheet.refresh()', 'erase all vertical x-value lines')
 GraphSheet.addCommand('gzy', 'erase-reflines-y', 'sheet.reflines_y = []; sheet.refresh()', 'erase any horizontal y-value lines')
-GraphSheet.addCommand('', 'save-graph-state', 'sheet.saveState()', 'save current graph state (reflines, zoom, view) to state directory')
-GraphSheet.addCommand('', 'restore-graph-state', 'sheet.restoreState() or vd.status("no graph state found")', 'restore graph state from state directory')
 
 @GraphSheet.after
 def reload(sheet):

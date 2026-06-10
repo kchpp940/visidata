@@ -53,6 +53,15 @@ Some helpful commands when working with cells of lists and dictionaries:
         self.addRow(data)
 
 
+vd.registerLoader(
+    'toml',
+    extensions=['toml'],
+    can_open=True,
+    dependencies=[],
+    description='TOML configuration file format',
+    openfunc=VisiData.open_toml,
+)
+
 vd.addGlobals(
     {
         "TomlSheet": TomlSheet,

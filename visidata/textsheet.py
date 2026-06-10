@@ -43,11 +43,13 @@ class TextSheet(Sheet):
                     fp.write(row[1])
                     fp.write('\n')
 
-        with vd.runtime_paths.temp_file_ctx() as temppath:
-            writelines(sheet, str(temppath))
-            vd.launchEditor(str(temppath), '+%s' % linenum)
+        import tempfile
+        with tempfile.NamedTemporaryFile() as temp:
+            temp.close()  #2118
+            writelines(sheet, temp.name)
+            vd.launchEditor(temp.name, '+%s' % linenum)
             sheet.rows = []
-            for r in sheet.readlines(visidata.Path(temppath)):
+            for r in sheet.readlines(visidata.Path(temp.name)):
                 sheet.addRow(r)
 
 

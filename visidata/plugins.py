@@ -15,7 +15,7 @@ vd.option('plugins_autoload', True, 'do not autoload plugins if False')
 
 @VisiData.property
 def pluginConfig(self):
-    return vd.runtime_paths.get_file('config', '__init__.py', 'plugins', ensure_dir=True)
+    return Path(os.path.join(vd.options.visidata_dir, "plugins", "__init__.py"))
 
 
 @VisiData.property
@@ -32,9 +32,7 @@ def _plugin_import_name(self, plugin):
 
 @VisiData.api
 def enablePlugin(vd, plugin:str):
-    path = vd.pluginConfig
-    vd.runtime_paths.ensure_dir(path.parent, writable=True)
-    with path.open(mode='a', encoding='utf-8') as fprc:
+    with vd.pluginConfig.open(mode='a', encoding='utf-8') as fprc:
         print(f'import {plugin}', file=fprc)
         importlib.import_module(plugin)
         vd.status(f'{plugin} plugin enabled')

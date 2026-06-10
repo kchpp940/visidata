@@ -3,7 +3,9 @@ Launch an embedded ptipython REPL from within VisiData.
 Contributed by @ajkerrigan #2290 #2736
 """
 
-from visidata import LazyChainMap, Sheet, SuspendCurses, VisiData, Path
+from pathlib import Path
+
+from visidata import LazyChainMap, Sheet, SuspendCurses, VisiData
 
 
 # Sheet-local properties that are expensive or problematic during
@@ -50,7 +52,13 @@ def openRepl(vd):
 
     with SuspendCurses():
         try:
-            history_file = vd.runtime_paths.get_file('cache', 'history', 'ptpython', ensure_dir=True, writable=True)
+            history_file = (
+                Path(vd.options.visidata_dir).expanduser()
+                / "cache"
+                / "ptpython"
+                / "history"
+            )
+            Path.mkdir(history_file.parent, parents=True, exist_ok=True)
             ptipython.embed(
                 user_ns=user_ns,
                 history_filename=str(history_file),
