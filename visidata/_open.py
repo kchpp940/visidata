@@ -2,7 +2,7 @@ import os
 import os.path
 import sys
 
-from visidata import VisiData, vd, Path, BaseSheet, TableSheet, TextSheet, SettableColumn
+from visidata import VisiData, vd, Path, BaseSheet, TableSheet, TextSheet, SettableColumn, CompleteKey
 
 
 vd.option('filetype', '', 'specify file type', replay=True)
@@ -29,9 +29,14 @@ def inputPath(vd, *args, filetype='', **kwargs):
         v = kwargs.get('value', '')
         if v and Path(v).exists():
             kwargs['value'] = ''
+    available_fts = sorted(set(
+        ft for cap in vd.loaders.available()
+        for ft in [cap.filetype] + cap.extensions
+        if cap.can_save
+    ))
     r = vd.inputMultiple(
         path=dict(prompt=prompt, type='filename', completer=completer, **kwargs),
-        filetype=dict(prompt='as filetype: ', type='filetype', value=filetype),
+        filetype=dict(prompt='as filetype: ', type='filetype', value=filetype, completer=CompleteKey(available_fts)),
     )
     p = Path(r['path'].strip())
     if r['filetype']:

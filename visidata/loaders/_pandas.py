@@ -410,16 +410,6 @@ PandasSheet.addCommand('g"', 'dup-rows', 'vs=PandasSheet(sheet.name, "copy", sou
 PandasSheet.addCommand('z"', 'dup-selected-deep', 'vs=PandasSheet(sheet.name, "selecteddeepcopy", source=selectedRows.df.copy(deep=True)); vd.push(vs)', 'open duplicate sheet with deepcopy of selected rows')
 PandasSheet.addCommand('gz"', 'dup-rows-deep', 'vs=PandasSheet(sheet.name, "deepcopy", source=sheet.df.copy(deep=True)); vd.push(vs)', 'open duplicate sheet with deepcopy of all rows')
 
-vd.registerLoader(
-    'pandas',
-    can_open=True,
-    can_save=True,
-    dependencies=[('pandas', 'pandas')],
-    description='Pandas DataFrame (feather, gbq, orc, pickle, sas, stata, dta formats)',
-    openfunc=VisiData.open_pandas,
-    savefunc=VisiData.save_dta,
-)
-
 vd.addGlobals({
     'PandasSheet': PandasSheet,
 })

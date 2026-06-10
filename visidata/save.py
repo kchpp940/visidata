@@ -148,6 +148,8 @@ def saveSheets(vd, givenpath, *vsheets, confirm_overwrite=True):
 
     vd.clearCaches()
 
+    savefunc = None
+    filetype = None
     for ft in filetypes:
         cap = vd.loaders.get(ft)
         if cap:

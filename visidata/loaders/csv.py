@@ -102,18 +102,6 @@ def save_csv(vd, p, sheet):
                 cw.writerow(dispvals.values())
                 prog.addProgress(1)
 
-vd.registerLoader(
-    'csv',
-    extensions=['csv'],
-    can_open=True,
-    can_save=True,
-    dependencies=[],
-    description='Comma-separated values file',
-    openfunc=VisiData.open_csv,
-    savefunc=VisiData.save_csv,
-    guessfunc=VisiData.guess_csv,
-)
-
 vd.addGlobals({
     'CsvSheet': CsvSheet
 })

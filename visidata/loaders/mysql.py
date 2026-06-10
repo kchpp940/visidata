@@ -136,11 +136,3 @@ class MyTable(Sheet):
                 except UnicodeDecodeError as e:
                     vd.exceptionCaught(e)
 
-
-vd.registerLoader(
-    'mysql',
-    can_open=True,
-    dependencies=[('MySQLdb', 'mysqlclient')],
-    description='MySQL database',
-    openurl_schemes=['mysql'],
-)

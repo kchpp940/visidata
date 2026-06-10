@@ -9,15 +9,6 @@ def open_yml(vd, p):
 
 VisiData.open_yaml = VisiData.open_yml
 
-vd.registerLoader(
-    'yaml',
-    extensions=['yml', 'yaml'],
-    can_open=True,
-    dependencies=[('yaml', 'PyYAML')],
-    description='YAML file loader',
-    openfunc=VisiData.open_yml,
-)
-
 class YamlSheet(JsonSheet):
     def iterload(self):
         yaml = vd.importExternal('yaml', 'PyYAML')

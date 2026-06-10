@@ -548,12 +548,26 @@ def importModule(vd, pkgname, symbols=[]):
 
 @VisiData.api
 def importSubmodules(vd, pkgname):
-    'Import all files below the given *pkgname*'
+    'Import all files below the given *pkgname*, skipping loader modules with missing required dependencies'
     import pkgutil
 
     m = vd.importModule(pkgname)
     for module in pkgutil.walk_packages(m.__path__):
-        vd.importModule(pkgname + '.' + module.name)
+        modname = module.name
+        fullmodname = pkgname + '.' + modname
+
+        skip_reason = None
+        if hasattr(vd, 'loaders'):
+            skip_reason = vd.loaders.should_skip_module(modname)
+
+        if skip_reason:
+            vd.debug(f'skipping {fullmodname}: {skip_reason}')
+            continue
+
+        try:
+            vd.importModule(fullmodname)
+        except Exception as e:
+            vd.exceptionCaught(e)
 
 
 @VisiData.api

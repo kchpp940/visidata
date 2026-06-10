@@ -43,12 +43,3 @@ class TabulaSheet(IndexSheet):
         for i, t in enumerate(tabula.read_pdf(self.source, pages='all', multiple_tables=True)):
             yield PandasSheet(self.source.base_stem, i, source=t)
 
-
-vd.registerLoader(
-    'pdf',
-    extensions=['pdf'],
-    can_open=True,
-    dependencies=[('pdfminer.high_level', 'pdfminer.six')],
-    description='PDF document (text or tables)',
-    openfunc=VisiData.open_pdf,
-)

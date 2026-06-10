@@ -137,11 +137,3 @@ class PgTable(Sheet):
             for r in cur:
                 self.addRow(r)
 
-
-vd.registerLoader(
-    'postgres',
-    can_open=True,
-    dependencies=[('psycopg2', 'psycopg2-binary')],
-    description='PostgreSQL database',
-    openurl_schemes=['postgres', 'postgresql', 'rds'],
-)
