@@ -1,5 +1,3 @@
-import os
-import os.path
 import time
 
 from visidata import vd, VisiData, Path, modtime
@@ -11,9 +9,10 @@ def urlcache(vd, url, days=1, text=True, headers={}):
     from urllib.request import Request, urlopen
     import urllib.parse
 
-    os.makedirs(vd.cache_dir, exist_ok=True)
+    p = vd.runtime_paths.get_file('cache', urllib.parse.quote(url, safe=''), ensure_dir=True, writable=True)
+    if p is None:
+        return None
 
-    p = Path(vd.cache_dir / urllib.parse.quote(url, safe=''))
     if p.exists():
         secs = time.time() - modtime(p)
         if secs < days*24*60*60:
@@ -42,7 +41,9 @@ def enable_requests_cache(vd):
         import requests
         import requests_cache
 
-        requests_cache.install_cache(str(Path(os.path.join(vd.options.visidata_dir, 'httpcache'))), backend='sqlite', expire_after=24*60*60)
+        cache_path = vd.runtime_paths.get_file('cache', 'httpcache.sqlite', ensure_dir=True, writable=True)
+        if cache_path:
+            requests_cache.install_cache(str(cache_path.with_suffix('')), backend='sqlite', expire_after=24*60*60)
     except ModuleNotFoundError:
         vd.warning('install requests_cache for less intrusive scraping')
 

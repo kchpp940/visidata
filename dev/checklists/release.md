@@ -13,17 +13,9 @@
     c. visidata.org; (formats?)
         - remember to check the tables with prettier: https://github.com/saulpw/visidata/pull/2056
 
-3. Ensure `develop` automated tests run correctly
+3. Ensure `develop` automated tests run correctly with dev/test.sh
 
-    `vd-dev test all`
-
-4. Run release readiness checks
-
-    `vd-dev preflight check`
-    - verifies version consistency across setup.py / __init__.py / main.py
-    - checks CHANGELOG mentions current version
-    - verifies generated files (man pages) exist
-    - confirms editable install matches dev mode
+4. Go through the manual tests checklist
 
 5. Verify that setup.py is up-to-date with requirements.
 
@@ -81,15 +73,17 @@
     ```
 
 
-  Build, verify, and push to pypi:
+  Push to pypi
     ```
-    vd-dev package all          # builds sdist + wheel, verifies install in temp venv
+    rm -rf dist/
+    rm -rf build/
+    python3 setup.py sdist bdist_wheel
+    chmod -R a+rX dist
+    ls dist/
     twine upload dist/*
     ```
 
-    (equivalently: `make package` then `twine upload dist/*`)
-
-13. Test install/upgrade from pypi
+11. Test install/upgrade from pypi
 
   a. Build and deploy the website
 

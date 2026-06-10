@@ -28,32 +28,14 @@ See [design/README.md](design/README.md) for full index.
 
 ## Scripts
 
-All development actions are unified under the `vd-dev` CLI (installed with the package, or run via `python3 -m visidata.dev_cli`).
-
-| Command | Description |
-|---------|-------------|
-| `vd-dev install [dev|test|all|prod] [--check]` | Install package; `--check` verifies mode without installing |
-| `vd-dev test golden` | Run test suite (batched, fast; `-d` for debug; see `TESTING.md`) |
-| `vd-dev test individual` | Run each test in its own process (isolated, slower; see `TESTING.md`) |
-| `vd-dev test all` | Run all test suites |
-| `vd-dev build man` | Generate manpage |
-| `vd-dev build zsh` | Generate zsh completions |
-| `vd-dev lint` | Run ruff linter |
-| `vd-dev check` | Comprehensive check (lint + all tests) |
-| `vd-dev preflight check` | Release readiness checks (version, files, install) |
-| `vd-dev preflight smoke` | Fast import + version smoke test |
-| `vd-dev package build` | Build sdist + wheel into dist/ |
-| `vd-dev package verify` | Verify built packages can be installed and imported |
-| `vd-dev package all` | Build + verify (default) |
-| `vd-dev package clean` | Remove dist/ and build/ |
-| `vd-dev setup hooks` | Configure git hooks |
-| `vd-dev setup vscode` | Configure VS Code settings |
-| `vd-dev diff-test` | Diff-based test runner |
-| `vd-dev clean` | Remove generated files |
-
-Run `vd-dev --help` and `vd-dev <command> --help` for full details.
-
-The underlying shell/Python scripts in this directory (`mkman.sh`, `zsh-completion.py`, etc.) are implementation details and are invoked by `vd-dev` as needed.
+| File | Description |
+|------|-------------|
+| `test.sh` | Run test suite (batched, fast; `-d` for debug; see `TESTING.md`) |
+| `diff-test.sh` | Diff-based test runner |
+| `run-tests-individually.sh` | Run each test in its own process (isolated, slower; see `TESTING.md`) |
+| `mkman.sh` | Generate manpage |
+| `mkpandas-df.py` | Generate pandas DataFrame test fixtures |
+| `zsh-completion.py` | Generate zsh completions |
 
 ## Data Files
 

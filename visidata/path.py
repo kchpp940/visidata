@@ -4,11 +4,13 @@ import sys
 import io
 import codecs
 import pathlib
+import tempfile
+import shutil
 from urllib.parse import urlparse, urlunparse
 from functools import wraps, lru_cache
 
 from visidata import vd
-from visidata import VisiData, Progress
+from visidata import VisiData
 
 vd.help_encoding = '''Common Encodings:
 
@@ -97,6 +99,7 @@ class BytesIOWrapper(io.BufferedReader):
 class FileProgress:
     'Open file in binary mode and track read() progress.'
     def __init__(self, path, fp, mode='r', **kwargs):
+        from visidata import Progress
         self.path = path
         self.fp = fp
         self.prog = None
@@ -534,8 +537,240 @@ class RepeatFileIter:
         return r
 
 
+class RuntimePaths:
+    '''Unified runtime paths manager for VisiData.
+
+    Centralizes all path resolution, directory creation, permission handling,
+    and diagnostics for state files, caches, configs, and temporary files.
+    All modules should go through this instead of constructing paths manually.
+    '''
+
+    def __init__(self, vd):
+        self._vd = vd
+        self._dirs = {}
+        self._writable_cache = {}
+
+    def _resolve_base(self, category):
+        '''Resolve the base directory for a given category.'''
+        from visidata.vendor.appdirs import (user_config_dir, user_data_dir,
+                                             user_cache_dir, user_state_dir)
+
+        overrides = {
+            'config': lambda: self._vd.options.visidata_dir if self._vd.options.visidata_dir else None,
+        }
+
+        override = overrides.get(category, lambda: None)()
+        if override:
+            return Path(os.path.expanduser(os.path.expandvars(str(override))))
+
+        resolvers = {
+            'config': lambda: user_config_dir('visidata'),
+            'data': lambda: user_data_dir('visidata'),
+            'cache': lambda: user_cache_dir('visidata'),
+            'state': lambda: user_state_dir('visidata'),
+            'temp': lambda: tempfile.gettempdir(),
+        }
+
+        if category not in resolvers:
+            raise ValueError(f'unknown path category: {category}')
+
+        return Path(resolvers[category]())
+
+    def get_dir(self, category, *subpaths, ensure=False, writable=False):
+        '''Get a Path for a category directory, optionally with subpaths.
+
+        Args:
+            category: one of 'config', 'data', 'cache', 'state', 'temp'
+            *subpaths: path components to append
+            ensure: if True, create the directory if it doesn't exist
+            writable: if True, verify the directory is writable
+        '''
+        if category == 'temp':
+            base = Path(tempfile.mkdtemp(prefix='visidata-'))
+        else:
+            cache_key = (category, subpaths)
+            if cache_key not in self._dirs:
+                base = self._resolve_base(category)
+                for sub in subpaths:
+                    base = base / sub
+                self._dirs[cache_key] = base
+            base = self._dirs[cache_key]
+
+        if ensure:
+            self.ensure_dir(base, writable=writable)
+
+        return base
+
+    def get_file(self, category, filename, *subpaths, ensure_dir=False, writable=False):
+        '''Get a Path for a file within a category directory.
+
+        Args:
+            category: one of 'config', 'data', 'cache', 'state', 'temp'
+            filename: the file name
+            *subpaths: intermediate subdirectories
+            ensure_dir: if True, create the parent directory
+            writable: if True, verify parent directory is writable
+        '''
+        d = self.get_dir(category, *subpaths, ensure=ensure_dir, writable=writable)
+        return d / filename
+
+    def ensure_dir(self, path, writable=False):
+        '''Create directory and optionally verify writability.
+
+        Handles permission errors gracefully with diagnostics.
+        Returns True if the directory exists and is accessible.
+        '''
+        if self._vd.options.nothing:
+            return False
+
+        p = Path(path) if not isinstance(path, Path) else path
+
+        try:
+            if not p.exists():
+                p.mkdir(parents=True, exist_ok=True)
+        except PermissionError as e:
+            self._vd.warning(f'permission denied creating {p}: {e}')
+            return False
+        except OSError as e:
+            self._vd.warning(f'cannot create directory {p}: {e}')
+            return False
+
+        if writable:
+            return self._check_writable(p)
+
+        return True
+
+    def _check_writable(self, path):
+        '''Check if a directory is writable, caching the result.'''
+        cache_key = str(path)
+        if cache_key in self._writable_cache:
+            return self._writable_cache[cache_key]
+
+        try:
+            testfile = os.path.join(str(path), '.visidata-write-test')
+            with open(testfile, 'w') as f:
+                f.write('')
+            os.unlink(testfile)
+            result = True
+        except (PermissionError, OSError) as e:
+            self._vd.warning(f'{path} is not writable: {e}')
+            result = False
+
+        self._writable_cache[cache_key] = result
+        return result
+
+    def resolve_relative(self, relpath, base_category='config'):
+        '''Resolve a potentially relative path against a category base.
+
+        If relpath is absolute, return it as-is. Otherwise resolve against
+        the base directory for base_category.
+        '''
+        p = Path(relpath) if not isinstance(relpath, Path) else relpath
+        if p.is_absolute():
+            return p
+        base = self.get_dir(base_category)
+        return base / p
+
+    def migrate_file(self, old_path, new_category, *new_subpaths, filename=None):
+        '''Migrate a file from an old location to the new managed path.
+
+        Returns the new Path if migration happened or file exists, None on failure.
+        '''
+        old = Path(old_path) if not isinstance(old_path, Path) else old_path
+        if not old.exists():
+            return None
+
+        fname = filename or old.name
+        new = self.get_file(new_category, fname, *new_subpaths, ensure_dir=True, writable=True)
+
+        if new.exists():
+            return new
+
+        try:
+            self.ensure_dir(new.parent, writable=True)
+            shutil.copy2(str(old), str(new))
+            self._vd.status(f'migrated {old} to {new}')
+            return new
+        except (OSError, IOError) as e:
+            self._vd.warning(f'failed to migrate {old} to {new}: {e}')
+            return None
+
+    def diagnose(self):
+        '''Return a list of (path, status, note) tuples for all managed paths.'''
+        results = []
+        for category in ['config', 'data', 'cache', 'state']:
+            try:
+                p = self.get_dir(category)
+                exists = p.exists()
+                writable = self._check_writable(p) if exists else False
+                note = ''
+                if not exists:
+                    note = 'directory does not exist'
+                elif not writable:
+                    note = 'directory not writable'
+                results.append((str(p), category, exists and writable, note))
+            except Exception as e:
+                results.append(('', category, False, str(e)))
+        return results
+
+    def config_file(self, name='config.py'):
+        '''Get path to a config file, checking standard locations.'''
+        xdg_path = self.get_file('config', name)
+        if xdg_path.exists():
+            return xdg_path
+
+        legacy = Path(os.path.expanduser('~/.visidatarc'))
+        if legacy.exists() and name == 'config.py':
+            return legacy
+
+        return xdg_path
+
+    def temp_file(self, suffix='', prefix='vd-'):
+        '''Create and return a Path to a temporary file.'''
+        fd, tmppath = tempfile.mkstemp(suffix=suffix, prefix=prefix)
+        os.close(fd)
+        return Path(tmppath)
+
+    def temp_dir(self, suffix='', prefix='vd-'):
+        '''Create and return a Path to a temporary directory.'''
+        return Path(tempfile.mkdtemp(suffix=suffix, prefix=prefix))
+
+
+@VisiData.cached_property
+def runtime_paths(vd):
+    '''Unified RuntimePaths instance.'''
+    return RuntimePaths(vd)
+
+
+@VisiData.api
+def getPath(vd, category, *args, **kwargs):
+    '''Legacy-compatible path getter; delegates to runtime_paths.'''
+    return vd.runtime_paths.get_dir(category, *args, **kwargs)
+
+
+@VisiData.api
+def getFilePath(vd, category, filename, *args, **kwargs):
+    '''Legacy-compatible file path getter; delegates to runtime_paths.'''
+    return vd.runtime_paths.get_file(category, filename, *args, **kwargs)
+
+
+@VisiData.api
+def ensureDir(vd, path, writable=False):
+    '''Legacy-compatible directory creator; delegates to runtime_paths.'''
+    return vd.runtime_paths.ensure_dir(path, writable=writable)
+
+
+@VisiData.api
+def diagnosePaths(vd):
+    '''Print diagnostics for all managed runtime paths.'''
+    for path, category, ok, note in vd.runtime_paths.diagnose():
+        status = 'OK' if ok else 'FAIL'
+        vd.status(f'{category}: {status} {path} {note}')
+
+
 vd.addGlobals(RepeatFile=RepeatFile,
               Path=Path,
               modtime=modtime,
               filesize=filesize,
-              vstat=vstat)
+              vstat=vstat,
+              RuntimePaths=RuntimePaths)

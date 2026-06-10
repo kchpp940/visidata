@@ -1,6 +1,0 @@
-#!/usr/bin/env python3
-
-import visidata.dev_cli
-
-if __name__ == '__main__':
-    visidata.dev_cli.vd_dev_cli()

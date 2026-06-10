@@ -5,19 +5,14 @@ from visidata import vd, VisiData, Path, AttrDict
 
 @VisiData.api
 class StoredList(list):
-    'Read existing persisted list from filesystem, and append new elements to .jsonl in .visidata'
+    'Read existing persisted list from filesystem, and append new elements to .jsonl via runtime_paths'
     def __init__(self, *args, name:str='', **kwargs):
         super().__init__(*args, **kwargs)
         self.name = name
 
     @property
     def path(self):
-        vdpath = vd.data_dir
-        if not vdpath.exists():
-            if vd.options.nothing:
-                return
-            vdpath.mkdir(parents=True)
-        return vdpath/(self.name + '.jsonl')
+        return vd.runtime_paths.get_file('data', self.name + '.jsonl', ensure_dir=True, writable=True)
 
     def reload(self):
         p = self.path
@@ -40,6 +35,9 @@ class StoredList(list):
 
         p = self.path
         if p is None:
+            return
+
+        if not vd.runtime_paths.ensure_dir(p.parent, writable=True):
             return
 
         with p.open(encoding='utf-8', mode='a') as fp:

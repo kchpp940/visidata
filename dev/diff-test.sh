@@ -1,5 +1,8 @@
-#!/usr/bin/env bash
-# Compatibility wrapper — delegates to `vd-dev diff-test`
-# Core implementation is in visidata/dev_cli.py (cmd_diff_test).
-VD_DEV_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-exec env PYTHONPATH="$VD_DEV_DIR:$PYTHONPATH" python3 -m visidata.dev_cli diff-test "$@"
+#!/bin/bash
+
+for fn in `git diff --name-only -- *.tsv` ; do
+    if [ "${fn%-notest.tsv}-notest" != "${fn%.tsv}" ]
+    then
+        git show HEAD^:$fn | bin/vd --diff $fn
+    fi
+done

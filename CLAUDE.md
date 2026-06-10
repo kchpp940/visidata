@@ -80,26 +80,8 @@ vd.addGlobals(MySheet=MySheet)
 
 ## Make Targets
 
-- `make test` — run all tests (alias for `vd-dev test all`)
-- `make lint` — run ruff linter (`vd-dev lint`)
-- `make check` — comprehensive check (lint + test, `vd-dev check`)
-- `make preflight` — release readiness checks (`vd-dev preflight check`)
-- `make package` — build + verify distribution artifacts (`vd-dev package all`)
+- `make test` — run all tests
 - `make help` — list all targets
-
-The preferred way to run development commands is via the unified `vd-dev` CLI:
-- `vd-dev install [dev|test|all|prod] [--check]` — install package (--check verifies without installing)
-- `vd-dev test [all|golden|unit|vgit|vdsql|smoke|perf|individual]` — run tests
-- `vd-dev build [all|man|zsh|docker]` — build resources
-- `vd-dev lint` — run ruff
-- `vd-dev setup [all|hooks|vscode]` — configure dev environment
-- `vd-dev diff-test` — git-diff-based tests
-- `vd-dev clean` — remove generated files
-- `vd-dev check` — lint + test
-- `vd-dev preflight [check|smoke]` — release readiness checks
-- `vd-dev package [all|build|verify|clean]` — build and verify distribution artifacts
-
-Run `vd-dev --help` or `vd-dev <subcommand> --help` for details.
 
 ## Documentation
 

@@ -8,7 +8,7 @@ import os
 
 import visidata
 from visidata import VisiData, BaseSheet, vd, AttrDict
-from visidata.vendor.appdirs import user_config_dir, user_cache_dir, user_data_dir
+from visidata.vendor.appdirs import user_config_dir
 
 
 # [settingname] -> { objname(Sheet-instance/Sheet-type/'global'/'default'): Option/Command/longname }
@@ -459,23 +459,50 @@ def loadConfigFile(vd, fn=''):
             vd.addGlobals(newdefs)
 
 
+_runtime_paths_instance = None
+
+
+def _get_runtime_paths(vd):
+    '''Get runtime_paths, ensuring visidata.path has been imported.'''
+    global _runtime_paths_instance
+    if _runtime_paths_instance is None:
+        import visidata.path
+        # If class-level cached_property exists, use it (via path.py)
+        if hasattr(vd.__class__, 'runtime_paths'):
+            _runtime_paths_instance = 'class_property'
+        else:
+            # Fallback: instantiate directly
+            _runtime_paths_instance = visidata.path.RuntimePaths(vd)
+
+    if _runtime_paths_instance == 'class_property':
+        return vd.__class__.runtime_paths.fget(vd)
+    return _runtime_paths_instance
+
+
+@VisiData.property
+def runtime_paths(vd):
+    '''Unified RuntimePaths instance (compatibility accessor).'''
+    return _get_runtime_paths(vd)
+
+
 @VisiData.cached_property
 def config_file(vd):
-    xdg_config_file = visidata.Path(user_config_dir('visidata')) / 'config.py'
-    if xdg_config_file.exists():
-        return xdg_config_file
-    else:
-        return visidata.Path('~/.visidatarc')
+    return _get_runtime_paths(vd).config_file()
 
 
 @VisiData.cached_property
 def cache_dir(vd):
-    return visidata.Path(user_cache_dir('visidata'))
+    return _get_runtime_paths(vd).get_dir('cache')
 
 
 @VisiData.cached_property
 def data_dir(vd):
-    return visidata.Path(user_data_dir('visidata'))
+    return _get_runtime_paths(vd).get_dir('data')
+
+
+@VisiData.cached_property
+def state_dir(vd):
+    return _get_runtime_paths(vd).get_dir('state')
 
 
 @VisiData.api
@@ -484,8 +511,9 @@ def loadConfigAndPlugins(vd, args=AttrDict()):
     vd.options.visidata_dir = args.visidata_dir if args.visidata_dir is not None else os.getenv('VD_DIR', '') or vd.options.visidata_dir
     vd.options.config = args.config if args.config is not None else os.getenv('VD_CONFIG', '') or vd.options.config
 
-    sys.path.append(str(visidata.Path(vd.options.visidata_dir)))
-    sys.path.append(str(visidata.Path(vd.options.visidata_dir)/"plugins-deps"))
+    config_dir = _get_runtime_paths(vd).get_dir('config')
+    sys.path.append(str(config_dir))
+    sys.path.append(str(config_dir/"plugins-deps"))
 
     # autoload installed plugins first
     args_plugins_autoload = args.plugins_autoload if 'plugins_autoload' in args else True
@@ -590,10 +618,13 @@ def setPersistentOptions(vd, **kwargs):
         setattr(vd.options, optname, optval)
 
     optnames = ' '.join(kwargs.keys())
-    yn = vd.input(f'Save {len(kwargs)} options ({optnames}) to {vd.options.config}? ', record=False)[0:1]
+    rp = _get_runtime_paths(vd)
+    config_path = visidata.Path(vd.options.config) if vd.options.config else rp.config_file()
+    yn = vd.input(f'Save {len(kwargs)} options ({optnames}) to {config_path}? ', record=False)[0:1]
 
     if yn and yn in 'Yy':
-        with open(str(visidata.Path(vd.options.config)), mode='a') as fp:
+        rp.ensure_dir(config_path.parent, writable=True)
+        with open(str(config_path), mode='a') as fp:
             for optname, optval in kwargs.items():
                 fp.write(f'options.{optname}={repr(optval)}\n')
 

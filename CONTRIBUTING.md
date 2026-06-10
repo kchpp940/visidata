@@ -65,12 +65,6 @@ Some examples of great bug reports:
 VisiData includes git hooks in `dev/hooks/` that run unit tests and cmdlog tests before pushing. To enable them:
 
 ```
-vd-dev setup hooks
-```
-
-Or equivalently:
-
-```
 git config core.hooksPath dev/hooks
 ```
 

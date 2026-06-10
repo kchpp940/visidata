@@ -49,8 +49,7 @@ setup(
     scripts=["bin/vd2to3.vdx"],
     entry_points={
         "console_scripts": ["vd=visidata.main:vd_cli",
-                            "visidata=visidata.main:vd_cli",
-                            "vd-dev=visidata.dev_cli:vd_dev_cli"],
+                            "visidata=visidata.main:vd_cli"],
     },
     py_modules=["visidata"],
     install_requires=install_requires,
