@@ -52,6 +52,22 @@
 
 9. Push code to stable
 
+9.5. Run pre-release consistency check
+
+    ```
+    make release-check
+    ```
+
+    This verifies:
+    - Version numbers are consistent across all files
+    - All modules can be imported
+    - CLI entry points are valid
+    - Manpage and documentation are in sync
+    - Packaging metadata (setup.py, MANIFEST.in) is complete
+    - Internal formats documentation is up-to-date
+
+    Use `make release-check-strict` to treat warnings as errors.
+
 10. Push `stable` to pypi
 
     a. set up a ~/.pypirc

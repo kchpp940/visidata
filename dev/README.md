@@ -36,6 +36,7 @@ See [design/README.md](design/README.md) for full index.
 | `mkman.sh` | Generate manpage |
 | `mkpandas-df.py` | Generate pandas DataFrame test fixtures |
 | `zsh-completion.py` | Generate zsh completions |
+| `pre_release_check.py` | Pre-release consistency checker (versions, modules, docs, packaging) |
 
 ## Data Files
 

@@ -41,7 +41,7 @@ def extract_parts(sheet, givenpath, *parts):
     if givenpath.is_dir() or givenpath.given.endswith('/') or len(parts) > 1:
         # save as individual files in the givenpath directory
         try:
-            os.makedirs(givenpath, exist_ok=True)
+            vd.runtime_paths.ensure_dir(givenpath)
         except FileExistsError:
             vd.debug(f'{givenpath} already exists')
 

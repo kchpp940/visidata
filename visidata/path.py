@@ -6,6 +6,7 @@ import codecs
 import pathlib
 import tempfile
 import shutil
+import contextlib
 from urllib.parse import urlparse, urlunparse
 from functools import wraps, lru_cache
 
@@ -734,6 +735,32 @@ class RuntimePaths:
     def temp_dir(self, suffix='', prefix='vd-'):
         '''Create and return a Path to a temporary directory.'''
         return Path(tempfile.mkdtemp(suffix=suffix, prefix=prefix))
+
+    @contextlib.contextmanager
+    def temp_file_ctx(self, suffix='', prefix='vd-', delete=True):
+        '''Context manager yielding a Path to a temporary file, deleted on exit by default.'''
+        p = self.temp_file(suffix=suffix, prefix=prefix)
+        try:
+            yield p
+        finally:
+            if delete and p.exists():
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+
+    @contextlib.contextmanager
+    def temp_dir_ctx(self, suffix='', prefix='vd-', delete=True):
+        '''Context manager yielding a Path to a temporary directory, deleted on exit by default.'''
+        p = self.temp_dir(suffix=suffix, prefix=prefix)
+        try:
+            yield p
+        finally:
+            if delete and p.exists():
+                try:
+                    shutil.rmtree(str(p))
+                except OSError:
+                    pass
 
 
 @VisiData.cached_property

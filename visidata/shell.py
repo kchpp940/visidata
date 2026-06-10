@@ -180,7 +180,7 @@ class DirSheet(Sheet):
                 vd.error('destination %s not a directory' % parent)
         else:
             with contextlib.suppress(FileExistsError):
-                os.makedirs(parent)
+                vd.runtime_paths.ensure_dir(parent)
 
         row.rename(newpath)
         row.given = newpath # modify visidata.Path
@@ -342,7 +342,7 @@ def copy_files(sheet, paths, dest):
     destdir = Path(dest)
     destdir.is_dir() or vd.fail('target must be directory')
     vd.status('copying %s %s to %s' % (len(paths), sheet.rowtype, destdir))
-    os.makedirs(destdir, exist_ok=True)
+    vd.runtime_paths.ensure_dir(destdir)
     for srcpath in Progress(paths, gerund='copying'):
         try:
             destpath = destdir/str(srcpath._path.name)

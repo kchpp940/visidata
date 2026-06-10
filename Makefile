@@ -3,7 +3,8 @@
        test test-all test-vgit test-vdsql \
        build man zsh-completion docker \
        setup-hooks setup-vscode lint \
-       diff-test clean
+       diff-test clean \
+       release-check release-check-strict
 
 help:
 	@echo "Install:"
@@ -28,6 +29,10 @@ help:
 	@echo "  make lint              run ruff linter"
 	@echo "  make diff-test         show diffs from last test run"
 	@echo "  make clean             remove generated files"
+	@echo ""
+	@echo "Release:"
+	@echo "  make release-check     run pre-release consistency checks"
+	@echo "  make release-check-strict  run checks with warnings as errors"
 
 install:
 	pip3 install .
@@ -85,3 +90,9 @@ diff-test:
 clean:
 	rm -f visidata/man/vd.1 visidata/man/visidata.1 visidata/man/vd.txt
 	rm -f docs/man.md
+
+release-check:
+	python3 dev/pre_release_check.py
+
+release-check-strict:
+	python3 dev/pre_release_check.py --strict

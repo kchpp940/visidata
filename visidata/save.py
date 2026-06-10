@@ -176,7 +176,7 @@ def saveSheets(vd, givenpath, *vsheets, confirm_overwrite=True):
 
     # save as individual files in the givenpath directory
     try:
-        os.makedirs(givenpath, exist_ok=True)
+        vd.runtime_paths.ensure_dir(givenpath)
     except FileExistsError:
         pass
 
@@ -198,13 +198,12 @@ def saveSheets(vd, givenpath, *vsheets, confirm_overwrite=True):
 def save_zip(vd, p, *vsheets):
     vd.clearCaches()
 
-    import tempfile
     import zipfile
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with vd.runtime_paths.temp_dir_ctx() as tmpdir:
         with zipfile.ZipFile(str(p), 'w', zipfile.ZIP_DEFLATED, allowZip64=True, compresslevel=9) as zfp:
             for vs in Progress(vsheets):
                 filetype = vs.options.save_filetype
-                tmpp = Path(f'{tmpdir}{vs.name}.{filetype}')
+                tmpp = Path(f'{tmpdir}{os.sep}{vs.name}.{filetype}')
                 savefunc = getattr(vs, 'save_' + filetype, None) or getattr(vd, 'save_' + filetype, None)
                 savefunc(tmpp, vs)
                 zfp.write(tmpp, f'{vs.name}.{vs.options.save_filetype}')

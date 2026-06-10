@@ -65,6 +65,9 @@ def error(s):
 def warning(s):
     print(s, file=sys.stderr)
 
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+
 def get_bits(val:int, *args):
     'Generate bitfields (one for each arg) from LSB to MSB.'
     for n in args:
@@ -224,7 +227,7 @@ class RemoteZipFile:
             path = path or pathlib.Path('.')
 
             outpath = path/member
-            os.makedirs(outpath.parent, exist_ok=True)
+            ensure_dir(outpath.parent)
             with self.open(member) as fpin:
                 with open(path/member, mode='wb') as fpout:
                     while True:
@@ -354,7 +357,7 @@ def download_file(f, rzf, args):
     else:
         path = pathlib.Path(f.filename)
         if args.full_filepaths:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            ensure_dir(path.parent)
         else:
             path = path.name
 

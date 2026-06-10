@@ -91,10 +91,9 @@ Commands:
 
     def sysopen_row(self, row):
         'Extract file in row to tempdir and launch $EDITOR.  Modifications will be discarded.'
-        import tempfile
-        with tempfile.TemporaryDirectory() as tempdir:
-            self.zfp.extract(member=row[0], path=tempdir)
-            vd.launchExternalEditorPath(Path(tempdir)/row[0].filename)
+        with vd.runtime_paths.temp_dir_ctx() as tempdir:
+            self.zfp.extract(member=row[0], path=str(tempdir))
+            vd.launchExternalEditorPath(Path(str(tempdir))/row[0].filename)
 
     @asyncthread
     def extract_async(self, *rows, path=None):
@@ -109,6 +108,8 @@ Commands:
             if '://' in str(self.source):
                 vd.importExternal('urllib3')
                 unzip_http.warning = vd.warning
+                unzip_http.error = vd.fail
+                unzip_http.ensure_dir = lambda p: vd.runtime_paths.ensure_dir(Path(p))
                 self._zfp = unzip_http.RemoteZipFile(str(self.source))
             elif isinstance(self.source, Path):
                 if self.source.has_fp():  #when opening a zip inside tar or zip
